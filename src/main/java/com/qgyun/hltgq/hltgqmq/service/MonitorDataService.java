@@ -66,18 +66,14 @@ public class MonitorDataService {
     /** 设备表全限定名 */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
 
-    /** tag → 设备类型后缀（用于构造设备名称: 站点名+设备类型+#） */
-    private static final Map<String, String> TAG_DEVICE_TYPE_MAP = new LinkedHashMap<>();
+    /** 站点类型(epjutj) → 设备名称后缀 映射 */
+    private static final Map<String, String> SITE_TYPE_DEVICE_MAP = new LinkedHashMap<>();
     static {
-        TAG_DEVICE_TYPE_MAP.put("msgInfo",   "通信终端");
-        TAG_DEVICE_TYPE_MAP.put("volInfo",   "遥测终端");
-        TAG_DEVICE_TYPE_MAP.put("wtInfo",    "流量计");
-        TAG_DEVICE_TYPE_MAP.put("riverInfo", "水位计");
-        TAG_DEVICE_TYPE_MAP.put("nmIspInfo", "水质监测仪");
-        TAG_DEVICE_TYPE_MAP.put("pcpInfo",   "理化监测仪");
-        TAG_DEVICE_TYPE_MAP.put("rainInfo",  "雨量计");
-        TAG_DEVICE_TYPE_MAP.put("gatesInfo", "闸位计");
-        TAG_DEVICE_TYPE_MAP.put("gateInfo",  "闸位计");
+        SITE_TYPE_DEVICE_MAP.put("1", "水位计");     // 水位站
+        SITE_TYPE_DEVICE_MAP.put("2", "雨量计");     // 雨量站
+        SITE_TYPE_DEVICE_MAP.put("3", "流量计");     // 流量站
+        SITE_TYPE_DEVICE_MAP.put("6", "泵站");       // 泵站
+        SITE_TYPE_DEVICE_MAP.put("8", "水质监测仪"); // 水质
     }
 
     /**
@@ -88,8 +84,14 @@ public class MonitorDataService {
     /** 设备名 → device_id 缓存（首次查/建后缓存） */
     private final ConcurrentMap<String, String> deviceCache = new ConcurrentHashMap<>();
 
+    /** stcd → 主设备 device_id 缓存（闸站=闸孔1，非闸站=RTU设备） */
+    private final ConcurrentMap<String, String> stcdDeviceCache = new ConcurrentHashMap<>();
+
     /** site_id → 站点名称 缓存 */
     private final ConcurrentMap<String, String> siteNameCache = new ConcurrentHashMap<>();
+
+    /** site_id → epjutj(站点类型) 缓存 */
+    private final ConcurrentMap<String, String> siteTypeCache = new ConcurrentHashMap<>();
 
     /** stcd → site_id 缓存 */
     private final ConcurrentMap<String, String> stcdSiteCache = new ConcurrentHashMap<>();
@@ -169,7 +171,14 @@ public class MonitorDataService {
 
             // === 业务字段（仅当列存在时才添加） ===
             if (isValidColumn(validColumns, "site"))   fieldMap.put("site", site);
-            if (isValidColumn(validColumns, "device")) fieldMap.put("device", lookupOrCreateDeviceByStcd(stcd, site, tag));
+            if (isValidColumn(validColumns, "device")) {
+                String device = lookupOrCreateRtuDevice(stcd, site);
+                if (device == null) {
+                    log.error("设备创建失败, 丢弃报文: stcd={}, tag={}", stcd, tag);
+                    return;
+                }
+                fieldMap.put("device", device);
+            }
             if (isValidColumn(validColumns, "stcd"))   fieldMap.put("stcd", stcd);
 
             // 遍历entity字段，转为小写作为数据库列名（仅当列存在时才添加）
@@ -208,10 +217,12 @@ public class MonitorDataService {
                 insertGateFromGatesInfo(entity, site, stcd);
                 return;
             }
-            // === msgInfo 条件入库：msg为空则跳过 ===
-            if ("msgInfo".equals(tag) && !hasValue(entity, "MSG")) {
-                log.debug("msgInfo 报文(MSG)为空, 跳过入库, stcd={}", stcd);
-                return;
+            // === msgInfo 条件入库：msg为空或空白则跳过 ===
+            if ("msgInfo".equals(tag)) {
+                if (!hasValue(entity, "MSG") || entity.get("MSG").asText().trim().isEmpty()) {
+                    log.debug("msgInfo 报文(MSG)为空, 跳过入库, stcd={}", stcd);
+                    return;
+                }
             }
             // === volInfo 条件入库：VOL为空或≤0视为无效 ===
             if ("volInfo".equals(tag)) {
@@ -227,10 +238,11 @@ public class MonitorDataService {
                     return;
                 }
             }
-            // === rainInfo 条件入库：DRP为空或≤0视为无有效雨量 ===
+            // === rainInfo 条件入库：DYP≤0说明设备无雨量监测能力或报文异常，跳过入库 ===
+            // DRP可为0（今日无雨），DYP是RTU安装以来累计值，为0则设备不匹配
             if ("rainInfo".equals(tag)) {
-                if (!hasValue(entity, "DRP") || entity.get("DRP").asDouble() <= 0) {
-                    log.debug("rainInfo 无有效雨量数据, 跳过入库, stcd={}", stcd);
+                if (!hasValue(entity, "DYP") || entity.get("DYP").asDouble() <= 0) {
+                    log.debug("rainInfo 无有效雨量数据(DYP缺失或≤0), 跳过入库, stcd={}", stcd);
                     return;
                 }
             }
@@ -245,6 +257,20 @@ public class MonitorDataService {
                 computeWaterLevelRise1h(fieldMap, stcd, validColumns);
             } else if ("rainInfo".equals(tag)) {
                 computeRainfall(fieldMap, entity, stcd, validColumns);
+            }
+
+            // 去重：相同 stcd+tm 已存在则跳过（防止RabbitMQ重投产生重复行）
+            if (fieldMap.containsKey("tm") && fieldMap.get("tm") != null) {
+                try {
+                    String checkSql = "SELECT COUNT(*) FROM " + tableName + " WHERE stcd = ? AND tm = ?";
+                    int count = jdbcTemplate.queryForObject(checkSql, Integer.class, stcd, fieldMap.get("tm"));
+                    if (count > 0) {
+                        log.debug("报文重复, 跳过入库: tag={}, stcd={}, tm={}", tag, stcd, fieldMap.get("tm"));
+                        return;
+                    }
+                } catch (Exception e) {
+                    log.debug("去重检查失败, 放行入库: {}", e.getMessage());
+                }
             }
 
             // 构建 INSERT SQL
@@ -305,18 +331,39 @@ public class MonitorDataService {
     }
 
     /**
-     * 按 tag + site 查找或创建设备，返回 t_auto_hltgq_water_device.id (带缓存)
-     * 设备名称 = 站点名 + 设备类型（如"南山寺节制闸雨量计"），首次查不到则自动创建
+     * 按站点类型查找或创建设备，返回 device_id (带缓存)
+     * <p>
+     * 闸站(#4#): 生成闸孔1设备 "{siteName}闸孔1#"，所有站级数据指向它
+     * 非闸站: 生成RTU设备 "{siteName}{类型后缀}#"
      */
-    private String lookupOrCreateDeviceByStcd(String stcd, String siteId, String tag) {
-        String deviceType = TAG_DEVICE_TYPE_MAP.getOrDefault(tag, tag);
-        // 设备名称格式：站点名+设备类型+#，如"集岭管理所雨量计#"，闸孔类已在 insertGateFromGatesInfo 单独命名
-        String deviceName = getSiteName(siteId) + deviceType + "#";
-        return lookupOrCreateDeviceByName(deviceName, siteId);
+    private String lookupOrCreateRtuDevice(String stcd, String siteId) {
+        return stcdDeviceCache.computeIfAbsent(stcd, s -> {
+            String siteName = getSiteName(siteId);
+            String epjutj = getSiteType(siteId);
+            String deviceName;
+            String deviceType;
+
+            // 闸站(#4#): 统一用闸孔1设备
+            if (epjutj != null && epjutj.contains("#4#")) {
+                deviceName = siteName + "1#";
+                deviceType = "#4#";
+            } else {
+                // 非闸站: 按站点类型生成 RTU 设备
+                String typeCode = extractPrimarySiteType(epjutj);
+                String suffix = SITE_TYPE_DEVICE_MAP.getOrDefault(typeCode, "遥测终端");
+                deviceName = siteName + suffix + "#";
+                deviceType = epjutj;
+            }
+            return lookupOrCreateDeviceByName(deviceName, siteId, deviceType);
+        });
     }
 
-    /** 按设备名称查找或创建（共享缓存） */
+    /** 按设备名称查找或创建（共享缓存），可选写入 type 字段 */
     private String lookupOrCreateDeviceByName(String deviceName, String siteId) {
+        return lookupOrCreateDeviceByName(deviceName, siteId, null);
+    }
+
+    private String lookupOrCreateDeviceByName(String deviceName, String siteId, String type) {
         return deviceCache.computeIfAbsent(deviceName, name -> {
             try {
                 String sql = "SELECT id FROM " + DEVICE_TABLE + " WHERE name = ?";
@@ -332,14 +379,22 @@ public class MonitorDataService {
             try {
                 String deviceId = IdGenerator.generate();
                 Timestamp now = new Timestamp(System.currentTimeMillis());
-                String sql = "INSERT INTO " + DEVICE_TABLE +
-                        " (id, corp_code, created_at, created_by, updated_at, updated_by, name, site) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-                jdbcTemplate.update(sql, deviceId, corpCode, now, "SYSTEM", now, "SYSTEM", name, siteId);
-                log.info("已自动创建遥测设备: name={}, deviceId={}", name, deviceId);
+                String sql;
+                if (type != null) {
+                    sql = "INSERT INTO " + DEVICE_TABLE +
+                          " (id, corp_code, created_at, created_by, updated_at, updated_by, name, site, type) " +
+                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    jdbcTemplate.update(sql, deviceId, corpCode, now, "SYSTEM", now, "SYSTEM", name, siteId, type);
+                } else {
+                    sql = "INSERT INTO " + DEVICE_TABLE +
+                          " (id, corp_code, created_at, created_by, updated_at, updated_by, name, site) " +
+                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+                    jdbcTemplate.update(sql, deviceId, corpCode, now, "SYSTEM", now, "SYSTEM", name, siteId);
+                }
+                log.info("已自动创建设备: name={}, id={}, type={}", name, deviceId, type);
                 return deviceId;
             } catch (Exception e) {
-                log.error("创建遥测设备失败, name={}, 错误: {}", name, e.getMessage());
+                log.error("创建设备失败, name={}, 错误: {}", name, e.getMessage());
                 return null;
             }
         });
@@ -361,13 +416,90 @@ public class MonitorDataService {
         });
     }
 
+    /** 根据 site_id 查站点类型 epjutj（带缓存），如 "#4#" */
+    private String getSiteType(String siteId) {
+        return siteTypeCache.computeIfAbsent(siteId, id -> {
+            try {
+                String sql = "SELECT epjutj FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef WHERE id = ?";
+                List<String> results = jdbcTemplate.queryForList(sql, String.class, id);
+                if (results != null && !results.isEmpty() && results.get(0) != null) {
+                    return results.get(0);
+                }
+            } catch (Exception e) {
+                log.warn("查找站点类型失败, siteId={}, 错误: {}", id, e.getMessage());
+            }
+            return null;
+        });
+    }
+
+    /** 从 epjutj 提取主类型码，如 "#4#" → "4"，"#1#|#3#" → "1" */
+    private String extractPrimarySiteType(String epjutj) {
+        if (epjutj == null || epjutj.isEmpty()) return null;
+        int s = epjutj.indexOf('#');
+        if (s < 0) return null;
+        int e = epjutj.indexOf('#', s + 1);
+        if (e < 0) return null;
+        return epjutj.substring(s + 1, e);
+    }
+
     /**
-     * riverInfo 闸站路由：将 Z1→up_z、Z2→down_z 写入 gate 表（站级水位，gate_no=0）
+     * riverInfo 闸站路由：优先更新已有闸孔行（gate_no≠0）的 up_z/down_z，
+     * 无已有行时才写入 gate_no=0 占位（等 gatesInfo 到达后自动合并）。
      */
     private void insertGateFromRiverInfo(JsonNode entity, String siteId, String stcd) {
         Timestamp now = new Timestamp(System.currentTimeMillis());
         Set<String> gateCols = tableColumnsCache.getOrDefault("t_auto_hltgq_water_gate", Collections.emptySet());
 
+        // 使用报文 TM，兜底服务器时间
+        Timestamp tm = extractTm(entity, now);
+
+        String device = lookupOrCreateRtuDevice(stcd, siteId);
+        if (device == null) {
+            log.error("riverInfo→gate 设备缺失, 跳过入库: stcd={}", stcd);
+            return;
+        }
+
+        double z1 = hasValue(entity, "Z1") && entity.get("Z1").asDouble() > 0 ? entity.get("Z1").asDouble() : -1;
+        double z2 = hasValue(entity, "Z2") && entity.get("Z2").asDouble() > 0 ? entity.get("Z2").asDouble() : -1;
+        if (z1 < 0 && z2 < 0) return;
+
+        // 优先尝试更新已有闸孔行（gatesInfo 可能已先到达）
+        Timestamp recentWindow = new Timestamp(tm.getTime() - 600000); // 10分钟窗口
+        StringBuilder updateSql = new StringBuilder("UPDATE " + GATE_TABLE + " SET updated_at = ?, updated_by = 'SYSTEM'");
+        List<Object> updateParams = new ArrayList<>();
+        updateParams.add(now);
+        if (z1 >= 0) {
+            updateSql.append(", up_z = ?");
+            updateParams.add(z1);
+        }
+        if (z2 >= 0) {
+            updateSql.append(", down_z = ?");
+            updateParams.add(z2);
+        }
+        updateSql.append(" WHERE stcd = ? AND tm >= ? AND gate_no != '0'");
+        updateParams.add(stcd);
+        updateParams.add(recentWindow);
+
+        int updated = jdbcTemplate.update(updateSql.toString(), updateParams.toArray());
+        if (updated > 0) {
+            log.info("riverInfo水位已合并到 {} 条闸孔行: stcd={}, Z1={}, Z2={}", updated, stcd,
+                     z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
+            return;
+        }
+
+        // 去重：相同 stcd+tm+gate_no=0 已存在则跳过（防止RabbitMQ重投）
+        try {
+            String checkSql = "SELECT COUNT(*) FROM " + GATE_TABLE + " WHERE stcd = ? AND tm = ? AND gate_no = '0'";
+            int count = jdbcTemplate.queryForObject(checkSql, Integer.class, stcd, tm);
+            if (count > 0) {
+                log.debug("gate_no=0占位行已存在, 跳过: stcd={}, tm={}", stcd, tm);
+                return;
+            }
+        } catch (Exception e) {
+            log.debug("gate表去重检查失败, 放行: {}", e.getMessage());
+        }
+
+        // 无已有闸孔行可更新 → 写入 gate_no=0 占位（等 gatesInfo 到达后合并）
         Map<String, Object> fm = new LinkedHashMap<>();
         fm.put("id",         IdGenerator.generate());
         fm.put("corp_code",  corpCode);
@@ -376,19 +508,15 @@ public class MonitorDataService {
         fm.put("updated_at", now);
         fm.put("updated_by", "SYSTEM");
         if (gateCols.isEmpty() || gateCols.contains("site"))     fm.put("site",     siteId);
-        if (gateCols.isEmpty() || gateCols.contains("device"))   fm.put("device",   lookupOrCreateDeviceByStcd(stcd, siteId, "riverInfo"));
+        if (gateCols.isEmpty() || gateCols.contains("device"))   fm.put("device",   device);
         if (gateCols.isEmpty() || gateCols.contains("stcd"))     fm.put("stcd",     stcd);
         if (gateCols.isEmpty() || gateCols.contains("gate_no"))  fm.put("gate_no",  "0");
-        if (gateCols.isEmpty() || gateCols.contains("tm"))       fm.put("tm",       now);
-        if (gateCols.isEmpty() || gateCols.contains("date"))     fm.put("date",     now);
-        if (gateCols.isEmpty() || gateCols.contains("ctime"))    fm.put("ctime",    now);
+        if (gateCols.isEmpty() || gateCols.contains("tm"))       fm.put("tm",       tm);
+        if (gateCols.isEmpty() || gateCols.contains("date"))     fm.put("date",     tm);
+        if (gateCols.isEmpty() || gateCols.contains("ctime"))    fm.put("ctime",    tm);
         if (gateCols.isEmpty() || gateCols.contains("status"))   fm.put("status",   "#1#");
-        if (hasValue(entity, "Z1") && entity.get("Z1").asDouble() > 0
-                && (gateCols.isEmpty() || gateCols.contains("up_z")))
-            fm.put("up_z", entity.get("Z1").asDouble());
-        if (hasValue(entity, "Z2") && entity.get("Z2").asDouble() > 0
-                && (gateCols.isEmpty() || gateCols.contains("down_z")))
-            fm.put("down_z", entity.get("Z2").asDouble());
+        if (z1 >= 0) fm.put("up_z", z1);
+        if (z2 >= 0) fm.put("down_z", z2);
 
         StringBuilder cols = new StringBuilder();
         StringBuilder phs = new StringBuilder();
@@ -404,26 +532,27 @@ public class MonitorDataService {
                 GATE_TABLE, cols.toString(), phs.toString());
         jdbcTemplate.update(sql, vals.toArray());
 
-        log.info("riverInfo闸站数据入库成功: stcd={}, Z1={}, Z2={}, table={}",
-                stcd,
-                hasValue(entity, "Z1") ? entity.get("Z1").asText() : "null",
-                hasValue(entity, "Z2") ? entity.get("Z2").asText() : "null",
-                GATE_TABLE);
+        log.info("riverInfo闸站数据已写入gate_no=0占位: stcd={}, Z1={}, Z2={}", stcd,
+                 z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
     }
 
     /**
      * gatesInfo 闸门开度路由：将 Gates1/2/3 → gate 表多行（闸孔级开度，gate_no=1/2/3）
-     * 每闸孔独立设备，命名规则与 MQTT 一致：{站点名}{闸孔号}#
+     * 每闸孔独立设备，命名: {站点名}{闸孔号}#
+     * 写入完成后自动合并 pending 的 gate_no=0 水位占位行。
      */
     private void insertGateFromGatesInfo(JsonNode entity, String siteId, String stcd) {
         Timestamp now = new Timestamp(System.currentTimeMillis());
         Set<String> gateCols = tableColumnsCache.getOrDefault("t_auto_hltgq_water_gate", Collections.emptySet());
         String siteName = getSiteName(siteId);
 
+        // 使用报文 TM，兜底服务器时间
+        Timestamp tm = extractTm(entity, now);
+
         int inserted = 0;
         for (int i = 1; i <= 10; i++) {
             String fieldName = "Gates" + i;
-            if (!hasValue(entity, fieldName)) break; // 连续编号，遇到第一个null就停止
+            if (!hasValue(entity, fieldName)) continue; // 跳过null字段，继续处理后续闸孔
 
             double openDegree = entity.get(fieldName).asDouble();
             // -999 表示无信号，跳过该闸孔（不创建设备）
@@ -431,6 +560,22 @@ public class MonitorDataService {
 
             String deviceName = siteName + i + "#";
             String deviceId = lookupOrCreateDeviceByName(deviceName, siteId);
+            if (deviceId == null) {
+                log.error("gatesInfo 设备缺失, 跳过闸孔{}: stcd={}, deviceName={}", i, stcd, deviceName);
+                continue;
+            }
+
+            // 去重：相同 stcd+tm+gate_no 已存在则跳过（防止RabbitMQ重投）
+            try {
+                String checkSql = "SELECT COUNT(*) FROM " + GATE_TABLE + " WHERE stcd = ? AND tm = ? AND gate_no = ?";
+                int count = jdbcTemplate.queryForObject(checkSql, Integer.class, stcd, tm, String.valueOf(i));
+                if (count > 0) {
+                    log.debug("gate表重复, 跳过闸孔{}: stcd={}, tm={}", i, stcd, tm);
+                    continue;
+                }
+            } catch (Exception e) {
+                log.debug("gate表去重检查失败, 放行: {}", e.getMessage());
+            }
 
             Map<String, Object> fm = new LinkedHashMap<>();
             fm.put("id",          IdGenerator.generate());
@@ -443,9 +588,9 @@ public class MonitorDataService {
             if (gateCols.isEmpty() || gateCols.contains("device"))      fm.put("device",       deviceId);
             if (gateCols.isEmpty() || gateCols.contains("stcd"))        fm.put("stcd",         stcd);
             if (gateCols.isEmpty() || gateCols.contains("gate_no"))     fm.put("gate_no",      String.valueOf(i));
-            if (gateCols.isEmpty() || gateCols.contains("tm"))          fm.put("tm",           now);
-            if (gateCols.isEmpty() || gateCols.contains("date"))        fm.put("date",         now);
-            if (gateCols.isEmpty() || gateCols.contains("ctime"))       fm.put("ctime",        now);
+            if (gateCols.isEmpty() || gateCols.contains("tm"))          fm.put("tm",           tm);
+            if (gateCols.isEmpty() || gateCols.contains("date"))        fm.put("date",         tm);
+            if (gateCols.isEmpty() || gateCols.contains("ctime"))       fm.put("ctime",        tm);
             if (gateCols.isEmpty() || gateCols.contains("status"))      fm.put("status",       "#1#");
             if (gateCols.isEmpty() || gateCols.contains("open_degree")) fm.put("open_degree",  openDegree);
 
@@ -465,6 +610,11 @@ public class MonitorDataService {
             inserted++;
         }
 
+        // 合并 pending 的 gate_no=0 水位占位行（riverInfo 可能已先到达）
+        if (inserted > 0) {
+            mergeGateZeroWaterLevels(stcd, tm, now);
+        }
+
         log.info("gatesInfo闸门开度入库成功: stcd={}, 闸孔数={}, table={}", stcd, inserted, GATE_TABLE);
     }
 
@@ -477,13 +627,22 @@ public class MonitorDataService {
         Object zObj = fieldMap.get("z");
         if (!(zObj instanceof Number)) return;
 
-        String sql = "SELECT z FROM " + SCHEMA + "t_auto_hltgq_water_river_info " +
-                     "WHERE stcd = ? AND z IS NOT NULL AND tm >= ? AND tm <= ? " +
-                     "ORDER BY tm DESC LIMIT 1";
+        String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
         Timestamp oneHourAgo = new Timestamp(System.currentTimeMillis() - 3600000);
         Timestamp twoHoursAgo = new Timestamp(System.currentTimeMillis() - 7200000);
         try {
-            List<Double> results = jdbcTemplate.queryForList(sql, Double.class, stcd, twoHoursAgo, oneHourAgo);
+            List<Double> results;
+            if (device != null) {
+                String sql = "SELECT z FROM " + SCHEMA + "t_auto_hltgq_water_river_info " +
+                             "WHERE stcd = ? AND device = ? AND z IS NOT NULL AND tm >= ? AND tm <= ? " +
+                             "ORDER BY tm DESC LIMIT 1";
+                results = jdbcTemplate.queryForList(sql, Double.class, stcd, device, twoHoursAgo, oneHourAgo);
+            } else {
+                String sql = "SELECT z FROM " + SCHEMA + "t_auto_hltgq_water_river_info " +
+                             "WHERE stcd = ? AND z IS NOT NULL AND tm >= ? AND tm <= ? " +
+                             "ORDER BY tm DESC LIMIT 1";
+                results = jdbcTemplate.queryForList(sql, Double.class, stcd, twoHoursAgo, oneHourAgo);
+            }
             if (results != null && !results.isEmpty() && results.get(0) != null) {
                 double rise = ((Number) zObj).doubleValue() - results.get(0);
                 fieldMap.put("water_level_rise1h", trunc2(rise));
@@ -503,39 +662,61 @@ public class MonitorDataService {
         if (!hasValue(entity, "DYP")) return;
         double currentDyp = entity.get("DYP").asDouble();
 
+        String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
+
         if (isValidColumn(validColumns, "rainfall1h")) {
-            Double prev = queryPreviousDyp(stcd, 3600000);
+            Double prev = queryPreviousDyp(stcd, device, 3600000);
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
-                if (diff >= 0) fieldMap.put("rainfall1h", diff);
+                if (diff >= 0) {
+                    fieldMap.put("rainfall1h", diff);
+                } else {
+                    log.debug("rainfall1h计算异常(DYP回退), stcd={}, currentDyp={}, prevDyp={}, diff={}", stcd, currentDyp, prev, diff);
+                }
             }
         }
         if (isValidColumn(validColumns, "rainfall3h")) {
-            Double prev = queryPreviousDyp(stcd, 3 * 3600000);
+            Double prev = queryPreviousDyp(stcd, device, 3 * 3600000);
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
-                if (diff >= 0) fieldMap.put("rainfall3h", diff);
+                if (diff >= 0) {
+                    fieldMap.put("rainfall3h", diff);
+                } else {
+                    log.debug("rainfall3h计算异常(DYP回退), stcd={}, currentDyp={}, prevDyp={}, diff={}", stcd, currentDyp, prev, diff);
+                }
             }
         }
         if (isValidColumn(validColumns, "rainfall6h")) {
-            Double prev = queryPreviousDyp(stcd, 6 * 3600000);
+            Double prev = queryPreviousDyp(stcd, device, 6 * 3600000);
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
-                if (diff >= 0) fieldMap.put("rainfall6h", diff);
+                if (diff >= 0) {
+                    fieldMap.put("rainfall6h", diff);
+                } else {
+                    log.debug("rainfall6h计算异常(DYP回退), stcd={}, currentDyp={}, prevDyp={}, diff={}", stcd, currentDyp, prev, diff);
+                }
             }
         }
     }
 
     /** 查询指定时间前的DYP累计值（DYP永不重置，差值始终≥0） */
-    private Double queryPreviousDyp(String stcd, long intervalMs) {
+    private Double queryPreviousDyp(String stcd, String device, long intervalMs) {
         long lowerBoundMs = intervalMs * 2;
-        String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
-                     "WHERE stcd = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ? " +
-                     "ORDER BY tm DESC LIMIT 1";
         Timestamp from = new Timestamp(System.currentTimeMillis() - lowerBoundMs);
         Timestamp to   = new Timestamp(System.currentTimeMillis() - intervalMs);
         try {
-            List<Double> results = jdbcTemplate.queryForList(sql, Double.class, stcd, from, to);
+            List<Double> results;
+            if (device != null) {
+                String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
+                             "WHERE stcd = ? AND device = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ? " +
+                             "ORDER BY tm DESC LIMIT 1";
+                results = jdbcTemplate.queryForList(sql, Double.class, stcd, device, from, to);
+            } else {
+                String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
+                             "WHERE stcd = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ? " +
+                             "ORDER BY tm DESC LIMIT 1";
+                results = jdbcTemplate.queryForList(sql, Double.class, stcd, from, to);
+            }
             if (results != null && !results.isEmpty() && results.get(0) != null) {
                 return results.get(0);
             }
@@ -586,6 +767,64 @@ public class MonitorDataService {
         return node.asText();
     }
 
+    // ======================== Gate 辅助方法 ========================
+
+    /** 从 entity 中提取测量时间 TM，解析失败则用兜底时间 */
+    private Timestamp extractTm(JsonNode entity, Timestamp fallback) {
+        if (!hasValue(entity, "TM")) return fallback;
+        try {
+            JsonNode tmNode = entity.get("TM");
+            if (tmNode.isNumber()) {
+                return new Timestamp(tmNode.asLong());
+            }
+            return Timestamp.valueOf(tmNode.asText());
+        } catch (Exception e) {
+            log.debug("无法解析TM字段, 使用兜底时间: {}", entity.get("TM"));
+            return fallback;
+        }
+    }
+
+    /** 将 gate_no=0 占位行的水位合并到闸孔行，并清理占位行 */
+    private void mergeGateZeroWaterLevels(String stcd, Timestamp tm, Timestamp now) {
+        try {
+            Timestamp recentWindow = new Timestamp(tm.getTime() - 600000); // 10分钟窗口
+            String selectSql = "SELECT up_z, down_z FROM " + GATE_TABLE +
+                    " WHERE stcd = ? AND gate_no = '0' AND tm >= ? ORDER BY tm DESC LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(selectSql, stcd, recentWindow);
+            if (rows.isEmpty()) return;
+
+            Map<String, Object> pending = rows.get(0);
+            Object upZ = pending.get("up_z");
+            Object downZ = pending.get("down_z");
+            if (upZ == null && downZ == null) return;
+
+            StringBuilder updateSql = new StringBuilder("UPDATE " + GATE_TABLE + " SET updated_at = ?, updated_by = 'SYSTEM'");
+            List<Object> updateParams = new ArrayList<>();
+            updateParams.add(now);
+            if (upZ != null) {
+                updateSql.append(", up_z = ?");
+                updateParams.add(upZ);
+            }
+            if (downZ != null) {
+                updateSql.append(", down_z = ?");
+                updateParams.add(downZ);
+            }
+            updateSql.append(" WHERE stcd = ? AND tm >= ? AND gate_no != '0'");
+            updateParams.add(stcd);
+            updateParams.add(recentWindow);
+
+            int merged = jdbcTemplate.update(updateSql.toString(), updateParams.toArray());
+
+            // 清理 gate_no=0 占位行
+            String deleteSql = "DELETE FROM " + GATE_TABLE + " WHERE stcd = ? AND gate_no = '0' AND tm >= ?";
+            int deleted = jdbcTemplate.update(deleteSql, stcd, recentWindow);
+
+            log.info("已合并gate_no=0水位到{}条闸孔行, 清理{}条占位: stcd={}", merged, deleted, stcd);
+        } catch (Exception e) {
+            log.warn("合并gate_no=0水位数据失败, stcd={}: {}", stcd, e.getMessage());
+        }
+    }
+
     // ======================== 站点状态 ========================
 
     /** 已标记在线的站点ID集合（当天），用于去重减少DB写 */
@@ -631,5 +870,15 @@ public class MonitorDataService {
         } catch (Exception e) {
             log.error("离线站点检查失败", e);
         }
+    }
+
+    /**
+     * 每天0点清空 todayOnlineSet，确保失联后恢复的站点能被重新标记在线
+     */
+    @Scheduled(cron = "0 0 0 * * ?")
+    public void resetOnlineSet() {
+        int size = todayOnlineSet.size();
+        todayOnlineSet.clear();
+        log.debug("todayOnlineSet已重置, {} 个站点可重新标记在线", size);
     }
 }

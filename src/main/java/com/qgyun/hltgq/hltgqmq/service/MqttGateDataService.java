@@ -47,7 +47,7 @@ public class MqttGateDataService {
 
     /**
      * MQTT 前缀 → 站点/设备名称 (查 zzkaec 和 water_device.name 共用)
-     * 设备表 name = 站点名 + 闸孔号#  例: "南山寺节制闸1#"
+     * 设备表 name = 站点名 + 闸孔号 + "#"  例: "南山寺节制闸1#"
      */
     private static final Map<String, String> PREFIX_MAP = new LinkedHashMap<>();
     static {
@@ -181,14 +181,18 @@ public class MqttGateDataService {
             row.put("updated_at", now);
         }
 
-        // 构建列序（取第一条的列顺序）
-        Map<String, Object> sample = rows.get(0);
-        List<String> columns = new ArrayList<>();
-        for (Map.Entry<String, Object> entry : sample.entrySet()) {
-            if (gateColumns.isEmpty() || gateColumns.contains(entry.getKey().toLowerCase())) {
-                columns.add(entry.getKey());
+        // 构建列序（取所有行的 key 并集，避免跨站点字段不一致时丢失数据）
+        Set<String> columnSet = new LinkedHashSet<>();
+        for (Map<String, Object> row : rows) {
+            for (String key : row.keySet()) {
+                if (gateColumns.isEmpty() || gateColumns.contains(key.toLowerCase())) {
+                    columnSet.add(key);
+                }
             }
         }
+        List<String> columns = new ArrayList<>(columnSet);
+        // 固定列序，避免故障恢复时不同批次列序不一致导致错位
+        Collections.sort(columns);
 
         StringBuilder colSb = new StringBuilder();
         StringBuilder placeholderSb = new StringBuilder();
@@ -336,13 +340,20 @@ public class MqttGateDataService {
         map.put("status",      "#1#");
 
         // 水位（站级，每个闸孔行都填充）
-        if (upZ   != null) map.put("up_z",   Double.parseDouble(upZ));
-        if (downZ != null) map.put("down_z", Double.parseDouble(downZ));
+        if (upZ != null) {
+            Double val = parseDoubleSafe(upZ, "up_z");
+            if (val != null) map.put("up_z", val);
+        }
+        if (downZ != null) {
+            Double val = parseDoubleSafe(downZ, "down_z");
+            if (val != null) map.put("down_z", val);
+        }
 
         // 闸门开度 R_{gateNo-1} → open_degree
         String rKey = "R_" + String.format("%03d", gateNo - 1);
         if (fields.containsKey(rKey)) {
-            map.put("open_degree", Double.parseDouble(fields.get(rKey)));
+            Double val = parseDoubleSafe(fields.get(rKey), "open_degree");
+            if (val != null) map.put("open_degree", val);
         }
 
         // DI 状态 B_{base}~B_{base+7} → local/remote/...
@@ -350,11 +361,32 @@ public class MqttGateDataService {
         for (int i = 0; i < 8; i++) {
             String bKey = "B_" + String.format("%03d", bBase + i);
             if (fields.containsKey(bKey)) {
-                map.put(DI_FIELDS[i], fields.get(bKey)); // "0" / "1"
+                Integer val = parseIntSafe(fields.get(bKey), DI_FIELDS[i]);
+                if (val != null) map.put(DI_FIELDS[i], val);
             }
         }
 
         return map;
+    }
+
+    /** 安全解析double，解析失败返回null并记录日志 */
+    private Double parseDoubleSafe(String value, String fieldName) {
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            log.debug("MQTT数值解析失败, field={}, value={}", fieldName, value);
+            return null;
+        }
+    }
+
+    /** 安全解析int，解析失败返回null并记录日志 */
+    private Integer parseIntSafe(String value, String fieldName) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            log.debug("MQTT数值解析失败, field={}, value={}", fieldName, value);
+            return null;
+        }
     }
 
     // ======================== 站点状态 ========================
@@ -377,6 +409,14 @@ public class MqttGateDataService {
         } catch (Exception e) {
             log.debug("MQTT标记站点在线失败, site={}: {}", siteId, e.getMessage());
         }
+    }
+
+    /** 每天0点清空 todayOnlineSet，确保失联后恢复的站点能被重新标记在线 */
+    @Scheduled(cron = "0 0 0 * * ?")
+    public void resetOnlineSet() {
+        int size = todayOnlineSet.size();
+        todayOnlineSet.clear();
+        log.debug("MQTT todayOnlineSet已重置, {} 个站点可重新标记在线", size);
     }
 
 }
