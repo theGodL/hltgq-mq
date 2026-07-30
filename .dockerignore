@@ -1,0 +1,22 @@
+# IDE
+.idea/
+*.iml
+
+# Maven
+target/
+
+# Git
+.git/
+.gitignore
+
+# 日志
+*.log
+
+# 部署相关（自身）
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 文档
+HELP.md
+*.md

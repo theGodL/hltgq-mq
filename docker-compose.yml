@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  hltgq-mq:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 如果构建机器不是 ARM64，可指定平台
+      # platform: linux/arm64
+    image: hltgq-mq:0.0.1
+    container_name: hltgq-mq
+    ports:
+      - "8081:8080"
+    environment:
+      # JVM 参数
+      - JAVA_OPTS=-Xms256m -Xmx512m
+      # RabbitMQ 配置（覆盖 application.properties）
+      - SPRING_RABBITMQ_HOST=10.68.18.8
+      - SPRING_RABBITMQ_PORT=5672
+      - SPRING_RABBITMQ_USERNAME=sunny
+      - SPRING_RABBITMQ_PASSWORD=sunny@2025
+      - SPRING_RABBITMQ_VIRTUAL_HOST=/
+    restart: unless-stopped
+    # 日志限制
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
