@@ -484,7 +484,7 @@ public class MonitorDataService {
         if (updated > 0) {
             log.info("riverInfo水位已合并到 {} 条闸孔行: stcd={}, Z1={}, Z2={}", updated, stcd,
                      z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
-            return;
+            // 继续创建 gate_no=0 占位行，确保后续 gateInfo 能获取水位数据
         }
 
         // 去重：相同 stcd+tm+gate_no=0 已存在则跳过（防止RabbitMQ重投）
