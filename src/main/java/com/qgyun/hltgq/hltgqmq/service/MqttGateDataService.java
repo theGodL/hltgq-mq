@@ -399,9 +399,11 @@ public class MqttGateDataService {
         if (!todayOnlineSet.add(siteId)) return;
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
+            // 无条件更新：跨天后即使已经 #1# 也要刷新 updated_at，
+            // 否则 checkOfflineSites 会在 24h 后误标为离线
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef " +
                          "SET zebpsu = '#1#', updated_at = ?, updated_by = 'SYSTEM' " +
-                         "WHERE id = ? AND (zebpsu IS NULL OR zebpsu != '#1#')";
+                         "WHERE id = ?";
             int rows = jdbcTemplate.update(sql, now, siteId);
             if (rows > 0) {
                 log.debug("MQTT站点标记在线: site={}", siteId);

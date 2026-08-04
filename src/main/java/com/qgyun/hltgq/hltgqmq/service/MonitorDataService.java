@@ -837,9 +837,11 @@ public class MonitorDataService {
         if (!todayOnlineSet.add(siteId)) return; // 当天已标记过
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
+            // 无条件更新：跨天后即使已经 #1# 也要刷新 updated_at，
+            // 否则 checkOfflineSites 会在 24h 后误标为离线
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef " +
                          "SET zebpsu = '#1#', updated_at = ?, updated_by = 'SYSTEM' " +
-                         "WHERE id = ? AND (zebpsu IS NULL OR zebpsu != '#1#')";
+                         "WHERE id = ?";
             int rows = jdbcTemplate.update(sql, now, siteId);
             if (rows > 0) {
                 log.debug("站点标记在线: site={}", siteId);
@@ -850,20 +852,53 @@ public class MonitorDataService {
     }
 
     /**
-     * 每小时检查：超过24小时未收到报文的站点标记为停用。
-     * 收到过报文的站点 updated_at 会被 markSiteOnline 刷新，
-     * 只有真正失联超过24h的才会被标记离线，程序异常不会误伤。
+     * 每小时检查：直接查所有入库表，判断站点 24h 内是否有数据到达。
+     * 不依赖 updated_at 代理字段，以实际入库记录为准。
+     * <p>
+     * 数据源覆盖：
+     * <pre>
+     * RabbitMQ (stcd 匹配 iofhpi):
+     *   msg_info   — 通信日志（msgInfo，MSG 为空时跳过）
+     *   vol_info   — RTU 电压（volInfo，VOL≤0 时跳过）
+     *   wt_nfo     — 流量（wtInfo，Q≤0 时跳过）
+     *   river_info — 水位（riverInfo，Z/Z1/Z2 全空时跳过）
+     *   rain_info  — 雨量（rainInfo，DYP≤0 时跳过）
+     *   gate       — 闸门开度/水位占位（gateInfo/gatesInfo/riverInfo闸站路由）
+     *
+     * MQTT (site 直接匹配 id):
+     *   gate       — 闸门监测（无 stcd，仅 site 字段）
+     *
+     * 不入库的表（已跳过，无需检查）：
+     *   nmisp_info — nmIspInfo 暂不录入
+     *   pcp_info   — pcpInfo 暂不录入
+     * </pre>
      */
     @Scheduled(fixedRate = 3600000)
     public void checkOfflineSites() {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Timestamp cutoff = new Timestamp(now.getTime() - 86400000L); // 24h前
-            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef " +
+            // 对所有入库表做 UNION ALL：任一表有 24h 内数据 → 在线，全部无数据 → 离线
+            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                          "SET zebpsu = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
                          "WHERE zebpsu IS DISTINCT FROM '#2#' " +
-                         "AND (updated_at IS NULL OR updated_at < ?)";
-            int rows = jdbcTemplate.update(sql, now, cutoff);
+                         "AND NOT EXISTS (" +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE stcd = s.iofhpi AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_vol_info   WHERE stcd = s.iofhpi AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_wt_nfo     WHERE stcd = s.iofhpi AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_river_info WHERE stcd = s.iofhpi AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_rain_info  WHERE stcd = s.iofhpi AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE stcd = s.iofhpi AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE site = s.id     AND tm >= ?" +
+                         ")";
+            int rows = jdbcTemplate.update(sql, now,
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
                 log.info("标记离线站点: {} 个", rows);
             }
