@@ -298,14 +298,14 @@ public class MqttGateDataService {
                 log.warn("查找设备失败, name={}, 错误: {}", name, e.getMessage());
             }
 
-            // 不存在则创建
+            // 不存在则创建（MQTT仅有闸门数据，type固定为#4#）
             try {
                 String deviceId = IdGenerator.generate();
                 Timestamp now = new Timestamp(System.currentTimeMillis());
                 String sql = "INSERT INTO " + DEVICE_TABLE +
-                        " (id, corp_code, created_at, created_by, updated_at, updated_by, name, site) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-                jdbcTemplate.update(sql, deviceId, corpCode, now, "SYSTEM", now, "SYSTEM", name, siteId);
+                        " (id, corp_code, created_at, created_by, updated_at, updated_by, name, site, type) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                jdbcTemplate.update(sql, deviceId, corpCode, now, "SYSTEM", now, "SYSTEM", name, siteId, "#4#");
                 log.info("已自动创建设备: name={}, id={}", name, deviceId);
                 return deviceId;
             } catch (Exception e) {

@@ -333,8 +333,9 @@ public class MonitorDataService {
     /**
      * 按站点类型查找或创建设备，返回 device_id (带缓存)
      * <p>
-     * 闸站(#4#): 生成闸孔1设备 "{siteName}闸孔1#"，所有站级数据指向它
-     * 非闸站: 生成RTU设备 "{siteName}{类型后缀}#"
+     * 闸站(#4#): 生成闸孔1设备 "{siteName}1#"，所有站级数据指向它
+     * 非闸站已知类型: 生成RTU设备 "{siteName}{类型后缀}#"
+     * 非闸站未知类型: 先查是否已有 "{siteName}1#" 闸孔设备，有则复用(epjutj未及时更新场景)；无则兜底 "{siteName}待接入#"
      */
     private String lookupOrCreateRtuDevice(String stcd, String siteId) {
         return stcdDeviceCache.computeIfAbsent(stcd, s -> {
@@ -350,9 +351,24 @@ public class MonitorDataService {
             } else {
                 // 非闸站: 按站点类型生成 RTU 设备
                 String typeCode = extractPrimarySiteType(epjutj);
-                String suffix = SITE_TYPE_DEVICE_MAP.getOrDefault(typeCode, "遥测终端");
-                deviceName = siteName + suffix + "#";
-                deviceType = epjutj;
+                String suffix = SITE_TYPE_DEVICE_MAP.get(typeCode); // 已知类型直接取，未知返回null
+                if (suffix != null) {
+                    // 已知非闸站类型（水位计/雨量计等），直接使用，不查闸孔设备
+                    deviceName = siteName + suffix + "#";
+                    deviceType = epjutj;
+                } else {
+                    // 类型未知：先检查是否已有闸孔1#设备（epjutj可能尚未更新为#4#的闸站）
+                    String gateDeviceName = siteName + "1#";
+                    String gateDeviceId = findExistingDevice(gateDeviceName);
+                    if (gateDeviceId != null) {
+                        log.info("站点类型未知但已存在闸孔设备，复用: stcd={}, device={}", stcd, gateDeviceName);
+                        deviceCache.putIfAbsent(gateDeviceName, gateDeviceId);
+                        return gateDeviceId;
+                    }
+                    // 无闸孔设备：兜底"待接入"
+                    deviceName = siteName + "待接入#";
+                    deviceType = null;
+                }
             }
             return lookupOrCreateDeviceByName(deviceName, siteId, deviceType);
         });
@@ -398,6 +414,86 @@ public class MonitorDataService {
                 return null;
             }
         });
+    }
+
+    /** 仅查询设备是否存在（不创建），返回 device_id 或 null */
+    private String findExistingDevice(String deviceName) {
+        // 先查缓存
+        String cached = deviceCache.get(deviceName);
+        if (cached != null) return cached;
+        // 缓存未命中则查DB
+        try {
+            String sql = "SELECT id FROM " + DEVICE_TABLE + " WHERE name = ?";
+            List<String> results = jdbcTemplate.queryForList(sql, String.class, deviceName);
+            if (results != null && !results.isEmpty()) {
+                String id = results.get(0);
+                deviceCache.putIfAbsent(deviceName, id);
+                return id;
+            }
+        } catch (Exception e) {
+            log.debug("查找设备失败, name={}, 错误: {}", deviceName, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * 清理孤儿"待接入"设备。
+     * 先遍历所有子表检查是否有数据：有数据则迁移到正确设备，无数据直接删除。
+     * 迁移/删除后从 deviceCache 中移除。
+     */
+    private void cleanupOrphanDevice(String orphanName, String siteId, String correctDeviceId) {
+        String orphanId = findExistingDevice(orphanName);
+        if (orphanId == null) return; // 没有孤儿设备，无需处理
+        if (orphanId.equals(correctDeviceId)) return; // 就是正确设备本身，不删
+
+        // 检查所有入库子表是否已有该设备的记录
+        boolean hasData = false;
+        for (String tagKey : TAG_TABLE_MAP.keySet()) {
+            if ("gateInfo".equals(tagKey)) continue; // 与 gatesInfo 同表，跳过
+            String tableName = TAG_TABLE_MAP.get(tagKey);
+            try {
+                String checkSql = "SELECT COUNT(*) FROM " + tableName + " WHERE device = ?";
+                int count = jdbcTemplate.queryForObject(checkSql, Integer.class, orphanId);
+                if (count > 0) {
+                    hasData = true;
+                    break;
+                }
+            } catch (Exception e) {
+                log.debug("检查孤儿设备子表数据失败, table={}, device={}: {}", tableName, orphanId, e.getMessage());
+            }
+        }
+
+        if (hasData) {
+            // 将所有子表的 device 迁移到正确设备
+            int migrated = 0;
+            for (String tagKey : TAG_TABLE_MAP.keySet()) {
+                if ("gateInfo".equals(tagKey)) continue;
+                String tableName = TAG_TABLE_MAP.get(tagKey);
+                try {
+                    String updateSql = "UPDATE " + tableName + " SET device = ? WHERE device = ?";
+                    int n = jdbcTemplate.update(updateSql, correctDeviceId, orphanId);
+                    if (n > 0) {
+                        migrated += n;
+                        log.info("device迁移: {} 表 {} 行, orphan={} -> correct={}", tableName, n, orphanId, correctDeviceId);
+                    }
+                } catch (Exception e) {
+                    log.warn("device迁移失败: table={}, orphan={}: {}", tableName, orphanId, e.getMessage());
+                }
+            }
+            log.info("孤儿设备数据迁移完成: orphan={}, correct={}, 共{}行受到影响", orphanName, correctDeviceId, migrated);
+        }
+
+        // 删除孤儿设备（此时子表已无引用或本来就没有）
+        try {
+            String deleteSql = "DELETE FROM " + DEVICE_TABLE + " WHERE id = ? AND name = ? AND site = ?";
+            int deleted = jdbcTemplate.update(deleteSql, orphanId, orphanName, siteId);
+            if (deleted > 0) {
+                deviceCache.remove(orphanName);
+                log.info("已删除孤儿设备: name={}, id={}, site={}", orphanName, orphanId, siteId);
+            }
+        } catch (Exception e) {
+            log.warn("删除孤儿设备失败: name={}, 错误: {}", orphanName, e.getMessage());
+        }
     }
 
     /** 根据 site_id 查站点名称（带缓存） */
@@ -453,11 +549,21 @@ public class MonitorDataService {
         // 使用报文 TM，兜底服务器时间
         Timestamp tm = extractTm(entity, now);
 
-        String device = lookupOrCreateRtuDevice(stcd, siteId);
+        // Z1/Z2有正值确定是闸站，直接用首闸孔设备，不依赖 epjutj
+        String siteName = getSiteName(siteId);
+        String deviceName = siteName + "1#";
+        String device = lookupOrCreateDeviceByName(deviceName, siteId, "#4#");
         if (device == null) {
             log.error("riverInfo→gate 设备缺失, 跳过入库: stcd={}", stcd);
             return;
         }
+        // 确保 stcdDeviceCache 指向正确的首闸孔设备（覆盖可能存在的"待接入"缓存）
+        String oldCached = stcdDeviceCache.put(stcd, device);
+        if (oldCached != null && !oldCached.equals(device)) {
+            log.info("riverInfo已纠正stcd设备缓存: stcd={}, 旧设备={}, 新设备={}", stcd, oldCached, device);
+        }
+        // 清理可能已创建的孤儿"待接入"设备（msgInfo 先于 riverInfo 到达时产生）
+        cleanupOrphanDevice(siteName + "待接入#", siteId, device);
 
         double z1 = hasValue(entity, "Z1") && entity.get("Z1").asDouble() > 0 ? entity.get("Z1").asDouble() : -1;
         double z2 = hasValue(entity, "Z2") && entity.get("Z2").asDouble() > 0 ? entity.get("Z2").asDouble() : -1;
@@ -559,7 +665,7 @@ public class MonitorDataService {
             if (openDegree == -999) continue;
 
             String deviceName = siteName + i + "#";
-            String deviceId = lookupOrCreateDeviceByName(deviceName, siteId);
+            String deviceId = lookupOrCreateDeviceByName(deviceName, siteId, "#4#");
             if (deviceId == null) {
                 log.error("gatesInfo 设备缺失, 跳过闸孔{}: stcd={}, deviceName={}", i, stcd, deviceName);
                 continue;
@@ -613,6 +719,17 @@ public class MonitorDataService {
         // 合并 pending 的 gate_no=0 水位占位行（riverInfo 可能已先到达）
         if (inserted > 0) {
             mergeGateZeroWaterLevels(stcd, tm, now);
+            // 刷新 stcdDeviceCache 指向正确的首闸孔设备（覆盖 epjutj=NULL 时可能创建的"待接入"设备）
+            String gate1DeviceName = siteName + "1#";
+            String gate1DeviceId = findExistingDevice(gate1DeviceName);
+            if (gate1DeviceId != null) {
+                String old = stcdDeviceCache.put(stcd, gate1DeviceId);
+                if (old != null && !old.equals(gate1DeviceId)) {
+                    log.info("已纠正stcd设备缓存: stcd={}, 旧设备={}, 新设备={}", stcd, old, gate1DeviceId);
+                }
+                // 清理无数据的孤儿"待接入"设备
+                cleanupOrphanDevice(siteName + "待接入#", siteId, gate1DeviceId);
+            }
         }
 
         log.info("gatesInfo闸门开度入库成功: stcd={}, 闸孔数={}, table={}", stcd, inserted, GATE_TABLE);
