@@ -16,6 +16,7 @@ import java.sql.Timestamp;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.springframework.scheduling.annotation.Scheduled;
 
@@ -95,6 +96,9 @@ public class MonitorDataService {
 
     /** stcd → site_id 缓存 */
     private final ConcurrentMap<String, String> stcdSiteCache = new ConcurrentHashMap<>();
+
+    /** 入库失败丢弃的消息计数（便于监控） */
+    private final AtomicLong droppedMessageCount = new AtomicLong(0);
 
     /**
      * 启动时从 information_schema 加载所有目标表的列名
@@ -190,6 +194,13 @@ public class MonitorDataService {
                 if ("stcd".equals(lowerKey)) {
                     continue;
                 }
+                // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳
+                if ("tm".equals(lowerKey)) {
+                    if (isValidColumn(validColumns, "tm")) {
+                        fieldMap.put("tm", extractTm(entity, now));
+                    }
+                    continue;
+                }
                 if (!isValidColumn(validColumns, lowerKey)) {
                     continue;
                 }
@@ -269,7 +280,7 @@ public class MonitorDataService {
                         return;
                     }
                 } catch (Exception e) {
-                    log.debug("去重检查失败, 放行入库: {}", e.getMessage());
+                    log.warn("去重检查失败, 放行入库: {}", e.getMessage());
                 }
             }
 
@@ -295,7 +306,8 @@ public class MonitorDataService {
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
 
         } catch (Exception e) {
-            log.error("数据入库失败: {}", message, e);
+            long dropped = droppedMessageCount.incrementAndGet();
+            log.error("数据入库失败(累计丢弃{}条): {}", dropped, message, e);
             // 不抛出异常，避免阻塞MQ消费
         }
     }
@@ -894,7 +906,8 @@ public class MonitorDataService {
             if (tmNode.isNumber()) {
                 return new Timestamp(tmNode.asLong());
             }
-            return Timestamp.valueOf(tmNode.asText());
+            // ISO 8601 "yyyy-MM-ddTHH:mm:ss" → 替换 T 为空格，兼容 Timestamp.valueOf()
+            return Timestamp.valueOf(tmNode.asText().replace('T', ' '));
         } catch (Exception e) {
             log.debug("无法解析TM字段, 使用兜底时间: {}", entity.get("TM"));
             return fallback;
