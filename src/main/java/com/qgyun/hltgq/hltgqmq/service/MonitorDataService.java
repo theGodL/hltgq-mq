@@ -242,11 +242,32 @@ public class MonitorDataService {
                     return;
                 }
             }
-            // === wtInfo 条件入库：Q为空或≤0视为无效流量 ===
+            // === wtInfo 条件入库 ===
+            // Q/TF为0属正常(无流量，如冬季枯水期)；Q<0或>100视为异常；
+            // FFFFFFFF(4294967295)表示传感器通讯异常，数据无效。异常数据不入库但打印日志。
             if ("wtInfo".equals(tag)) {
-                if (!hasValue(entity, "Q") || entity.get("Q").asDouble() <= 0) {
-                    log.debug("wtInfo 无有效流量数据, 跳过入库, stcd={}", stcd);
+                JsonNode qNode = entity.get("Q");
+                if (qNode == null || qNode.isNull()) {
+                    log.debug("wtInfo 缺少流量字段Q, 跳过入库, stcd={}", stcd);
                     return;
+                }
+                double q = parseDoubleSafe(qNode);
+                if (Double.isNaN(q) || q == 4294967295.0) {
+                    log.warn("wtInfo 瞬时流量无效(传感器通讯异常), 不入库: stcd={}, Q={}", stcd, qNode.asText());
+                    return;
+                }
+                if (q < 0 || q > 100) {
+                    log.warn("wtInfo 瞬时流量异常(Q={}), 不入库: stcd={}", q, stcd);
+                    return;
+                }
+                // 累计流量TF：0属正常，FFFFFFFF(4294967295)同样视为通讯异常
+                JsonNode tfNode = entity.get("TF");
+                if (tfNode != null && !tfNode.isNull()) {
+                    double tf = parseDoubleSafe(tfNode);
+                    if (Double.isNaN(tf) || tf == 4294967295.0) {
+                        log.warn("wtInfo 累计流量无效(传感器通讯异常), 不入库: stcd={}, TF={}", stcd, tfNode.asText());
+                        return;
+                    }
                 }
             }
             // === rainInfo 条件入库：DYP≤0说明设备无雨量监测能力或报文异常，跳过入库 ===
@@ -872,6 +893,17 @@ public class MonitorDataService {
     }
 
     /**
+     * 安全解析数值节点：非数值文本(如FFFFFFFF)返回NaN，表示传感器通讯异常
+     */
+    private double parseDoubleSafe(JsonNode node) {
+        try {
+            return node.isTextual() ? Double.parseDouble(node.asText()) : node.asDouble();
+        } catch (NumberFormatException e) {
+            return Double.NaN;
+        }
+    }
+
+    /**
      * 将JsonNode值转为Java对象
      */
     private Object convertValue(JsonNode node) {
@@ -990,7 +1022,7 @@ public class MonitorDataService {
      * RabbitMQ (stcd 匹配 iofhpi):
      *   msg_info   — 通信日志（msgInfo，MSG 为空时跳过）
      *   vol_info   — RTU 电压（volInfo，VOL≤0 时跳过）
-     *   wt_nfo     — 流量（wtInfo，Q≤0 时跳过）
+     *   wt_nfo     — 流量（wtInfo，Q缺失/通讯异常/异常值 时跳过）
      *   river_info — 水位（riverInfo，Z/Z1/Z2 全空时跳过）
      *   rain_info  — 雨量（rainInfo，DYP≤0 时跳过）
      *   gate       — 闸门开度/水位占位（gateInfo/gatesInfo/riverInfo闸站路由）
