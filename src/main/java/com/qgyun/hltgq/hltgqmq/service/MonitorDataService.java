@@ -693,9 +693,9 @@ public class MonitorDataService {
             String fieldName = "Gates" + i;
             if (!hasValue(entity, fieldName)) continue; // 跳过null字段，继续处理后续闸孔
 
-            double openDegree = entity.get(fieldName).asDouble();
-            // -999 表示无信号，跳过该闸孔（不创建设备）
-            if (openDegree == -999) continue;
+            double openDegree = parseDoubleSafe(entity.get(fieldName));
+            // 非数值文本(如FFFFFFFF)或 -999 表示无信号，跳过该闸孔（不创建设备）
+            if (Double.isNaN(openDegree) || openDegree == -999) continue;
 
             String deviceName = siteName + i + "#";
             String deviceId = lookupOrCreateDeviceByName(deviceName, siteId, "#4#");

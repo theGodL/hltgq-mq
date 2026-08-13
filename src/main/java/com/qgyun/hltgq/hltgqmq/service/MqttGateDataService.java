@@ -44,6 +44,8 @@ public class MqttGateDataService {
 
     private static final String GATE_TABLE   = SCHEMA + "t_auto_hltgq_water_gate";
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
+    private static final String WT_NFO_TABLE = SCHEMA + "t_auto_hltgq_water_wt_nfo";
+    private static final String SLUICE_TABLE = SCHEMA + "t_auto_hltgq_water_sluice_discharge";
 
     /**
      * MQTT 前缀 → 站点/设备名称 (查 zzkaec 和 water_device.name 共用)
@@ -68,6 +70,9 @@ public class MqttGateDataService {
     /** 闸门表有效列名缓存 */
     private Set<String> gateColumns = Collections.emptySet();
 
+    /** wt_nfo 流量表有效列名缓存 */
+    private Set<String> wtColumns = Collections.emptySet();
+
     /** 最新数据缓存: key = "siteId_deviceId_gateNo", value = fieldMap (会持续更新) */
     private final ConcurrentMap<String, Map<String, Object>> latestDataCache = new ConcurrentHashMap<>();
 
@@ -76,6 +81,12 @@ public class MqttGateDataService {
 
     /** device 名称 → deviceId 缓存 (首次查/建后缓存) */
     private final ConcurrentMap<String, String> deviceCache = new ConcurrentHashMap<>();
+
+    /** site → 流量计算配置缓存（5分钟过期，页面编辑配置 version+1 后自动生效） */
+    private final ConcurrentMap<String, SluiceConfigEntry> sluiceConfigCache = new ConcurrentHashMap<>();
+
+    /** 流量计算配置缓存有效期（5 分钟） */
+    private static final long SLUICE_CACHE_TTL_MS = 5 * 60 * 1000L;
 
     @PostConstruct
     public void init() {
@@ -90,6 +101,18 @@ public class MqttGateDataService {
             log.info("已加载闸门表列名元数据: {} 列", gateColumns.size());
         } catch (Exception e) {
             log.error("加载闸门表列名元数据失败", e);
+        }
+        try {
+            String sql = "SELECT column_name FROM information_schema.columns " +
+                    "WHERE table_schema = 'qixiao-apaas' AND table_name = 't_auto_hltgq_water_wt_nfo'";
+            List<String> cols = jdbcTemplate.queryForList(sql, String.class);
+            wtColumns = new HashSet<>();
+            for (String col : cols) {
+                wtColumns.add(col.toLowerCase());
+            }
+            log.info("已加载流量表列名元数据: {} 列", wtColumns.size());
+        } catch (Exception e) {
+            log.error("加载流量表列名元数据失败", e);
         }
     }
 
@@ -231,6 +254,273 @@ public class MqttGateDataService {
                 String cacheKey = row.get("site") + "_" + row.get("device") + "_" + row.get("gate_no");
                 latestDataCache.putIfAbsent(cacheKey, row);
             }
+            return;
+        }
+
+        // 闸门数据入库成功后，计算各站实时流量并写入流量表（失败仅跳过本批流量，不影响闸门数据）
+        try {
+            List<Map<String, Object>> wtRows = buildWtRows(rows);
+            insertWtRows(wtRows);
+        } catch (Exception e) {
+            log.warn("闸站流量计算/入库失败, 跳过本批流量写入", e);
+        }
+    }
+
+    // ======================== 流量计算 ========================
+
+    /**
+     * 聚合本批缓存行，按站计算实时流量，生成 wt_nfo 流量表行。
+     * 守卫场景（水位/开度缺失、无配置、倒流、H≤0 等）跳过该站。
+     */
+    private List<Map<String, Object>> buildWtRows(List<Map<String, Object>> rows) {
+        // 按 site 聚合（水位是站级共享值，开度是孔级）
+        Map<String, List<Map<String, Object>>> bySite = new LinkedHashMap<>();
+        for (Map<String, Object> row : rows) {
+            Object site = row.get("site");
+            if (site == null) {
+                continue;
+            }
+            bySite.computeIfAbsent(String.valueOf(site), k -> new ArrayList<>()).add(row);
+        }
+
+        List<Map<String, Object>> wtRows = new ArrayList<>();
+        for (Map.Entry<String, List<Map<String, Object>>> entry : bySite.entrySet()) {
+            String siteId = entry.getKey();
+            List<Map<String, Object>> siteRows = entry.getValue();
+
+            // 守卫5/6：无配置或脏配置 → 整站跳过
+            GateDischargeCalculator.SluiceConfig config = getSluiceConfig(siteId);
+            if (config == null) {
+                log.warn("站点无有效流量计算配置, 跳过流量入库: site={}", siteId);
+                continue;
+            }
+
+            // 水位为站级共享值，取该站任一行
+            Map<String, Object> sampleRow = siteRows.get(0);
+            Double upZ = toDouble(sampleRow.get("up_z"));
+            if (upZ == null || upZ.isNaN()) {
+                log.debug("上游水位缺失, 跳过流量计算: site={}", siteId);
+                continue;
+            }
+            Double downZ = toDouble(sampleRow.get("down_z"));
+            if (downZ == null || downZ.isNaN()) {
+                log.debug("下游水位缺失, 跳过流量计算: site={}", siteId);
+                continue;
+            }
+
+            // 逐孔收集开度；首孔设备取 gate_no 最小的行（站级流量归首孔，与 RabbitMQ 一致）
+            List<Double> openDegrees = new ArrayList<>();
+            Map<String, Object> firstGateRow = null;
+            int firstGateNo = Integer.MAX_VALUE;
+            boolean skip = false;
+            for (Map<String, Object> row : siteRows) {
+                Double openDegree = toDouble(row.get("open_degree"));
+                if (openDegree == null || openDegree.isNaN() || openDegree < 0) {
+                    // 守卫4：任一孔开度缺失或为负 → 整站跳过（避免站流量偏小失真）
+                    log.debug("闸孔开度缺失或异常, 整站跳过流量计算: site={}, gate_no={}",
+                            siteId, row.get("gate_no"));
+                    skip = true;
+                    break;
+                }
+                openDegrees.add(openDegree);
+                int gateNo = parseInt(row.get("gate_no"));
+                if (gateNo < firstGateNo) {
+                    firstGateNo = gateNo;
+                    firstGateRow = row;
+                }
+            }
+            if (skip || openDegrees.isEmpty()) {
+                continue;
+            }
+
+            Double totalQ = GateDischargeCalculator.calculateSiteDischarge(
+                    config, upZ, downZ, openDegrees, siteId);
+            if (totalQ == null) {
+                continue;
+            }
+
+            wtRows.add(buildWtRow(siteId, firstGateRow != null ? firstGateRow : sampleRow, upZ, totalQ));
+        }
+        return wtRows;
+    }
+
+    /**
+     * 组装 wt_nfo 站级一行：stcd 不写（MQTT 无 stcd），site + device 关联，z=上游水位，q=总流量
+     */
+    private Map<String, Object> buildWtRow(String siteId, Map<String, Object> gateRow,
+                                           double upZ, double totalQ) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        Timestamp now = new Timestamp(System.currentTimeMillis());
+
+        // 系统字段（与 RabbitMQ 行结构一致）
+        map.put("id", IdGenerator.generate());
+        map.put("corp_code", corpCode);
+        map.put("created_at", now);
+        map.put("created_by", "SYSTEM");
+        map.put("updated_at", now);
+        map.put("updated_by", "SYSTEM");
+
+        // 业务字段（按 wt_nfo 实际列过滤，列名元数据缺失时不校验直接写入）
+        if (wtColumns.isEmpty() || wtColumns.contains("site")) {
+            map.put("site", siteId);
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("device")) {
+            Object device = gateRow.get("device");
+            if (device != null) {
+                map.put("device", device);
+            }
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("z")) {
+            map.put("z", upZ);
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("q")) {
+            map.put("q", totalQ);
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("tm")) {
+            map.put("tm", now);
+        }
+        return map;
+    }
+
+    /** 批量写入流量表（列序固定，与闸门表写入方式一致） */
+    private void insertWtRows(List<Map<String, Object>> wtRows) {
+        if (wtRows.isEmpty()) {
+            return;
+        }
+
+        Set<String> columnSet = new LinkedHashSet<>();
+        for (Map<String, Object> row : wtRows) {
+            for (String key : row.keySet()) {
+                if (wtColumns.isEmpty() || wtColumns.contains(key.toLowerCase())) {
+                    columnSet.add(key);
+                }
+            }
+        }
+        List<String> columns = new ArrayList<>(columnSet);
+        Collections.sort(columns);
+
+        StringBuilder colSb = new StringBuilder();
+        StringBuilder placeholderSb = new StringBuilder();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) {
+                colSb.append(", ");
+                placeholderSb.append(", ");
+            }
+            colSb.append(columns.get(i));
+            placeholderSb.append("?");
+        }
+
+        String sql = String.format("INSERT INTO %s (%s) VALUES (%s)",
+                WT_NFO_TABLE, colSb.toString(), placeholderSb.toString());
+
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                Map<String, Object> row = wtRows.get(i);
+                for (int j = 0; j < columns.size(); j++) {
+                    ps.setObject(j + 1, row.get(columns.get(j)));
+                }
+            }
+
+            @Override
+            public int getBatchSize() {
+                return wtRows.size();
+            }
+        });
+        log.info("闸站流量入库完成: {} 条记录 → {}", wtRows.size(), WT_NFO_TABLE);
+    }
+
+    /**
+     * 查询站点流量计算配置：version 最大 + created_at 最新，带 5 分钟缓存。
+     * 查无记录/脏配置返回 null，同样缓存（避免每批反复查库）。
+     */
+    private GateDischargeCalculator.SluiceConfig getSluiceConfig(String siteId) {
+        long now = System.currentTimeMillis();
+        SluiceConfigEntry cached = sluiceConfigCache.get(siteId);
+        if (cached != null && now - cached.loadTime < SLUICE_CACHE_TTL_MS) {
+            return cached.config;
+        }
+
+        GateDischargeCalculator.SluiceConfig config = loadSluiceConfig(siteId);
+        sluiceConfigCache.put(siteId, new SluiceConfigEntry(config, now));
+        return config;
+    }
+
+    private GateDischargeCalculator.SluiceConfig loadSluiceConfig(String siteId) {
+        try {
+            String sql = "SELECT full_open_free_coeff, width, bottom_elevation, " +
+                    "submerged_flow_coeff, controlled_free_coeff, orifice_submerged_coeff, height " +
+                    "FROM " + SLUICE_TABLE + " WHERE site = ? ORDER BY version DESC, created_at DESC LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId);
+            if (rows == null || rows.isEmpty()) {
+                log.warn("站点未配置流量计算参数(sluice_discharge): site={}", siteId);
+                return null;
+            }
+            Map<String, Object> row = rows.get(0);
+
+            // 字段可能为字符串或数值，统一按文本解析
+            Double m     = parseDoubleOrNull(row.get("full_open_free_coeff"));
+            Double phi   = parseDoubleOrNull(row.get("submerged_flow_coeff"));
+            Double mu    = parseDoubleOrNull(row.get("controlled_free_coeff"));
+            Double mu2   = parseDoubleOrNull(row.get("orifice_submerged_coeff"));
+            Double width = parseDoubleOrNull(row.get("width"));
+            Double bottom = parseDoubleOrNull(row.get("bottom_elevation"));
+            Double height = parseDoubleOrNull(row.get("height"));
+
+            if (m == null || phi == null || mu == null || mu2 == null
+                    || width == null || bottom == null || height == null) {
+                log.warn("流量计算配置字段缺失或非数值, 跳过: site={}, row={}", siteId, row);
+                return null;
+            }
+            // 守卫6：系数/孔宽/闸底高程 ≤0 视为脏配置
+            if (m <= 0 || phi <= 0 || mu <= 0 || mu2 <= 0
+                    || width <= 0 || bottom <= 0 || height <= 0) {
+                log.warn("流量计算配置异常(存在≤0值), 跳过: site={}, m={}, phi={}, mu={}, mu2={}, width={}, bottom={}, height={}",
+                        siteId, m, phi, mu, mu2, width, bottom, height);
+                return null;
+            }
+            return new GateDischargeCalculator.SluiceConfig(siteId, m, phi, mu, mu2, width, bottom, height);
+        } catch (Exception e) {
+            log.warn("查询流量计算配置失败: site={}, 错误: {}", siteId, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 配置缓存条目（config 为 null 表示查无记录/脏配置，同样短期缓存避免反复查库） */
+    private static class SluiceConfigEntry {
+        final GateDischargeCalculator.SluiceConfig config;
+        final long loadTime;
+
+        SluiceConfigEntry(GateDischargeCalculator.SluiceConfig config, long loadTime) {
+            this.config = config;
+            this.loadTime = loadTime;
+        }
+    }
+
+    /** Object → Double（兼容 Number 与文本），解析失败返回 null */
+    private Double toDouble(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).doubleValue();
+        }
+        return parseDoubleOrNull(value);
+    }
+
+    private Double parseDoubleOrNull(Object value) {
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private int parseInt(Object value) {
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return Integer.MAX_VALUE;
         }
     }
 
