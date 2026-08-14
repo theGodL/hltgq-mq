@@ -47,6 +47,14 @@ public class MqttGateDataService {
     private static final String WT_NFO_TABLE = SCHEMA + "t_auto_hltgq_water_wt_nfo";
     private static final String SLUICE_TABLE = SCHEMA + "t_auto_hltgq_water_sluice_discharge";
 
+    /** ===== 数值守卫边界（与 RabbitMQ 路径一致，审计定版） ===== */
+    /** 水位上限(m)，河道/闸站水位基准差异大，取宽松值 */
+    private static final double MAX_WATER_LEVEL = 1000;
+    /** 闸门开度上限(m)，弧形/平面闸门物理开度远小于此值 */
+    private static final double MAX_OPEN_DEGREE = 50;
+    /** FFFFFFFF(4294967295) 传感器通讯异常哨兵值 */
+    private static final double SENSOR_COMM_ERR = 4294967295.0;
+
     /**
      * MQTT 前缀 → 站点/设备名称 (查 zzkaec 和 water_device.name 共用)
      * 设备表 name = 站点名 + 闸孔号 + "#"  例: "南山寺节制闸1#"
@@ -149,10 +157,15 @@ public class MqttGateDataService {
 
                 Set<Integer> gateNos = new TreeSet<>();
                 for (String key : fields.keySet()) {
-                    if (key.startsWith("R_")) {
-                        gateNos.add(Integer.parseInt(key.substring(2)) + 1);
-                    } else if (key.startsWith("B_")) {
-                        gateNos.add(Integer.parseInt(key.substring(2)) / 16 + 1);
+                    try {
+                        if (key.startsWith("R_")) {
+                            gateNos.add(Integer.parseInt(key.substring(2)) + 1);
+                        } else if (key.startsWith("B_")) {
+                            gateNos.add(Integer.parseInt(key.substring(2)) / 16 + 1);
+                        }
+                    } catch (NumberFormatException e) {
+                        // 非规范标签(如R_XXX)跳过，不因单键异常丢弃整条报文
+                        log.debug("MQTT闸孔标签编号解析失败, key={}", key);
                     }
                 }
 
@@ -202,6 +215,24 @@ public class MqttGateDataService {
             row.put("ctime", now);
             row.put("created_at", now);
             row.put("updated_at", now);
+        }
+
+        // 去重：site+device+gate_no+tm 已存在则跳过（防止批量写入部分成功后的重试产生重复行）
+        rows.removeIf(row -> {
+            try {
+                String checkSql = "SELECT COUNT(*) FROM " + GATE_TABLE +
+                        " WHERE site = ? AND device = ? AND gate_no = ? AND tm = ?";
+                Integer count = jdbcTemplate.queryForObject(checkSql, Integer.class,
+                        row.get("site"), row.get("device"), row.get("gate_no"), row.get("tm"));
+                return count != null && count > 0;
+            } catch (Exception e) {
+                log.debug("MQTT去重检查失败, 放行: {}", e.getMessage());
+                return false;
+            }
+        });
+        if (rows.isEmpty()) {
+            log.debug("缓存行均已入库, 跳过本批");
+            return;
         }
 
         // 构建列序（取所有行的 key 并集，避免跨站点字段不一致时丢失数据）
@@ -629,30 +660,31 @@ public class MqttGateDataService {
         map.put("ctime",       now);
         map.put("status",      "#1#");
 
-        // 水位（站级，每个闸孔行都填充）
+        // 水位（站级，每个闸孔行都填充）；守卫：>0且≤1000，排除通讯异常哨兵值，
+        // 避免PLC异常值(如0/32767/FFFFFFFF)入库后展示层出现离奇水位
         if (upZ != null) {
             Double val = parseDoubleSafe(upZ, "up_z");
-            if (val != null) map.put("up_z", val);
+            if (val != null && val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR) map.put("up_z", val);
         }
         if (downZ != null) {
             Double val = parseDoubleSafe(downZ, "down_z");
-            if (val != null) map.put("down_z", val);
+            if (val != null && val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR) map.put("down_z", val);
         }
 
-        // 闸门开度 R_{gateNo-1} → open_degree
+        // 闸门开度 R_{gateNo-1} → open_degree；守卫：物理范围 [0, 50]m，越界不入库
         String rKey = "R_" + String.format("%03d", gateNo - 1);
         if (fields.containsKey(rKey)) {
             Double val = parseDoubleSafe(fields.get(rKey), "open_degree");
-            if (val != null) map.put("open_degree", val);
+            if (val != null && val >= 0 && val <= MAX_OPEN_DEGREE) map.put("open_degree", val);
         }
 
-        // DI 状态 B_{base}~B_{base+7} → local/remote/...
+        // DI 状态 B_{base}~B_{base+7} → local/remote/...；守卫：仅接受0/1，其他值视为PLC异常不入库
         int bBase = (gateNo - 1) * 16;
         for (int i = 0; i < 8; i++) {
             String bKey = "B_" + String.format("%03d", bBase + i);
             if (fields.containsKey(bKey)) {
                 Integer val = parseIntSafe(fields.get(bKey), DI_FIELDS[i]);
-                if (val != null) map.put(DI_FIELDS[i], val);
+                if (val != null && (val == 0 || val == 1)) map.put(DI_FIELDS[i], val);
             }
         }
 

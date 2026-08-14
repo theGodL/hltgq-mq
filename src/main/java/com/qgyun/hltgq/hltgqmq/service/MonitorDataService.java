@@ -64,6 +64,30 @@ public class MonitorDataService {
     /** gate 表全限定名（riverInfo 闸站水位路由目标） */
     private static final String GATE_TABLE = SCHEMA + "t_auto_hltgq_water_gate";
 
+    /** ===== 数值守卫边界（物理合理性，审计定版） ===== */
+    /** 水位上限(m)，河道/闸站水位基准差异大，取宽松值 */
+    private static final double MAX_WATER_LEVEL = 1000;
+    /** 闸门开度上限(m)，弧形/平面闸门物理开度远小于此值 */
+    private static final double MAX_OPEN_DEGREE = 50;
+    /** RTU电压上限(V)，直流供电一般 ≤48V */
+    private static final double MAX_VOLTAGE = 100;
+    /** 瞬时流量上限(m³/s)，中大型闸站单孔过流远小于此值 */
+    private static final double MAX_FLOW = 100;
+    /** 日降雨量上限(mm)，极端台风日也不超过此值 */
+    private static final double MAX_DAILY_RAINFALL = 5000;
+    /** 1h/3h/6h时段降雨量物理上限(mm)，拦截DYP跳变导致的离奇降雨 */
+    private static final double MAX_RAINFALL_1H = 500;
+    private static final double MAX_RAINFALL_3H = 1500;
+    private static final double MAX_RAINFALL_6H = 3000;
+    /** 1h水位涨幅绝对上限(m)，拦截水位跳变导致的离奇涨幅 */
+    private static final double MAX_HOURLY_RISE = 100;
+    /** FFFFFFFF(4294967295) 传感器通讯异常哨兵值 */
+    private static final double SENSOR_COMM_ERR = 4294967295.0;
+    /** TM时间戳下界：早于2000年视为解析错误(1970/秒级未转换等)，用服务器时间兜底 */
+    private static final long TM_MIN_EPOCH_MS = Timestamp.valueOf("2000-01-01 00:00:00").getTime();
+    /** TM时间戳超前容忍度：晚于服务器时间2h视为设备时钟错误 */
+    private static final long TM_MAX_AHEAD_MS = 2 * 3600000L;
+
     /** 设备表全限定名 */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
 
@@ -211,15 +235,28 @@ public class MonitorDataService {
             // === riverInfo 路由 ===
             if ("riverInfo".equals(tag)) {
                 if (hasValue(entity, "Z")) {
-                    // Z有值 → 通用水位站，继续走下方 river_info 表入库
-                } else if ((hasValue(entity, "Z1") && entity.get("Z1").asDouble() > 0)
-                        || (hasValue(entity, "Z2") && entity.get("Z2").asDouble() > 0)) {
-                    // Z1/Z2有正值 → 闸站水位，写入 gate 表，跳过 river_info
-                    insertGateFromRiverInfo(entity, site, stcd);
-                    return;
+                    // Z有值 → 通用水位站；先做数值守卫（排除0/负值/FFFFFFFF通讯异常），
+                    // 无效水位不入库，避免展示层出现离奇数值
+                    if (!isPositiveNumber(entity, "Z")) {
+                        log.warn("riverInfo 水位Z无效, 跳过入库: stcd={}, Z={}", stcd,
+                                 hasValue(entity, "Z") ? entity.get("Z").asText() : "null");
+                        return;
+                    }
+                    // 副水位Z1/Z2守卫：异常值仅剔除该字段（不入库），不影响Z主数据
+                    if (hasValue(entity, "Z1") && !isPositiveNumber(entity, "Z1")) {
+                        log.warn("riverInfo 副水位Z1异常, 剔除该字段: stcd={}, Z1={}", stcd, entity.get("Z1").asText());
+                        fieldMap.remove("z1");
+                    }
+                    if (hasValue(entity, "Z2") && !isPositiveNumber(entity, "Z2")) {
+                        log.warn("riverInfo 副水位Z2异常, 剔除该字段: stcd={}, Z2={}", stcd, entity.get("Z2").asText());
+                        fieldMap.remove("z2");
+                    }
+                    // 继续走下方 river_info 表入库
                 } else {
-                    // Z/Z1/Z2全空 → 无有效水位数据
-                    log.debug("riverInfo 无水位数据, 跳过入库, stcd={}", stcd);
+                    // Z无值 → 闸站水位（闸前/闸后）：写 gate 表。
+                    // 优先补全 10 分钟窗口内无水位的开度行；无开度行可补时
+                    // 生成 gate_no=1 水位行，等 10 分钟开度补全，等不到即归档（开度留空）
+                    insertGateWaterLevelFromRiverInfo(entity, site, stcd);
                     return;
                 }
             }
@@ -235,10 +272,15 @@ public class MonitorDataService {
                     return;
                 }
             }
-            // === volInfo 条件入库：VOL为空或≤0视为无效 ===
+            // === volInfo 条件入库：VOL为空/≤0/超过100V均视为无效或异常 ===
             if ("volInfo".equals(tag)) {
-                if (!hasValue(entity, "VOL") || entity.get("VOL").asDouble() <= 0) {
+                if (!hasValue(entity, "VOL")) {
                     log.debug("volInfo 无有效电压数据, 跳过入库, stcd={}", stcd);
+                    return;
+                }
+                double vol = parseDoubleSafe(entity.get("VOL"));
+                if (Double.isNaN(vol) || vol <= 0 || vol > MAX_VOLTAGE) {
+                    log.warn("volInfo 电压异常, 不入库: stcd={}, VOL={}", stcd, entity.get("VOL").asText());
                     return;
                 }
             }
@@ -252,30 +294,39 @@ public class MonitorDataService {
                     return;
                 }
                 double q = parseDoubleSafe(qNode);
-                if (Double.isNaN(q) || q == 4294967295.0) {
+                if (Double.isNaN(q) || q == SENSOR_COMM_ERR) {
                     log.warn("wtInfo 瞬时流量无效(传感器通讯异常), 不入库: stcd={}, Q={}", stcd, qNode.asText());
                     return;
                 }
-                if (q < 0 || q > 100) {
+                if (q < 0 || q > MAX_FLOW) {
                     log.warn("wtInfo 瞬时流量异常(Q={}), 不入库: stcd={}", q, stcd);
                     return;
                 }
-                // 累计流量TF：0属正常，FFFFFFFF(4294967295)同样视为通讯异常
+                // 累计流量TF：0属正常，负值/FFFFFFFF(4294967295)视为通讯异常
                 JsonNode tfNode = entity.get("TF");
                 if (tfNode != null && !tfNode.isNull()) {
                     double tf = parseDoubleSafe(tfNode);
-                    if (Double.isNaN(tf) || tf == 4294967295.0) {
-                        log.warn("wtInfo 累计流量无效(传感器通讯异常), 不入库: stcd={}, TF={}", stcd, tfNode.asText());
+                    if (Double.isNaN(tf) || tf < 0 || tf == SENSOR_COMM_ERR) {
+                        log.warn("wtInfo 累计流量无效(通讯异常), 不入库: stcd={}, TF={}", stcd, tfNode.asText());
                         return;
                     }
                 }
             }
-            // === rainInfo 条件入库：DYP≤0说明设备无雨量监测能力或报文异常，跳过入库 ===
+            // === rainInfo 条件入库：DYP≤0/通讯异常说明设备无雨量监测能力或报文异常，跳过入库 ===
             // DRP可为0（今日无雨），DYP是RTU安装以来累计值，为0则设备不匹配
             if ("rainInfo".equals(tag)) {
-                if (!hasValue(entity, "DYP") || entity.get("DYP").asDouble() <= 0) {
-                    log.debug("rainInfo 无有效雨量数据(DYP缺失或≤0), 跳过入库, stcd={}", stcd);
+                double dyp = hasValue(entity, "DYP") ? parseDoubleSafe(entity.get("DYP")) : Double.NaN;
+                if (Double.isNaN(dyp) || dyp <= 0 || dyp == SENSOR_COMM_ERR) {
+                    log.warn("rainInfo 无有效雨量数据(DYP缺失/≤0/通讯异常), 跳过入库, stcd={}", stcd);
                     return;
+                }
+                // DRP日雨量守卫：异常值仅剔除该字段（不入库），不影响整条报文其他字段
+                if (hasValue(entity, "DRP")) {
+                    double drp = parseDoubleSafe(entity.get("DRP"));
+                    if (Double.isNaN(drp) || drp == SENSOR_COMM_ERR || drp < 0 || drp > MAX_DAILY_RAINFALL) {
+                        log.warn("rainInfo 日雨量DRP异常, 剔除该字段: stcd={}, DRP={}", stcd, entity.get("DRP").asText());
+                        fieldMap.remove("drp");
+                    }
                 }
             }
             // === nmIspInfo / pcpInfo 暂不录入，等待后续设备接入 ===
@@ -572,22 +623,44 @@ public class MonitorDataService {
     }
 
     /**
-     * riverInfo 闸站路由：优先更新已有闸孔行（gate_no≠0）的 up_z/down_z，
-     * 无已有行时才写入 gate_no=0 占位（等 gatesInfo 到达后自动合并）。
+     * 字段存在且数值为合理水位（>0 且 ≤1000，排除通讯异常哨兵值 4294967295/FFFFFFFF）；
+     * 解析失败（非数值文本）视为无效，避免 asDouble 抛异常拖垮整条报文。
      */
-    private void insertGateFromRiverInfo(JsonNode entity, String siteId, String stcd) {
-        Timestamp now = new Timestamp(System.currentTimeMillis());
-        Set<String> gateCols = tableColumnsCache.getOrDefault("t_auto_hltgq_water_gate", Collections.emptySet());
+    private boolean isPositiveNumber(JsonNode entity, String field) {
+        if (!hasValue(entity, field)) return false;
+        double v;
+        try {
+            v = entity.get(field).asDouble();
+        } catch (Exception e) {
+            return false;
+        }
+        return v > 0 && v <= MAX_WATER_LEVEL && v != SENSOR_COMM_ERR;
+    }
 
-        // 使用报文 TM，兜底服务器时间
+    /**
+     * 闸站水位（Z1/Z2）→ gate 表（闸站数据归闸站表，不写 river_info）：
+     * 1. 优先 UPDATE 10 分钟补全窗口内无水位（up_z IS NULL）、且采集时间(tm)与
+     *    本水位报文最接近的一批开度行，行转完整（多站点、多批次报文互不污染）；
+     * 2. 窗口内无可补的开度行 → INSERT gate_no=1 水位行（open_degree 留空），
+     *    作为"待补全"行等 10 分钟开度（gatesInfo 到达时补全），等不到即归档。
+     * 已入库行仅允许在 10 分钟补全窗口内补全，窗口外冻结归档不再改动。
+     */
+    private void insertGateWaterLevelFromRiverInfo(JsonNode entity, String siteId, String stcd) {
+        Timestamp now = new Timestamp(System.currentTimeMillis());
         Timestamp tm = extractTm(entity, now);
+
+        double z1 = isPositiveNumber(entity, "Z1") ? entity.get("Z1").asDouble() : -1;
+        double z2 = isPositiveNumber(entity, "Z2") ? entity.get("Z2").asDouble() : -1;
+        if (z1 < 0 && z2 < 0) {
+            log.debug("riverInfo 无有效闸站水位, 跳过入库, stcd={}", stcd);
+            return;
+        }
 
         // Z1/Z2有正值确定是闸站，直接用首闸孔设备，不依赖 epjutj
         String siteName = getSiteName(siteId);
-        String deviceName = siteName + "1#";
-        String device = lookupOrCreateDeviceByName(deviceName, siteId, "#4#");
+        String device = lookupOrCreateDeviceByName(siteName + "1#", siteId, "#4#");
         if (device == null) {
-            log.error("riverInfo→gate 设备缺失, 跳过入库: stcd={}", stcd);
+            log.error("riverInfo→gate 设备缺失, 跳过: stcd={}", stcd);
             return;
         }
         // 确保 stcdDeviceCache 指向正确的首闸孔设备（覆盖可能存在的"待接入"缓存）
@@ -598,64 +671,71 @@ public class MonitorDataService {
         // 清理可能已创建的孤儿"待接入"设备（msgInfo 先于 riverInfo 到达时产生）
         cleanupOrphanDevice(siteName + "待接入#", siteId, device);
 
-        double z1 = hasValue(entity, "Z1") && entity.get("Z1").asDouble() > 0 ? entity.get("Z1").asDouble() : -1;
-        double z2 = hasValue(entity, "Z2") && entity.get("Z2").asDouble() > 0 ? entity.get("Z2").asDouble() : -1;
-        if (z1 < 0 && z2 < 0) return;
-
-        // 优先尝试更新已有闸孔行（gatesInfo 可能已先到达）
-        Timestamp recentWindow = new Timestamp(tm.getTime() - 600000); // 10分钟窗口
-        StringBuilder updateSql = new StringBuilder("UPDATE " + GATE_TABLE + " SET updated_at = ?, updated_by = 'SYSTEM'");
-        List<Object> updateParams = new ArrayList<>();
-        updateParams.add(now);
-        if (z1 >= 0) {
-            updateSql.append(", up_z = ?");
-            updateParams.add(z1);
+        // 1) 优先补全 10 分钟窗口内无水位的开度行（水位补齐，行转完整）。
+        // 时间对齐：只补采集时间(tm)与水位报文最接近的一批（同一tm的多孔行一起补），
+        // 避免把本小时水位误贴到窗口内其他采集时间的开度行上（多站点/多批次报文场景）。
+        Timestamp windowStart = new Timestamp(now.getTime() - 600000L);
+        Timestamp windowEnd = new Timestamp(now.getTime() + 600000L);
+        List<Timestamp> pendingTms = jdbcTemplate.queryForList(
+                "SELECT tm FROM " + GATE_TABLE +
+                " WHERE stcd = ? AND open_degree IS NOT NULL AND up_z IS NULL AND tm >= ? AND tm <= ?",
+                Timestamp.class, stcd, windowStart, windowEnd);
+        Timestamp targetTm = nearestTm(pendingTms, tm);
+        if (targetTm != null) {
+            StringBuilder updateSql = new StringBuilder("UPDATE " + GATE_TABLE +
+                    " SET updated_at = ?, updated_by = 'SYSTEM'");
+            List<Object> updateParams = new ArrayList<>();
+            updateParams.add(now);
+            if (z1 >= 0) {
+                updateSql.append(", up_z = ?");
+                updateParams.add(z1);
+            }
+            if (z2 >= 0) {
+                updateSql.append(", down_z = ?");
+                updateParams.add(z2);
+            }
+            updateSql.append(" WHERE stcd = ? AND open_degree IS NOT NULL AND up_z IS NULL AND tm = ?");
+            updateParams.add(stcd);
+            updateParams.add(targetTm);
+            int completed = jdbcTemplate.update(updateSql.toString(), updateParams.toArray());
+            if (completed > 0) {
+                log.info("riverInfo水位已补全 {} 条采集时间最近的开度行: stcd={}, tm={}, Z1={}, Z2={}",
+                         completed, stcd, targetTm, z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
+            }
         }
-        if (z2 >= 0) {
-            updateSql.append(", down_z = ?");
-            updateParams.add(z2);
-        }
-        updateSql.append(" WHERE stcd = ? AND tm >= ? AND gate_no != '0'");
-        updateParams.add(stcd);
-        updateParams.add(recentWindow);
 
-        int updated = jdbcTemplate.update(updateSql.toString(), updateParams.toArray());
-        if (updated > 0) {
-            log.info("riverInfo水位已合并到 {} 条闸孔行: stcd={}, Z1={}, Z2={}", updated, stcd,
-                     z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
-            // 继续创建 gate_no=0 占位行，确保后续 gateInfo 能获取水位数据
-        }
-
-        // 去重：相同 stcd+tm+gate_no=0 已存在则跳过（防止RabbitMQ重投）
+        // 2) 生成 gate_no=1 水位行（待补全缓存行，10 分钟内等开度补全，等不到即归档）
+        // 去重：同 stcd+tm+gate_no=1 已存在则跳过（防止RabbitMQ重投）
         try {
-            String checkSql = "SELECT COUNT(*) FROM " + GATE_TABLE + " WHERE stcd = ? AND tm = ? AND gate_no = '0'";
+            String checkSql = "SELECT COUNT(*) FROM " + GATE_TABLE + " WHERE stcd = ? AND tm = ? AND gate_no = '1'";
             int count = jdbcTemplate.queryForObject(checkSql, Integer.class, stcd, tm);
             if (count > 0) {
-                log.debug("gate_no=0占位行已存在, 跳过: stcd={}, tm={}", stcd, tm);
+                log.debug("gate表水位行已存在, 跳过: stcd={}, tm={}", stcd, tm);
                 return;
             }
         } catch (Exception e) {
             log.debug("gate表去重检查失败, 放行: {}", e.getMessage());
         }
 
-        // 无已有闸孔行可更新 → 写入 gate_no=0 占位（等 gatesInfo 到达后合并）
+        Set<String> gateCols = tableColumnsCache.getOrDefault("t_auto_hltgq_water_gate", Collections.emptySet());
         Map<String, Object> fm = new LinkedHashMap<>();
-        fm.put("id",         IdGenerator.generate());
-        fm.put("corp_code",  corpCode);
-        fm.put("created_at", now);
-        fm.put("created_by", "SYSTEM");
-        fm.put("updated_at", now);
-        fm.put("updated_by", "SYSTEM");
-        if (gateCols.isEmpty() || gateCols.contains("site"))     fm.put("site",     siteId);
-        if (gateCols.isEmpty() || gateCols.contains("device"))   fm.put("device",   device);
-        if (gateCols.isEmpty() || gateCols.contains("stcd"))     fm.put("stcd",     stcd);
-        if (gateCols.isEmpty() || gateCols.contains("gate_no"))  fm.put("gate_no",  "0");
-        if (gateCols.isEmpty() || gateCols.contains("tm"))       fm.put("tm",       tm);
-        if (gateCols.isEmpty() || gateCols.contains("date"))     fm.put("date",     tm);
-        if (gateCols.isEmpty() || gateCols.contains("ctime"))    fm.put("ctime",    tm);
-        if (gateCols.isEmpty() || gateCols.contains("status"))   fm.put("status",   "#1#");
-        if (z1 >= 0) fm.put("up_z", z1);
-        if (z2 >= 0) fm.put("down_z", z2);
+        fm.put("id",          IdGenerator.generate());
+        fm.put("corp_code",   corpCode);
+        fm.put("created_at",  now);
+        fm.put("created_by",  "SYSTEM");
+        fm.put("updated_at",  now);
+        fm.put("updated_by",  "SYSTEM");
+        if (gateCols.isEmpty() || gateCols.contains("site"))        fm.put("site",         siteId);
+        if (gateCols.isEmpty() || gateCols.contains("device"))      fm.put("device",       device);
+        if (gateCols.isEmpty() || gateCols.contains("stcd"))        fm.put("stcd",         stcd);
+        if (gateCols.isEmpty() || gateCols.contains("gate_no"))     fm.put("gate_no",      "1");
+        if (gateCols.isEmpty() || gateCols.contains("tm"))          fm.put("tm",           tm);
+        if (gateCols.isEmpty() || gateCols.contains("date"))        fm.put("date",         tm);
+        if (gateCols.isEmpty() || gateCols.contains("ctime"))       fm.put("ctime",        tm);
+        if (gateCols.isEmpty() || gateCols.contains("status"))      fm.put("status",       "#1#");
+        if (z1 >= 0 && (gateCols.isEmpty() || gateCols.contains("up_z")))   fm.put("up_z",   z1);
+        if (z2 >= 0 && (gateCols.isEmpty() || gateCols.contains("down_z"))) fm.put("down_z", z2);
+        // open_degree 留空：10 分钟窗口内等 gatesInfo 补全，等不到即归档（无开度）
 
         StringBuilder cols = new StringBuilder();
         StringBuilder phs = new StringBuilder();
@@ -666,19 +746,19 @@ public class MonitorDataService {
             phs.append("?");
             vals.add(e.getValue());
         }
-
         String sql = String.format("INSERT INTO %s (%s) VALUES (%s)",
                 GATE_TABLE, cols.toString(), phs.toString());
         jdbcTemplate.update(sql, vals.toArray());
-
-        log.info("riverInfo闸站数据已写入gate_no=0占位: stcd={}, Z1={}, Z2={}", stcd,
+        log.info("riverInfo闸站水位行入库: stcd={}, gate_no=1, Z1={}, Z2={}", stcd,
                  z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
     }
 
     /**
      * gatesInfo 闸门开度路由：将 Gates1/2/3 → gate 表多行（闸孔级开度，gate_no=1/2/3）
      * 每闸孔独立设备，命名: {站点名}{闸孔号}#
-     * 写入完成后自动合并 pending 的 gate_no=0 水位占位行。
+     * 1号孔优先补全 10 分钟窗口内、采集时间(tm)与本报文最接近的一条待补全水位缓存行；
+     * 各闸孔行按"读最近水位 + INSERT 一次成型"写入。
+     * 行入库后仅允许在 10 分钟补全窗口内被 riverInfo 补水位，窗口外冻结归档不再改动。
      */
     private void insertGateFromGatesInfo(JsonNode entity, String siteId, String stcd) {
         Timestamp now = new Timestamp(System.currentTimeMillis());
@@ -688,14 +768,57 @@ public class MonitorDataService {
         // 使用报文 TM，兜底服务器时间
         Timestamp tm = extractTm(entity, now);
 
+        // 取该站最新闸站水位（读 gate 表近 2h 记录，仅读不改），与开度一并写入本批次闸孔行
+        double[] waterLevels = getLatestWaterLevels(stcd);
+
         int inserted = 0;
         for (int i = 1; i <= 10; i++) {
             String fieldName = "Gates" + i;
             if (!hasValue(entity, fieldName)) continue; // 跳过null字段，继续处理后续闸孔
 
             double openDegree = parseDoubleSafe(entity.get(fieldName));
-            // 非数值文本(如FFFFFFFF)或 -999 表示无信号，跳过该闸孔（不创建设备）
+            // 非数值文本(如FFFFFFFF)或 -999 表示无信号，跳过该闸孔（不创建设备）；
+            // 开度物理范围 [0, 50]m，越界视为传感器异常，不入库（避免展示层出现负开度/超大开度）
             if (Double.isNaN(openDegree) || openDegree == -999) continue;
+            if (openDegree < 0 || openDegree > MAX_OPEN_DEGREE) {
+                log.warn("gatesInfo 开度异常, 跳过闸孔{}: stcd={}, open_degree={}", i, stcd, openDegree);
+                continue;
+            }
+
+            // 1号孔优先补全 10 分钟窗口内待补全的水位缓存行（riverInfo 先到生成的 gate_no=1 行）。
+            // 时间对齐：只补采集时间(tm)与开度报文最接近的一条，
+            // 避免同一条开度被复制到窗口内多个采集时间的水位行上。
+            if (i == 1) {
+                try {
+                    Timestamp windowStart = new Timestamp(now.getTime() - 600000L);
+                    Timestamp windowEnd = new Timestamp(now.getTime() + 600000L);
+                    List<Map<String, Object>> pendingRows = jdbcTemplate.queryForList(
+                            "SELECT id, tm FROM " + GATE_TABLE +
+                            " WHERE stcd = ? AND gate_no = '1' AND open_degree IS NULL AND up_z IS NOT NULL AND tm >= ? AND tm <= ?",
+                            stcd, windowStart, windowEnd);
+                    String targetId = null;
+                    long bestDiff = Long.MAX_VALUE;
+                    for (Map<String, Object> row : pendingRows) {
+                        Timestamp rowTm = toDbTimestamp(row.get("tm"));
+                        if (rowTm == null || row.get("id") == null) continue;
+                        long diff = Math.abs(rowTm.getTime() - tm.getTime());
+                        if (diff < bestDiff) {
+                            bestDiff = diff;
+                            targetId = String.valueOf(row.get("id"));
+                        }
+                    }
+                    if (targetId != null) {
+                        String completeSql = "UPDATE " + GATE_TABLE +
+                                " SET open_degree = ?, updated_at = ?, updated_by = 'SYSTEM' WHERE id = ?";
+                        int completed = jdbcTemplate.update(completeSql, openDegree, now, targetId);
+                        if (completed > 0) {
+                            log.info("gatesInfo已补全采集时间最近的水位缓存行: stcd={}, id={}", stcd, targetId);
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("gatesInfo补全水位行失败, 放行: {}", e.getMessage());
+                }
+            }
 
             String deviceName = siteName + i + "#";
             String deviceId = lookupOrCreateDeviceByName(deviceName, siteId, "#4#");
@@ -732,6 +855,8 @@ public class MonitorDataService {
             if (gateCols.isEmpty() || gateCols.contains("ctime"))       fm.put("ctime",        tm);
             if (gateCols.isEmpty() || gateCols.contains("status"))      fm.put("status",       "#1#");
             if (gateCols.isEmpty() || gateCols.contains("open_degree")) fm.put("open_degree",  openDegree);
+            if (waterLevels[0] >= 0 && (gateCols.isEmpty() || gateCols.contains("up_z")))   fm.put("up_z",   waterLevels[0]);
+            if (waterLevels[1] >= 0 && (gateCols.isEmpty() || gateCols.contains("down_z"))) fm.put("down_z", waterLevels[1]);
 
             StringBuilder cols = new StringBuilder();
             StringBuilder phs = new StringBuilder();
@@ -749,10 +874,8 @@ public class MonitorDataService {
             inserted++;
         }
 
-        // 合并 pending 的 gate_no=0 水位占位行（riverInfo 可能已先到达）
+        // 刷新 stcdDeviceCache 指向正确的首闸孔设备（覆盖 epjutj=NULL 时可能创建的"待接入"设备）
         if (inserted > 0) {
-            mergeGateZeroWaterLevels(stcd, tm, now);
-            // 刷新 stcdDeviceCache 指向正确的首闸孔设备（覆盖 epjutj=NULL 时可能创建的"待接入"设备）
             String gate1DeviceName = siteName + "1#";
             String gate1DeviceId = findExistingDevice(gate1DeviceName);
             if (gate1DeviceId != null) {
@@ -775,7 +898,9 @@ public class MonitorDataService {
         if (!isValidColumn(validColumns, "water_level_rise1h")) return;
 
         Object zObj = fieldMap.get("z");
-        if (!(zObj instanceof Number)) return;
+        // convertValue 对文本数值返回 String，必须用 toDbDouble 统一解析，否则涨幅永远不计算
+        Double zVal = toDbDouble(zObj);
+        if (zVal == null) return;
 
         String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
         Timestamp oneHourAgo = new Timestamp(System.currentTimeMillis() - 3600000);
@@ -794,7 +919,18 @@ public class MonitorDataService {
                 results = jdbcTemplate.queryForList(sql, Double.class, stcd, twoHoursAgo, oneHourAgo);
             }
             if (results != null && !results.isEmpty() && results.get(0) != null) {
-                double rise = ((Number) zObj).doubleValue() - results.get(0);
+                double prevZ = results.get(0);
+                // 守卫：历史水位异常(存量42亿/越界)时不计算涨幅，避免写入离奇涨幅
+                if (!isValidWaterLevelValue(prevZ)) {
+                    log.warn("1h涨幅计算跳过, 历史水位异常: stcd={}, prevZ={}", stcd, prevZ);
+                    return;
+                }
+                double rise = zVal - prevZ;
+                // 守卫：涨幅超物理上限视为水位跳变异常，不写入（z本身照常入库）
+                if (Math.abs(rise) > MAX_HOURLY_RISE) {
+                    log.warn("1h水位涨幅超物理上限, 不写入: stcd={}, rise={}", stcd, rise);
+                    return;
+                }
                 fieldMap.put("water_level_rise1h", trunc2(rise));
             }
         } catch (Exception e) {
@@ -819,7 +955,12 @@ public class MonitorDataService {
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
                 if (diff >= 0) {
-                    fieldMap.put("rainfall1h", diff);
+                    // 守卫：时段降雨超物理上限视为DYP跳变异常，不写入（dyp本身照常入库）
+                    if (diff > MAX_RAINFALL_1H) {
+                        log.warn("rainfall1h超物理上限, 不写入: stcd={}, diff={}", stcd, diff);
+                    } else {
+                        fieldMap.put("rainfall1h", diff);
+                    }
                 } else {
                     log.debug("rainfall1h计算异常(DYP回退), stcd={}, currentDyp={}, prevDyp={}, diff={}", stcd, currentDyp, prev, diff);
                 }
@@ -830,7 +971,11 @@ public class MonitorDataService {
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
                 if (diff >= 0) {
-                    fieldMap.put("rainfall3h", diff);
+                    if (diff > MAX_RAINFALL_3H) {
+                        log.warn("rainfall3h超物理上限, 不写入: stcd={}, diff={}", stcd, diff);
+                    } else {
+                        fieldMap.put("rainfall3h", diff);
+                    }
                 } else {
                     log.debug("rainfall3h计算异常(DYP回退), stcd={}, currentDyp={}, prevDyp={}, diff={}", stcd, currentDyp, prev, diff);
                 }
@@ -841,7 +986,11 @@ public class MonitorDataService {
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
                 if (diff >= 0) {
-                    fieldMap.put("rainfall6h", diff);
+                    if (diff > MAX_RAINFALL_6H) {
+                        log.warn("rainfall6h超物理上限, 不写入: stcd={}, diff={}", stcd, diff);
+                    } else {
+                        fieldMap.put("rainfall6h", diff);
+                    }
                 } else {
                     log.debug("rainfall6h计算异常(DYP回退), stcd={}, currentDyp={}, prevDyp={}, diff={}", stcd, currentDyp, prev, diff);
                 }
@@ -868,7 +1017,12 @@ public class MonitorDataService {
                 results = jdbcTemplate.queryForList(sql, Double.class, stcd, from, to);
             }
             if (results != null && !results.isEmpty() && results.get(0) != null) {
-                return results.get(0);
+                double prev = results.get(0);
+                // 守卫：历史DYP异常(存量0/负值/42亿哨兵值)时不参与差值计算，避免离奇降雨量
+                if (prev > 0 && prev != SENSOR_COMM_ERR) {
+                    return prev;
+                }
+                log.warn("历史DYP异常, 不参与降雨量计算: stcd={}, prevDyp={}", stcd, prev);
             }
         } catch (Exception e) {
             log.debug("查询历史DYP失败, stcd={}: {}", stcd, e.getMessage());
@@ -930,60 +1084,128 @@ public class MonitorDataService {
 
     // ======================== Gate 辅助方法 ========================
 
-    /** 从 entity 中提取测量时间 TM，解析失败则用兜底时间 */
+    /** 从 entity 中提取测量时间 TM，解析失败或时间异常则用兜底时间 */
     private Timestamp extractTm(JsonNode entity, Timestamp fallback) {
         if (!hasValue(entity, "TM")) return fallback;
         try {
+            Timestamp ts;
             JsonNode tmNode = entity.get("TM");
             if (tmNode.isNumber()) {
-                return new Timestamp(tmNode.asLong());
+                long epochMs = tmNode.asLong();
+                // 防御：秒级时间戳(10位)按毫秒解析会变成1970年，统一转毫秒；0/负值视为无效
+                if (epochMs <= 0) return fallback;
+                if (epochMs < 100_000_000_000L) {
+                    epochMs *= 1000L;
+                }
+                ts = new Timestamp(epochMs);
+            } else {
+                // ISO 8601 "yyyy-MM-ddTHH:mm:ss" → 替换 T 为空格，兼容 Timestamp.valueOf()
+                ts = Timestamp.valueOf(tmNode.asText().replace('T', ' '));
             }
-            // ISO 8601 "yyyy-MM-ddTHH:mm:ss" → 替换 T 为空格，兼容 Timestamp.valueOf()
-            return Timestamp.valueOf(tmNode.asText().replace('T', ' '));
+            // 时间合理性守卫：早于2000年(1970解析错误)或晚于服务器时间2h(设备时钟错误) → 兜底。
+            // 2000年后的历史补传数据保留原TM，不影响离线站点补传场景。
+            if (ts.getTime() < TM_MIN_EPOCH_MS || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
+                log.warn("TM时间戳异常(早于2000年或超前服务器时间2h), 使用服务器时间: TM={}",
+                         entity.get("TM").asText());
+                return fallback;
+            }
+            return ts;
         } catch (Exception e) {
             log.debug("无法解析TM字段, 使用兜底时间: {}", entity.get("TM"));
             return fallback;
         }
     }
 
-    /** 将 gate_no=0 占位行的水位合并到闸孔行，并清理占位行 */
-    private void mergeGateZeroWaterLevels(String stcd, Timestamp tm, Timestamp now) {
+    /**
+     * 取 stcd 最新闸站水位（仅读 gate 表，不改库）：
+     * 查近 2 小时内最近一条带 up_z 的闸孔行（含水位缓存行和完整行）。
+     * 只读历史数据，不产生任何等待、缓存或滞留。返回 {upZ, downZ}，缺失为 -1。
+     */
+    private double[] getLatestWaterLevels(String stcd) {
         try {
-            Timestamp recentWindow = new Timestamp(tm.getTime() - 600000); // 10分钟窗口
+            Timestamp window = new Timestamp(System.currentTimeMillis() - 7200000L);
             String selectSql = "SELECT up_z, down_z FROM " + GATE_TABLE +
-                    " WHERE stcd = ? AND gate_no = '0' AND tm >= ? ORDER BY tm DESC LIMIT 1";
-            List<Map<String, Object>> rows = jdbcTemplate.queryForList(selectSql, stcd, recentWindow);
-            if (rows.isEmpty()) return;
-
-            Map<String, Object> pending = rows.get(0);
-            Object upZ = pending.get("up_z");
-            Object downZ = pending.get("down_z");
-            if (upZ == null && downZ == null) return;
-
-            StringBuilder updateSql = new StringBuilder("UPDATE " + GATE_TABLE + " SET updated_at = ?, updated_by = 'SYSTEM'");
-            List<Object> updateParams = new ArrayList<>();
-            updateParams.add(now);
-            if (upZ != null) {
-                updateSql.append(", up_z = ?");
-                updateParams.add(upZ);
+                    " WHERE stcd = ? AND up_z IS NOT NULL AND tm >= ? ORDER BY tm DESC LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(selectSql, stcd, window);
+            if (!rows.isEmpty()) {
+                Map<String, Object> row = rows.get(0);
+                Double up = toDbDouble(row.get("up_z"));
+                Double down = toDbDouble(row.get("down_z"));
+                // 守卫：存量异常水位(42亿哨兵值/越界)不得传播到新开度行，无效视为缺失
+                double upZ = (up != null && isValidWaterLevelValue(up)) ? up : -1;
+                double downZ = (down != null && isValidWaterLevelValue(down)) ? down : -1;
+                return new double[]{upZ, downZ};
             }
-            if (downZ != null) {
-                updateSql.append(", down_z = ?");
-                updateParams.add(downZ);
-            }
-            updateSql.append(" WHERE stcd = ? AND tm >= ? AND gate_no != '0'");
-            updateParams.add(stcd);
-            updateParams.add(recentWindow);
-
-            int merged = jdbcTemplate.update(updateSql.toString(), updateParams.toArray());
-
-            // 清理 gate_no=0 占位行
-            String deleteSql = "DELETE FROM " + GATE_TABLE + " WHERE stcd = ? AND gate_no = '0' AND tm >= ?";
-            int deleted = jdbcTemplate.update(deleteSql, stcd, recentWindow);
-
-            log.info("已合并gate_no=0水位到{}条闸孔行, 清理{}条占位: stcd={}", merged, deleted, stcd);
         } catch (Exception e) {
-            log.warn("合并gate_no=0水位数据失败, stcd={}: {}", stcd, e.getMessage());
+            log.warn("查询gate表最近闸站水位失败, stcd={}: {}", stcd, e.getMessage());
+        }
+        return new double[]{-1, -1};
+    }
+
+    /**
+     * 水位类数值合理性校验（>0 且 ≤MAX_WATER_LEVEL，排除通讯异常哨兵值）；
+     * 供历史水位读回（涨幅计算、开度行继承水位）与存量异常值防传播使用。
+     */
+    private static boolean isValidWaterLevelValue(double v) {
+        return v > 0 && v <= MAX_WATER_LEVEL && v != SENSOR_COMM_ERR;
+    }
+
+    /** Object → Double（兼容 Number 与文本），转换失败返回 null */
+    private Double toDbDouble(Object value) {
+        if (value == null) return null;
+        if (value instanceof Number) return ((Number) value).doubleValue();
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 从候选采集时间集合中选与目标时间差最小者；无候选返回 null */
+    private Timestamp nearestTm(List<Timestamp> candidates, Timestamp target) {
+        Timestamp best = null;
+        long bestDiff = Long.MAX_VALUE;
+        for (Timestamp c : candidates) {
+            if (c == null) continue;
+            long diff = Math.abs(c.getTime() - target.getTime());
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    /** Object → Timestamp（兼容 Timestamp/Date/文本），转换失败返回 null */
+    private Timestamp toDbTimestamp(Object value) {
+        if (value == null) return null;
+        if (value instanceof Timestamp) return (Timestamp) value;
+        if (value instanceof java.util.Date) return new Timestamp(((java.util.Date) value).getTime());
+        try {
+            return Timestamp.valueOf(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 存量清理：每小时删除超过 1 小时的 gate_no=0 水位占位行。
+     * 改造后 riverInfo 的 Z1/Z2 直接写 river_info 表（z1/z2 列），gatesInfo 写 gate 表时
+     * 从 river_info 读水位一次成型，占位行已从根上杜绝产生，
+     * 本任务仅用于清理改造前遗留的历史占位行。
+     */
+    @Scheduled(fixedRate = 3600000)
+    public void cleanupStaleGatePlaceholders() {
+        try {
+            Timestamp staleCutoff = new Timestamp(System.currentTimeMillis() - 3600000L);
+            String deleteSql = "DELETE FROM " + GATE_TABLE +
+                    " WHERE gate_no = '0' AND tm < ?";
+            int deleted = jdbcTemplate.update(deleteSql, staleCutoff);
+            if (deleted > 0) {
+                log.info("兜底清理超时占位行: {} 条", deleted);
+            }
+        } catch (Exception e) {
+            log.warn("兜底清理占位行失败: {}", e.getMessage());
         }
     }
 
@@ -1023,9 +1245,9 @@ public class MonitorDataService {
      *   msg_info   — 通信日志（msgInfo，MSG 为空时跳过）
      *   vol_info   — RTU 电压（volInfo，VOL≤0 时跳过）
      *   wt_nfo     — 流量（wtInfo，Q缺失/通讯异常/异常值 时跳过）
-     *   river_info — 水位（riverInfo，Z/Z1/Z2 全空时跳过）
+     *   river_info — 水位（riverInfo，Z 空时跳过；闸站 Z1/Z2 走 gate 表）
      *   rain_info  — 雨量（rainInfo，DYP≤0 时跳过）
-     *   gate       — 闸门开度/水位占位（gateInfo/gatesInfo/riverInfo闸站路由）
+     *   gate       — 闸门开度/水位（gateInfo/gatesInfo 开度，riverInfo 闸站水位 Z1/Z2）
      *
      * MQTT (site 直接匹配 id):
      *   gate       — 闸门监测（无 stcd，仅 site 字段）
