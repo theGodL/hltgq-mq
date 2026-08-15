@@ -87,6 +87,8 @@ public class MonitorDataService {
     private static final long TM_MIN_EPOCH_MS = Timestamp.valueOf("2000-01-01 00:00:00").getTime();
     /** TM时间戳超前容忍度：晚于服务器时间2h视为设备时钟错误 */
     private static final long TM_MAX_AHEAD_MS = 2 * 3600000L;
+    /** TM时间戳滞后容忍度：早于服务器时间2h视为设备时钟错误(停摆/复位)，用服务器时间兜底 */
+    private static final long TM_MAX_BEHIND_MS = 2 * 3600000L;
 
     /** 设备表全限定名 */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
@@ -814,6 +816,23 @@ public class MonitorDataService {
                         if (completed > 0) {
                             log.info("gatesInfo已补全采集时间最近的水位缓存行: stcd={}, id={}", stcd, targetId);
                         }
+                    } else {
+                        // 窗口外兜底：开度迟到超10分钟时，按同采集时间(tm)对齐补全水位缓存行，
+                        // 防止 1# 孔开度被去重键(stcd+tm+gate_no)挡住而永久丢失
+                        List<Map<String, Object>> sameTmRows = jdbcTemplate.queryForList(
+                                "SELECT id FROM " + GATE_TABLE +
+                                " WHERE stcd = ? AND gate_no = '1' AND open_degree IS NULL AND up_z IS NOT NULL AND tm = ?",
+                                stcd, tm);
+                        if (!sameTmRows.isEmpty() && sameTmRows.get(0).get("id") != null) {
+                            String sameTmId = String.valueOf(sameTmRows.get(0).get("id"));
+                            String completeSql = "UPDATE " + GATE_TABLE +
+                                    " SET open_degree = ?, updated_at = ?, updated_by = 'SYSTEM' WHERE id = ?";
+                            int completed = jdbcTemplate.update(completeSql, openDegree, now, sameTmId);
+                            if (completed > 0) {
+                                log.warn("gatesInfo窗口外补全同tm水位缓存行(开度迟到): stcd={}, id={}, tm={}",
+                                         stcd, sameTmId, tm);
+                            }
+                        }
                     }
                 } catch (Exception e) {
                     log.debug("gatesInfo补全水位行失败, 放行: {}", e.getMessage());
@@ -1102,10 +1121,13 @@ public class MonitorDataService {
                 // ISO 8601 "yyyy-MM-ddTHH:mm:ss" → 替换 T 为空格，兼容 Timestamp.valueOf()
                 ts = Timestamp.valueOf(tmNode.asText().replace('T', ' '));
             }
-            // 时间合理性守卫：早于2000年(1970解析错误)或晚于服务器时间2h(设备时钟错误) → 兜底。
-            // 2000年后的历史补传数据保留原TM，不影响离线站点补传场景。
-            if (ts.getTime() < TM_MIN_EPOCH_MS || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
-                log.warn("TM时间戳异常(早于2000年或超前服务器时间2h), 使用服务器时间: TM={}",
+            // 时间合理性守卫：早于2000年(1970解析错误)、超前服务器时间2h(设备时钟快)、
+            // 滞后服务器时间2h(设备时钟停摆/复位) → 服务器时间兜底。
+            // 2h内的历史补传数据保留原TM，不影响短时离线补传场景。
+            if (ts.getTime() < TM_MIN_EPOCH_MS
+                    || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS
+                    || ts.getTime() < fallback.getTime() - TM_MAX_BEHIND_MS) {
+                log.warn("TM时间戳异常(早于2000年/超前2h/滞后2h), 使用服务器时间: TM={}",
                          entity.get("TM").asText());
                 return fallback;
             }
@@ -1206,6 +1228,33 @@ public class MonitorDataService {
             }
         } catch (Exception e) {
             log.warn("兜底清理占位行失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 开度断报告警：每小时检查近 2 小时内有闸站水位入库(gate_no=1 水位行)
+     * 但无任何开度入库的站点，WARN 提醒排查开度报文上报链路。
+     * 阈值 ≥2 条水位行，排除单条偶然错位导致的误报。
+     */
+    @Scheduled(fixedRate = 3600000)
+    public void checkGateDegreeGapAlarm() {
+        try {
+            Timestamp windowStart = new Timestamp(System.currentTimeMillis() - 7200000L);
+            String sql = "SELECT w.stcd, COUNT(*) AS cnt FROM " + GATE_TABLE + " w" +
+                    " WHERE w.stcd IS NOT NULL AND w.gate_no = '1'" +
+                    " AND w.open_degree IS NULL AND w.up_z IS NOT NULL AND w.tm >= ?" +
+                    " AND NOT EXISTS (" +
+                    "  SELECT 1 FROM " + GATE_TABLE + " o" +
+                    "  WHERE o.stcd = w.stcd AND o.open_degree IS NOT NULL AND o.tm >= ?" +
+                    " )" +
+                    " GROUP BY w.stcd HAVING COUNT(*) >= 2";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, windowStart, windowStart);
+            for (Map<String, Object> row : rows) {
+                log.warn("闸站开度报文疑似断报: stcd={}, 近2h水位行{}条且无任何开度入库, 请排查开度上报链路",
+                         row.get("stcd"), row.get("cnt"));
+            }
+        } catch (Exception e) {
+            log.warn("开度断报告警检查失败: {}", e.getMessage());
         }
     }
 
