@@ -193,9 +193,9 @@ public class MqttGateDataService {
     }
 
     /**
-     * 定时入库：每 30 分钟将缓存中最新数据批量写入数据库
+     * 定时入库：服务器整点/半点(如16:00:00、16:30:00)将缓存中最新数据批量写入数据库
      */
-    @Scheduled(fixedRate = 1800000)  // 30 分钟 = 1,800,000 ms
+    @Scheduled(cron = "0 0,30 * * * ?")  // 每小时 0 分和 30 分执行，墙钟对齐服务器时区
     public void flushToDb() {
         if (latestDataCache.isEmpty()) {
             log.debug("缓存为空，跳过入库");
@@ -370,25 +370,28 @@ public class MqttGateDataService {
                 continue;
             }
 
-            wtRows.add(buildWtRow(siteId, firstGateRow != null ? firstGateRow : sampleRow, upZ, totalQ));
+            // 日累计流量：梯形积分(Q×Δt)累加到当天0点起的日累计，随行入库 tf 字段
+            Timestamp wtNow = new Timestamp(System.currentTimeMillis());
+            double dailyTf = computeDailyTf(siteId, wtNow, totalQ);
+            wtRows.add(buildWtRow(siteId, firstGateRow != null ? firstGateRow : sampleRow,
+                    upZ, totalQ, wtNow, dailyTf));
         }
         return wtRows;
     }
 
     /**
-     * 组装 wt_nfo 站级一行：stcd 不写（MQTT 无 stcd），site + device 关联，z=上游水位，q=总流量
+     * 组装 wt_nfo 站级一行：stcd 不写（MQTT 无 stcd），site + device 关联，z=上游水位，q=总流量，tf=日累计流量
      */
     private Map<String, Object> buildWtRow(String siteId, Map<String, Object> gateRow,
-                                           double upZ, double totalQ) {
+                                           double upZ, double totalQ, Timestamp tm, double tf) {
         Map<String, Object> map = new LinkedHashMap<>();
-        Timestamp now = new Timestamp(System.currentTimeMillis());
 
         // 系统字段（与 RabbitMQ 行结构一致）
         map.put("id", IdGenerator.generate());
         map.put("corp_code", corpCode);
-        map.put("created_at", now);
+        map.put("created_at", tm);
         map.put("created_by", "SYSTEM");
-        map.put("updated_at", now);
+        map.put("updated_at", tm);
         map.put("updated_by", "SYSTEM");
 
         // 业务字段（按 wt_nfo 实际列过滤，列名元数据缺失时不校验直接写入）
@@ -408,9 +411,86 @@ public class MqttGateDataService {
             map.put("q", totalQ);
         }
         if (wtColumns.isEmpty() || wtColumns.contains("tm")) {
-            map.put("tm", now);
+            map.put("tm", tm);
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("tf")) {
+            map.put("tf", tf);
         }
         return map;
+    }
+
+    /**
+     * 计算站点日累计流量（当天0点起，梯形积分）：
+     * 查 wt_nfo 该站最近一行(MQTT行)，增量 = (lastQ + q) / 2 × Δt。
+     * 同一天：继承上行星 tf、以上行 tm 为积分起点；
+     * 跨天/首行：日累计归零，从当天 0 点起算（跨天首行仍用昨天 Q 做梯形底）。
+     * 间隔超 2h 视为数据断层(断报/停机)，该段不积分防止日累计虚增；
+     * 1~2h 缺批容忍并积分(近似值)但 WARN 提醒排查。
+     */
+    private double computeDailyTf(String siteId, Timestamp now, double q) {
+        try {
+            Timestamp dayStart = Timestamp.valueOf(now.toLocalDateTime().toLocalDate().atStartOfDay());
+            double baseTf = 0;
+            double lastQ = q;
+            Timestamp effectiveStart = dayStart;
+
+            String sql = "SELECT tm, q, tf FROM " + WT_NFO_TABLE +
+                    " WHERE site = ? AND (stcd IS NULL OR stcd = '') AND tm < ? ORDER BY tm DESC LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId, now);
+            if (!rows.isEmpty()) {
+                Map<String, Object> row = rows.get(0);
+                Timestamp lastTm = toDbTimestamp(row.get("tm"));
+                Double lastQVal = toDouble(row.get("q"));
+                Double lastTfVal = toDouble(row.get("tf"));
+                if (lastTm != null && lastTm.getTime() >= dayStart.getTime() && lastQVal != null) {
+                    // 同一天：继承日累计，以上行 tm 为积分起点
+                    lastQ = lastQVal;
+                    effectiveStart = lastTm;
+                    if (lastTfVal != null) {
+                        baseTf = lastTfVal;
+                    }
+                }
+                // 跨天/上行无效：effectiveStart 保持 dayStart，baseTf=0 → 今天重新累计
+            }
+
+            long dtMs = now.getTime() - effectiveStart.getTime();
+            if (dtMs < 0) {
+                dtMs = 0;
+            }
+            double dtSec = dtMs / 1000.0;
+            double delta = 0;
+            if (dtSec > 7200) {
+                // 断层超2h：期间的流量曲线无从知晓，宁缺毋滥，不积分
+                log.warn("MQTT流量积分间隔超2h(断报/停机), 该段不积分: site={}, 间隔={}s", siteId, dtSec);
+            } else {
+                if (dtSec > 3600) {
+                    log.warn("MQTT流量积分间隔超1h(疑似缺批), 积分为近似值: site={}, 间隔={}s", siteId, dtSec);
+                }
+                delta = (lastQ + q) / 2.0 * dtSec;
+            }
+            return baseTf + delta;
+        } catch (Exception e) {
+            log.warn("计算日累计流量失败, tf不入库: site={}, {}", siteId, e.getMessage());
+            return 0;
+        }
+    }
+
+    /** Object → Timestamp（兼容 Timestamp/Date/文本），转换失败返回 null */
+    private Timestamp toDbTimestamp(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Timestamp) {
+            return (Timestamp) value;
+        }
+        if (value instanceof java.util.Date) {
+            return new Timestamp(((java.util.Date) value).getTime());
+        }
+        try {
+            return Timestamp.valueOf(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 批量写入流量表（列序固定，与闸门表写入方式一致） */

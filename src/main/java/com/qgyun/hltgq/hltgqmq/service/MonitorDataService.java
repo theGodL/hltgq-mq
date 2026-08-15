@@ -1212,8 +1212,8 @@ public class MonitorDataService {
 
     /**
      * 存量清理：每小时删除超过 1 小时的 gate_no=0 水位占位行。
-     * 改造后 riverInfo 的 Z1/Z2 直接写 river_info 表（z1/z2 列），gatesInfo 写 gate 表时
-     * 从 river_info 读水位一次成型，占位行已从根上杜绝产生，
+     * 当前 riverInfo 闸站水位(Z1/Z2)直接写 gate 表 gate_no=1 水位行，
+     * gatesInfo 开度经 10 分钟补全窗口与水位同行合并，占位行已从根上杜绝产生，
      * 本任务仅用于清理改造前遗留的历史占位行。
      */
     @Scheduled(fixedRate = 3600000)
