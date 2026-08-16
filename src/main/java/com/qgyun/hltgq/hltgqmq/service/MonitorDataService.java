@@ -1,6 +1,7 @@
 package com.qgyun.hltgq.hltgqmq.service;
 
 import com.qgyun.hltgq.hltgqmq.util.IdGenerator;
+import com.qgyun.hltgq.hltgqmq.config.WaterLevelDatumProperties;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -31,6 +32,10 @@ public class MonitorDataService {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
+    /** 水位基准高程配置（stcd → 高程m，来自 application.properties，可热改配置重启生效） */
+    @Autowired
+    private WaterLevelDatumProperties waterLevelDatumProperties;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -253,6 +258,8 @@ public class MonitorDataService {
                         log.warn("riverInfo 副水位Z2异常, 剔除该字段: stcd={}, Z2={}", stcd, entity.get("Z2").asText());
                         fieldMap.remove("z2");
                     }
+                    // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正
+                    applyWaterLevelDatum(fieldMap, stcd);
                     // 继续走下方 river_info 表入库
                 } else {
                     // Z无值 → 闸站水位（闸前/闸后）：写 gate 表。
@@ -625,6 +632,57 @@ public class MonitorDataService {
     }
 
     /**
+     * 查站点水位基准高程(stcd → 高程m)：配置来自 application.properties
+     * (water-level-datum.datum.*)，未配置返回 0（不加高程）。
+     * 键大小写不敏感（先精确匹配，再转大写匹配）。
+     */
+    private double getWaterLevelDatum(String stcd) {
+        if (stcd == null || stcd.isEmpty() || waterLevelDatumProperties == null) {
+            return 0;
+        }
+        Map<String, Double> datum = waterLevelDatumProperties.getDatum();
+        if (datum == null || datum.isEmpty()) {
+            return 0;
+        }
+        Double v = datum.get(stcd);
+        if (v == null) {
+            v = datum.get(stcd.toUpperCase());
+        }
+        return (v != null && v > 0) ? v : 0;
+    }
+
+    /** 通用水位站基准高程修正：fieldMap 中已通过守卫的 z/z1/z2 统一加基准高程(水深→海拔) */
+    private void applyWaterLevelDatum(Map<String, Object> fieldMap, String stcd) {
+        double datum = getWaterLevelDatum(stcd);
+        if (datum <= 0) {
+            return;
+        }
+        boolean applied = false;
+        if (fieldMap.containsKey("z")) {
+            Double z = toDbDouble(fieldMap.get("z"));
+            if (z != null) {
+                fieldMap.put("z", z + datum);
+                applied = true;
+            }
+        }
+        if (fieldMap.containsKey("z1")) {
+            Double z1 = toDbDouble(fieldMap.get("z1"));
+            if (z1 != null) {
+                fieldMap.put("z1", z1 + datum);
+            }
+        }
+        if (fieldMap.containsKey("z2")) {
+            Double z2 = toDbDouble(fieldMap.get("z2"));
+            if (z2 != null) {
+                fieldMap.put("z2", z2 + datum);
+            }
+        }
+        if (applied) {
+            log.info("水位基准高程修正: stcd={}, 高程={}m, 入库水位=报文水位+高程", stcd, datum);
+        }
+    }
+
+    /**
      * 字段存在且数值为合理水位（>0 且 ≤1000，排除通讯异常哨兵值 4294967295/FFFFFFFF）；
      * 解析失败（非数值文本）视为无效，避免 asDouble 抛异常拖垮整条报文。
      */
@@ -656,6 +714,13 @@ public class MonitorDataService {
         if (z1 < 0 && z2 < 0) {
             log.debug("riverInfo 无有效闸站水位, 跳过入库, stcd={}", stcd);
             return;
+        }
+        // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正
+        double datum = getWaterLevelDatum(stcd);
+        if (datum > 0) {
+            if (z1 >= 0) z1 += datum;
+            if (z2 >= 0) z2 += datum;
+            log.info("闸站水位基准高程修正: stcd={}, 高程={}m", stcd, datum);
         }
 
         // Z1/Z2有正值确定是闸站，直接用首闸孔设备，不依赖 epjutj
