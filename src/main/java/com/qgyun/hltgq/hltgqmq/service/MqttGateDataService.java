@@ -740,22 +740,32 @@ public class MqttGateDataService {
         map.put("ctime",       now);
         map.put("status",      "#1#");
 
-        // 水位（站级，每个闸孔行都填充）；守卫：>0且≤1000，排除通讯异常哨兵值，
-        // 避免PLC异常值(如0/32767/FFFFFFFF)入库后展示层出现离奇水位
+        // 水位（站级，每个闸孔行都填充）；守卫：>0且≤1000；
+        // 通讯异常哨兵值(FFFFFFFF/4294967295)不丢弃，归一化为-999入库表示设备异常
         if (upZ != null) {
             Double val = parseDoubleSafe(upZ, "up_z");
-            if (val != null && val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR) map.put("up_z", val);
+            if (val == null && isCommErrorText(upZ)) val = -999.0;
+            if (val != null && (val == -999 || (val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR))) {
+                map.put("up_z", val);
+            }
         }
         if (downZ != null) {
             Double val = parseDoubleSafe(downZ, "down_z");
-            if (val != null && val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR) map.put("down_z", val);
+            if (val == null && isCommErrorText(downZ)) val = -999.0;
+            if (val != null && (val == -999 || (val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR))) {
+                map.put("down_z", val);
+            }
         }
 
-        // 闸门开度 R_{gateNo-1} → open_degree；守卫：物理范围 [0, 50]m，越界不入库
+        // 闸门开度 R_{gateNo-1} → open_degree；守卫：物理范围 [0, 50]m，越界不入库；
+        // 通讯异常哨兵值(FFFFFFFF)或PLC上报-999：以-999入库表示设备异常(不丢弃)
         String rKey = "R_" + String.format("%03d", gateNo - 1);
         if (fields.containsKey(rKey)) {
             Double val = parseDoubleSafe(fields.get(rKey), "open_degree");
-            if (val != null && val >= 0 && val <= MAX_OPEN_DEGREE) map.put("open_degree", val);
+            if (val == null && isCommErrorText(fields.get(rKey))) val = -999.0;
+            if (val != null && (val == -999 || (val >= 0 && val <= MAX_OPEN_DEGREE))) {
+                map.put("open_degree", val);
+            }
         }
 
         // DI 状态 B_{base}~B_{base+7} → local/remote/...；守卫：仅接受0/1，其他值视为PLC异常不入库
@@ -779,6 +789,15 @@ public class MqttGateDataService {
             log.debug("MQTT数值解析失败, field={}, value={}", fieldName, value);
             return null;
         }
+    }
+
+    /** 文本形式的通讯异常哨兵值判断（十六进制FFFFFFFF/十进制4294967295），归一化为-999入库 */
+    private static boolean isCommErrorText(String value) {
+        if (value == null) return false;
+        String t = value.trim();
+        return "FFFFFFFF".equalsIgnoreCase(t)
+                || "FFFFFFFFFFFFFFFF".equalsIgnoreCase(t)
+                || "4294967295".equals(t);
     }
 
     /** 安全解析int，解析失败返回null并记录日志 */

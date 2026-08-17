@@ -64,6 +64,20 @@ public class MonitorDataService {
         TAG_TABLE_MAP.put("rainInfo",   SCHEMA + "t_auto_hltgq_water_rain_info");
         TAG_TABLE_MAP.put("gatesInfo",  SCHEMA + "t_auto_hltgq_water_gate");
         TAG_TABLE_MAP.put("gateInfo",   SCHEMA + "t_auto_hltgq_water_gate");
+        TAG_TABLE_MAP.put("soilData",   SCHEMA + "t_auto_hltgq_water_nmisp_info");
+    }
+
+    /** soilData 墒情报文字段名 → nmisp_info 表列名 映射（M10→mten等） */
+    private static final Map<String, String> SOIL_FIELD_MAP = new LinkedHashMap<>();
+    static {
+        SOIL_FIELD_MAP.put("m10",   "mten");
+        SOIL_FIELD_MAP.put("m20",   "mtwenty");
+        SOIL_FIELD_MAP.put("m30",   "mthirty");
+        SOIL_FIELD_MAP.put("m40",   "mforty");
+        SOIL_FIELD_MAP.put("m50",   "mfifty");
+        SOIL_FIELD_MAP.put("m60",   "msixty");
+        SOIL_FIELD_MAP.put("m80",   "meighty");
+        SOIL_FIELD_MAP.put("m100",  "mhundred");
     }
 
     /** gate 表全限定名（riverInfo 闸站水位路由目标） */
@@ -80,6 +94,8 @@ public class MonitorDataService {
     private static final double MAX_FLOW = 100;
     /** 日降雨量上限(mm)，极端台风日也不超过此值 */
     private static final double MAX_DAILY_RAINFALL = 5000;
+    /** 土壤墒情含水量上限(%)，含水量百分比物理上限100 */
+    private static final double MAX_SOIL_MOISTURE = 100;
     /** 1h/3h/6h时段降雨量物理上限(mm)，拦截DYP跳变导致的离奇降雨 */
     private static final double MAX_RAINFALL_1H = 500;
     private static final double MAX_RAINFALL_3H = 1500;
@@ -221,6 +237,13 @@ public class MonitorDataService {
             while (fieldNames.hasNext()) {
                 String fieldName = fieldNames.next();
                 String lowerKey = fieldName.toLowerCase();
+                // soilData 墒情报文字段名与表列名不一致，先做映射（M10→mten等）
+                if ("soilData".equals(tag)) {
+                    String mapped = SOIL_FIELD_MAP.get(lowerKey);
+                    if (mapped != null) {
+                        lowerKey = mapped;
+                    }
+                }
                 // stcd 已添加，避免重复
                 if ("stcd".equals(lowerKey)) {
                     continue;
@@ -239,24 +262,50 @@ public class MonitorDataService {
                 fieldMap.put(lowerKey, convertValue(valueNode));
             }
 
+            // === soilData 墒情字段守卫 ===
+            // 含水量百分比物理范围 [0,100]，-999(设备异常/无传感器)照常入库；
+            // 越界或无效值仅剔除该字段，不影响整条报文入库
+            if ("soilData".equals(tag)) {
+                for (String col : SOIL_FIELD_MAP.values()) {
+                    if (!fieldMap.containsKey(col)) continue;
+                    Double v = toDbDouble(fieldMap.get(col));
+                    if (v == null || (v < 0 && v != -999) || v > MAX_SOIL_MOISTURE) {
+                        log.warn("soilData 墒情值异常, 剔除字段: stcd={}, col={}, value={}",
+                                 stcd, col, fieldMap.get(col));
+                        fieldMap.remove(col);
+                    }
+                }
+            }
+
             // === riverInfo 路由 ===
             if ("riverInfo".equals(tag)) {
                 if (hasValue(entity, "Z")) {
-                    // Z有值 → 通用水位站；先做数值守卫（排除0/负值/FFFFFFFF通讯异常），
-                    // 无效水位不入库，避免展示层出现离奇数值
-                    if (!isPositiveNumber(entity, "Z")) {
+                    // Z有值 → 通用水位站；先做数值守卫（排除0/负值），
+                    // 通讯异常哨兵值(FFFFFFFF)不拦截，以-999入库表示设备异常
+                    if (isCommErrorValue(entity, "Z")) {
+                        log.warn("riverInfo 水位设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                    } else if (!isPositiveNumber(entity, "Z")) {
                         log.warn("riverInfo 水位Z无效, 跳过入库: stcd={}, Z={}", stcd,
                                  hasValue(entity, "Z") ? entity.get("Z").asText() : "null");
                         return;
                     }
-                    // 副水位Z1/Z2守卫：异常值仅剔除该字段（不入库），不影响Z主数据
-                    if (hasValue(entity, "Z1") && !isPositiveNumber(entity, "Z1")) {
-                        log.warn("riverInfo 副水位Z1异常, 剔除该字段: stcd={}, Z1={}", stcd, entity.get("Z1").asText());
-                        fieldMap.remove("z1");
+                    // 副水位Z1/Z2守卫：异常值仅剔除该字段（不入库），不影响Z主数据；
+                    // 通讯异常哨兵值(FFFFFFFF)不剔除，以-999入库表示设备异常
+                    if (hasValue(entity, "Z1")) {
+                        if (isCommErrorValue(entity, "Z1")) {
+                            log.warn("riverInfo 副水位Z1设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                        } else if (!isPositiveNumber(entity, "Z1")) {
+                            log.warn("riverInfo 副水位Z1异常, 剔除该字段: stcd={}, Z1={}", stcd, entity.get("Z1").asText());
+                            fieldMap.remove("z1");
+                        }
                     }
-                    if (hasValue(entity, "Z2") && !isPositiveNumber(entity, "Z2")) {
-                        log.warn("riverInfo 副水位Z2异常, 剔除该字段: stcd={}, Z2={}", stcd, entity.get("Z2").asText());
-                        fieldMap.remove("z2");
+                    if (hasValue(entity, "Z2")) {
+                        if (isCommErrorValue(entity, "Z2")) {
+                            log.warn("riverInfo 副水位Z2设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                        } else if (!isPositiveNumber(entity, "Z2")) {
+                            log.warn("riverInfo 副水位Z2异常, 剔除该字段: stcd={}, Z2={}", stcd, entity.get("Z2").asText());
+                            fieldMap.remove("z2");
+                        }
                     }
                     // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正
                     applyWaterLevelDatum(fieldMap, stcd);
@@ -282,59 +331,78 @@ public class MonitorDataService {
                 }
             }
             // === volInfo 条件入库：VOL为空/≤0/超过100V均视为无效或异常 ===
+            // 通讯异常哨兵值(FFFFFFFF)不拦截，以-999入库表示设备异常
             if ("volInfo".equals(tag)) {
                 if (!hasValue(entity, "VOL")) {
                     log.debug("volInfo 无有效电压数据, 跳过入库, stcd={}", stcd);
                     return;
                 }
-                double vol = parseDoubleSafe(entity.get("VOL"));
-                if (Double.isNaN(vol) || vol <= 0 || vol > MAX_VOLTAGE) {
-                    log.warn("volInfo 电压异常, 不入库: stcd={}, VOL={}", stcd, entity.get("VOL").asText());
-                    return;
+                if (isCommErrorValue(entity, "VOL")) {
+                    log.warn("volInfo 电压设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                } else {
+                    double vol = parseDoubleSafe(entity.get("VOL"));
+                    if (Double.isNaN(vol) || vol <= 0 || vol > MAX_VOLTAGE) {
+                        log.warn("volInfo 电压异常, 不入库: stcd={}, VOL={}", stcd, entity.get("VOL").asText());
+                        return;
+                    }
                 }
             }
             // === wtInfo 条件入库 ===
             // Q/TF为0属正常(无流量，如冬季枯水期)；Q<0或>100视为异常；
-            // FFFFFFFF(4294967295)表示传感器通讯异常，数据无效。异常数据不入库但打印日志。
+            // 通讯异常哨兵值(FFFFFFFF/4294967295)不拦截，以-999入库表示设备异常。
             if ("wtInfo".equals(tag)) {
                 JsonNode qNode = entity.get("Q");
                 if (qNode == null || qNode.isNull()) {
                     log.debug("wtInfo 缺少流量字段Q, 跳过入库, stcd={}", stcd);
                     return;
                 }
-                double q = parseDoubleSafe(qNode);
-                if (Double.isNaN(q) || q == SENSOR_COMM_ERR) {
-                    log.warn("wtInfo 瞬时流量无效(传感器通讯异常), 不入库: stcd={}, Q={}", stcd, qNode.asText());
-                    return;
-                }
-                if (q < 0 || q > MAX_FLOW) {
-                    log.warn("wtInfo 瞬时流量异常(Q={}), 不入库: stcd={}", q, stcd);
-                    return;
-                }
-                // 累计流量TF：0属正常，负值/FFFFFFFF(4294967295)视为通讯异常
-                JsonNode tfNode = entity.get("TF");
-                if (tfNode != null && !tfNode.isNull()) {
-                    double tf = parseDoubleSafe(tfNode);
-                    if (Double.isNaN(tf) || tf < 0 || tf == SENSOR_COMM_ERR) {
-                        log.warn("wtInfo 累计流量无效(通讯异常), 不入库: stcd={}, TF={}", stcd, tfNode.asText());
+                if (isCommErrorValue(entity, "Q")) {
+                    log.warn("wtInfo 瞬时流量设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                } else {
+                    double q = parseDoubleSafe(qNode);
+                    if (Double.isNaN(q) || q < 0 || q > MAX_FLOW) {
+                        log.warn("wtInfo 瞬时流量异常(Q={}), 不入库: stcd={}", q, stcd);
                         return;
                     }
                 }
-            }
-            // === rainInfo 条件入库：DYP≤0/通讯异常说明设备无雨量监测能力或报文异常，跳过入库 ===
-            // DRP可为0（今日无雨），DYP是RTU安装以来累计值，为0则设备不匹配
-            if ("rainInfo".equals(tag)) {
-                double dyp = hasValue(entity, "DYP") ? parseDoubleSafe(entity.get("DYP")) : Double.NaN;
-                if (Double.isNaN(dyp) || dyp <= 0 || dyp == SENSOR_COMM_ERR) {
-                    log.warn("rainInfo 无有效雨量数据(DYP缺失/≤0/通讯异常), 跳过入库, stcd={}", stcd);
-                    return;
+                // 累计流量TF：0属正常，负值视为通讯异常；哨兵值(FFFFFFFF)以-999入库
+                JsonNode tfNode = entity.get("TF");
+                if (tfNode != null && !tfNode.isNull()) {
+                    if (isCommErrorValue(entity, "TF")) {
+                        log.warn("wtInfo 累计流量设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                    } else {
+                        double tf = parseDoubleSafe(tfNode);
+                        if (Double.isNaN(tf) || tf < 0) {
+                            log.warn("wtInfo 累计流量无效(通讯异常), 不入库: stcd={}, TF={}", stcd, tfNode.asText());
+                            return;
+                        }
+                    }
                 }
-                // DRP日雨量守卫：异常值仅剔除该字段（不入库），不影响整条报文其他字段
+            }
+            // === rainInfo 条件入库：DYP≤0说明设备无雨量监测能力或报文异常，跳过入库 ===
+            // DRP可为0（今日无雨），DYP是RTU安装以来累计值，为0则设备不匹配；
+            // 通讯异常哨兵值(FFFFFFFF)不拦截，以-999入库表示设备异常
+            if ("rainInfo".equals(tag)) {
+                if (isCommErrorValue(entity, "DYP")) {
+                    log.warn("rainInfo 雨量设备异常(FFFFFFFF), 以-999入库: stcd={}", stcd);
+                } else {
+                    double dyp = hasValue(entity, "DYP") ? parseDoubleSafe(entity.get("DYP")) : Double.NaN;
+                    if (Double.isNaN(dyp) || dyp <= 0) {
+                        log.warn("rainInfo 无有效雨量数据(DYP缺失/≤0), 跳过入库, stcd={}", stcd);
+                        return;
+                    }
+                }
+                // DRP日雨量守卫：异常值仅剔除该字段（不入库），不影响整条报文其他字段；
+                // 哨兵值(FFFFFFFF)不剔除，以-999入库表示设备异常
                 if (hasValue(entity, "DRP")) {
-                    double drp = parseDoubleSafe(entity.get("DRP"));
-                    if (Double.isNaN(drp) || drp == SENSOR_COMM_ERR || drp < 0 || drp > MAX_DAILY_RAINFALL) {
-                        log.warn("rainInfo 日雨量DRP异常, 剔除该字段: stcd={}, DRP={}", stcd, entity.get("DRP").asText());
-                        fieldMap.remove("drp");
+                    if (isCommErrorValue(entity, "DRP")) {
+                        log.warn("rainInfo 日雨量设备异常(FFFFFFFF), DRP以-999入库: stcd={}", stcd);
+                    } else {
+                        double drp = parseDoubleSafe(entity.get("DRP"));
+                        if (Double.isNaN(drp) || drp < 0 || drp > MAX_DAILY_RAINFALL) {
+                            log.warn("rainInfo 日雨量DRP异常, 剔除该字段: stcd={}, DRP={}", stcd, entity.get("DRP").asText());
+                            fieldMap.remove("drp");
+                        }
                     }
                 }
             }
@@ -651,7 +719,10 @@ public class MonitorDataService {
         return (v != null && v > 0) ? v : 0;
     }
 
-    /** 通用水位站基准高程修正：fieldMap 中已通过守卫的 z/z1/z2 统一加基准高程(水深→海拔) */
+    /**
+     * 通用水位站基准高程修正：fieldMap 中已通过守卫的 z/z1/z2 统一加基准高程(水深→海拔)。
+     * 仅对有效正值加高程，-999(设备异常)保持原值不加。
+     */
     private void applyWaterLevelDatum(Map<String, Object> fieldMap, String stcd) {
         double datum = getWaterLevelDatum(stcd);
         if (datum <= 0) {
@@ -660,20 +731,20 @@ public class MonitorDataService {
         boolean applied = false;
         if (fieldMap.containsKey("z")) {
             Double z = toDbDouble(fieldMap.get("z"));
-            if (z != null) {
+            if (z != null && z > 0) {
                 fieldMap.put("z", z + datum);
                 applied = true;
             }
         }
         if (fieldMap.containsKey("z1")) {
             Double z1 = toDbDouble(fieldMap.get("z1"));
-            if (z1 != null) {
+            if (z1 != null && z1 > 0) {
                 fieldMap.put("z1", z1 + datum);
             }
         }
         if (fieldMap.containsKey("z2")) {
             Double z2 = toDbDouble(fieldMap.get("z2"));
-            if (z2 != null) {
+            if (z2 != null && z2 > 0) {
                 fieldMap.put("z2", z2 + datum);
             }
         }
@@ -709,17 +780,23 @@ public class MonitorDataService {
         Timestamp now = new Timestamp(System.currentTimeMillis());
         Timestamp tm = extractTm(entity, now);
 
-        double z1 = isPositiveNumber(entity, "Z1") ? entity.get("Z1").asDouble() : -1;
-        double z2 = isPositiveNumber(entity, "Z2") ? entity.get("Z2").asDouble() : -1;
-        if (z1 < 0 && z2 < 0) {
+        // 有效水位(>0)照常入库；通讯异常哨兵值(FFFFFFFF)以-999入库表示设备异常；其余视为无效(-1)
+        double z1 = isCommErrorValue(entity, "Z1") ? -999
+                : (isPositiveNumber(entity, "Z1") ? entity.get("Z1").asDouble() : -1);
+        double z2 = isCommErrorValue(entity, "Z2") ? -999
+                : (isPositiveNumber(entity, "Z2") ? entity.get("Z2").asDouble() : -1);
+        boolean z1Valid = z1 > 0 || z1 == -999;
+        boolean z2Valid = z2 > 0 || z2 == -999;
+        if (!z1Valid && !z2Valid) {
             log.debug("riverInfo 无有效闸站水位, 跳过入库, stcd={}", stcd);
             return;
         }
-        // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正
+        // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正。
+        // 仅对有效正值加高程，-999(设备异常)保持原值不加
         double datum = getWaterLevelDatum(stcd);
         if (datum > 0) {
-            if (z1 >= 0) z1 += datum;
-            if (z2 >= 0) z2 += datum;
+            if (z1 > 0) z1 += datum;
+            if (z2 > 0) z2 += datum;
             log.info("闸站水位基准高程修正: stcd={}, 高程={}m", stcd, datum);
         }
 
@@ -753,11 +830,11 @@ public class MonitorDataService {
                     " SET updated_at = ?, updated_by = 'SYSTEM'");
             List<Object> updateParams = new ArrayList<>();
             updateParams.add(now);
-            if (z1 >= 0) {
+            if (z1Valid) {
                 updateSql.append(", up_z = ?");
                 updateParams.add(z1);
             }
-            if (z2 >= 0) {
+            if (z2Valid) {
                 updateSql.append(", down_z = ?");
                 updateParams.add(z2);
             }
@@ -767,7 +844,7 @@ public class MonitorDataService {
             int completed = jdbcTemplate.update(updateSql.toString(), updateParams.toArray());
             if (completed > 0) {
                 log.info("riverInfo水位已补全 {} 条采集时间最近的开度行: stcd={}, tm={}, Z1={}, Z2={}",
-                         completed, stcd, targetTm, z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
+                         completed, stcd, targetTm, z1Valid ? z1 : "null", z2Valid ? z2 : "null");
             }
         }
 
@@ -800,8 +877,8 @@ public class MonitorDataService {
         if (gateCols.isEmpty() || gateCols.contains("date"))        fm.put("date",         tm);
         if (gateCols.isEmpty() || gateCols.contains("ctime"))       fm.put("ctime",        tm);
         if (gateCols.isEmpty() || gateCols.contains("status"))      fm.put("status",       "#1#");
-        if (z1 >= 0 && (gateCols.isEmpty() || gateCols.contains("up_z")))   fm.put("up_z",   z1);
-        if (z2 >= 0 && (gateCols.isEmpty() || gateCols.contains("down_z"))) fm.put("down_z", z2);
+        if (z1Valid && (gateCols.isEmpty() || gateCols.contains("up_z")))   fm.put("up_z",   z1);
+        if (z2Valid && (gateCols.isEmpty() || gateCols.contains("down_z"))) fm.put("down_z", z2);
         // open_degree 留空：10 分钟窗口内等 gatesInfo 补全，等不到即归档（无开度）
 
         StringBuilder cols = new StringBuilder();
@@ -817,7 +894,7 @@ public class MonitorDataService {
                 GATE_TABLE, cols.toString(), phs.toString());
         jdbcTemplate.update(sql, vals.toArray());
         log.info("riverInfo闸站水位行入库: stcd={}, gate_no=1, Z1={}, Z2={}", stcd,
-                 z1 >= 0 ? z1 : "null", z2 >= 0 ? z2 : "null");
+                 z1Valid ? z1 : "null", z2Valid ? z2 : "null");
     }
 
     /**
@@ -844,10 +921,15 @@ public class MonitorDataService {
             if (!hasValue(entity, fieldName)) continue; // 跳过null字段，继续处理后续闸孔
 
             double openDegree = parseDoubleSafe(entity.get(fieldName));
-            // 非数值文本(如FFFFFFFF)或 -999 表示无信号，跳过该闸孔（不创建设备）；
-            // 开度物理范围 [0, 50]m，越界视为传感器异常，不入库（避免展示层出现负开度/超大开度）
-            if (Double.isNaN(openDegree) || openDegree == -999) continue;
-            if (openDegree < 0 || openDegree > MAX_OPEN_DEGREE) {
+            // 通讯异常哨兵值(文本FFFFFFFF/数值4294967295)或设备上报-999：不再跳过该闸孔，
+            // 统一以 open_degree=-999 入库表示设备异常（展示层按 -999 识别）；
+            // 其他非数值文本或越界值仍跳过，避免展示层出现离奇开度
+            if (isCommErrorValue(entity, fieldName) || openDegree == -999) {
+                openDegree = -999;
+            } else if (Double.isNaN(openDegree)) {
+                log.warn("gatesInfo 开度非数值, 跳过闸孔{}: stcd={}, value={}", i, stcd, entity.get(fieldName).asText());
+                continue;
+            } else if (openDegree < 0 || openDegree > MAX_OPEN_DEGREE) {
                 log.warn("gatesInfo 开度异常, 跳过闸孔{}: stcd={}, open_degree={}", i, stcd, openDegree);
                 continue;
             }
@@ -984,7 +1066,8 @@ public class MonitorDataService {
         Object zObj = fieldMap.get("z");
         // convertValue 对文本数值返回 String，必须用 toDbDouble 统一解析，否则涨幅永远不计算
         Double zVal = toDbDouble(zObj);
-        if (zVal == null) return;
+        // 守卫：当前水位无效(缺失/≤0/设备异常-999)时不计算涨幅，z本身照常入库
+        if (zVal == null || zVal <= 0) return;
 
         String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
         Timestamp oneHourAgo = new Timestamp(System.currentTimeMillis() - 3600000);
@@ -1030,6 +1113,8 @@ public class MonitorDataService {
      */
     private void computeRainfall(Map<String, Object> fieldMap, JsonNode entity, String stcd, Set<String> validColumns) {
         if (!hasValue(entity, "DYP")) return;
+        // 守卫：DYP为设备异常哨兵值(入库-999)时不计算时段降雨，避免离奇差值
+        if (isCommErrorValue(entity, "DYP")) return;
         double currentDyp = entity.get("DYP").asDouble();
 
         String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
@@ -1142,28 +1227,64 @@ public class MonitorDataService {
     }
 
     /**
-     * 将JsonNode值转为Java对象
+     * 将JsonNode值转为Java对象。
+     * 通讯异常哨兵值统一归一化：文本"FFFFFFFF"/数值4294967295 → -999(设备异常)，
+     * 全类型报文通用——异常值也入库(-999)，展示层按 -999 识别设备异常。
      */
     private Object convertValue(JsonNode node) {
         if (node == null || node.isNull()) {
             return null;
         }
         if (node.isTextual()) {
-            return node.asText();
+            String text = node.asText();
+            if (isCommErrorText(text)) {
+                return "-999";
+            }
+            return text;
         }
         if (node.isInt()) {
             return node.asInt();
         }
         if (node.isLong()) {
-            return node.asLong();
+            long v = node.asLong();
+            if (v == (long) SENSOR_COMM_ERR) {
+                return -999.0;
+            }
+            return v;
         }
         if (node.isDouble() || node.isFloat()) {
-            return node.asDouble();
+            double d = node.asDouble();
+            if (d == SENSOR_COMM_ERR) {
+                return -999.0;
+            }
+            return d;
         }
         if (node.isBoolean()) {
             return node.asBoolean();
         }
         return node.asText();
+    }
+
+    /**
+     * 判断字段值是否为设备通讯异常哨兵值（文本"FFFFFFFF"/数值4294967295）。
+     * 哨兵值不再拦截丢弃，统一以 -999 入库表示设备异常，全类型报文/设备通用。
+     */
+    private boolean isCommErrorValue(JsonNode entity, String field) {
+        if (!hasValue(entity, field)) return false;
+        JsonNode node = entity.get(field);
+        if (node.isTextual()) {
+            return isCommErrorText(node.asText());
+        }
+        return node.isNumber() && node.asDouble() == SENSOR_COMM_ERR;
+    }
+
+    /** 文本形式的通讯异常哨兵值判断（十六进制FFFFFFFF或十进制4294967295） */
+    private static boolean isCommErrorText(String text) {
+        if (text == null) return false;
+        String t = text.trim();
+        return "FFFFFFFF".equalsIgnoreCase(t)
+                || "FFFFFFFFFFFFFFFF".equalsIgnoreCase(t)
+                || "4294967295".equals(t);
     }
 
     // ======================== Gate 辅助方法 ========================
@@ -1362,12 +1483,12 @@ public class MonitorDataService {
      *   river_info — 水位（riverInfo，Z 空时跳过；闸站 Z1/Z2 走 gate 表）
      *   rain_info  — 雨量（rainInfo，DYP≤0 时跳过）
      *   gate       — 闸门开度/水位（gateInfo/gatesInfo 开度，riverInfo 闸站水位 Z1/Z2）
+     *   nmisp_info — 土壤墒情（soilData）
      *
      * MQTT (site 直接匹配 id):
      *   gate       — 闸门监测（无 stcd，仅 site 字段）
      *
      * 不入库的表（已跳过，无需检查）：
-     *   nmisp_info — nmIspInfo 暂不录入
      *   pcp_info   — pcpInfo 暂不录入
      * </pre>
      */
@@ -1394,9 +1515,11 @@ public class MonitorDataService {
                          "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE stcd = s.iofhpi AND tm >= ?" +
                          "  UNION ALL " +
                          "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE site = s.id     AND tm >= ?" +
+                         "  UNION ALL " +
+                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_nmisp_info WHERE stcd = s.iofhpi AND tm >= ?" +
                          ")";
             int rows = jdbcTemplate.update(sql, now,
-                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
                 log.info("标记离线站点: {} 个", rows);
             }
