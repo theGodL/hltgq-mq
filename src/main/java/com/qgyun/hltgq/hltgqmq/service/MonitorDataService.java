@@ -113,8 +113,8 @@ public class MonitorDataService {
     /** TM时间戳滞后容忍度：早于服务器时间2h视为设备时钟错误(停摆/复位)，用服务器时间兜底 */
     private static final long TM_MAX_BEHIND_MS = 2 * 3600000L;
 
-    /** 滞后分档阈值：滞后2h~24h按时钟停摆兜底服务器时间；超24h按历史补传保留原TM */
-    private static final long TM_BACKFILL_THRESHOLD_MS = 24 * 3600000L;
+    /** 各站最近一次业务测量时间TM（msgInfo的TM为平台转发时间不参与），用于TM停滞检测区分时钟停摆与延迟/补传 */
+    private final Map<String, Timestamp> lastBizTmByStcd = new ConcurrentHashMap<>();
 
     /** 设备表全限定名 */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
@@ -261,7 +261,7 @@ public class MonitorDataService {
                 // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳
                 if ("tm".equals(lowerKey)) {
                     if (isValidColumn(validColumns, "tm")) {
-                        fieldMap.put("tm", extractTm(entity, now));
+                        fieldMap.put("tm", extractTm(entity, now, stcd, tag));
                     }
                     continue;
                 }
@@ -779,7 +779,7 @@ public class MonitorDataService {
      */
     private void insertGateWaterLevelFromRiverInfo(JsonNode entity, String siteId, String stcd) {
         Timestamp now = new Timestamp(System.currentTimeMillis());
-        Timestamp tm = extractTm(entity, now);
+        Timestamp tm = extractTm(entity, now, stcd, "riverInfo");
 
         // 有效水位(>0)照常入库；通讯异常哨兵值(FFFFFFFF)以-9991入库表示设备异常；其余视为无效(-1)
         double z1 = isCommErrorValue(entity, "Z1") ? COMM_ERROR_INSERT_VALUE
@@ -911,7 +911,7 @@ public class MonitorDataService {
         String siteName = getSiteName(siteId);
 
         // 使用报文 TM，兜底服务器时间
-        Timestamp tm = extractTm(entity, now);
+        Timestamp tm = extractTm(entity, now, stcd, "gatesInfo");
 
         // 取该站最新闸站水位（读 gate 表近 2h 记录，仅读不改），与开度一并写入本批次闸孔行
         double[] waterLevels = getLatestWaterLevels(stcd);
@@ -1225,10 +1225,6 @@ public class MonitorDataService {
                 double dtSec = dtMs / 1000.0;
                 if (dtMs < 0) {
                     log.warn("wtInfo流量积分时间倒挂(补传乱序), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
-                } else if (dtSec < 1800) {
-                    // 1h周期报文不可能出现<30min的相邻行，短间隔必为TM兜底错标行/乱序补传所致，
-                    // 积分会把错标行与正常行之间的假时段算入累计，虚增流量
-                    log.warn("wtInfo流量积分间隔过小(疑似TM兜底错标/乱序), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
                 } else if (dtSec > 7200) {
                     log.warn("wtInfo流量积分间隔超2h(断报/停机), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
                 } else {
@@ -1382,8 +1378,8 @@ public class MonitorDataService {
 
     // ======================== Gate 辅助方法 ========================
 
-    /** 从 entity 中提取测量时间 TM，解析失败或时间异常则用兜底时间 */
-    private Timestamp extractTm(JsonNode entity, Timestamp fallback) {
+    /** 从 entity 中提取测量时间 TM，解析失败或时间异常则用兜底时间；tag 用于区分业务报文与平台转发时间 */
+    private Timestamp extractTm(JsonNode entity, Timestamp fallback, String stcd, String tag) {
         if (!hasValue(entity, "TM")) return fallback;
         try {
             Timestamp ts;
@@ -1401,10 +1397,10 @@ public class MonitorDataService {
                 ts = Timestamp.valueOf(tmNode.asText().replace('T', ' '));
             }
             // 时间合理性守卫：
-            // 早于2000年(1970解析错误)、超前服务器时间2h(设备时钟快) → 服务器时间兜底；
-            // 滞后分档：2h~24h视为设备时钟停摆/复位(如TM停在00:00:00)，兜底服务器时间，
-            // 避免同批报文tm相同触发stcd+tm去重碰撞丢数据(9000000006站事故)；
-            // 滞后超24h视为RTU断网恢复后的合法补传(连续历史时间序列)，保留原TM入库，
+            // 早于2000年(1970解析错误)、超前服务器时间2h(设备时钟快) → 服务器时间兜底。
+            // 滞后按TM停滞检测区分：与本站最近业务TM相同 → 设备时钟停摆(TM恒停不前进)，
+            // 兜底服务器时间避免同批报文tm相同触发stcd+tm去重碰撞丢数据(9000000006站事故)；
+            // TM随时间变化 → RTU断网恢复后的历史补传或延迟上报，保留原TM入库，
             // 若兜底成当前时间会把历史数据错标时间并污染当天流量积分。
             if (ts.getTime() < TM_MIN_EPOCH_MS
                     || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
@@ -1413,13 +1409,18 @@ public class MonitorDataService {
                 return fallback;
             }
             if (ts.getTime() < fallback.getTime() - TM_MAX_BEHIND_MS) {
-                if (fallback.getTime() - ts.getTime() <= TM_BACKFILL_THRESHOLD_MS) {
-                    log.warn("TM时钟停摆疑似(滞后2h~24h), 使用服务器时间: TM={}",
-                             entity.get("TM").asText());
+                Timestamp last = stcd != null ? lastBizTmByStcd.get(stcd) : null;
+                if (last != null && last.equals(ts)) {
+                    log.warn("TM停滞疑似时钟停摆, 使用服务器时间: stcd={}, TM={}",
+                             stcd, entity.get("TM").asText());
                     return fallback;
                 }
-                // 历史补传：保留原测量时间入库，时间轴正确，历史行不参与实时累计积分
-                log.debug("历史补传数据(滞后超24h), 保留原TM入库: TM={}", entity.get("TM").asText());
+                log.debug("滞后数据保留原TM入库(延迟上报/历史补传): stcd={}, TM={}",
+                          stcd, entity.get("TM").asText());
+            }
+            // 记录最近业务测量时间供TM停滞检测（msgInfo的TM是平台转发时间，不参与）
+            if (!"msgInfo".equals(tag) && stcd != null) {
+                lastBizTmByStcd.put(stcd, ts);
             }
             return ts;
         } catch (Exception e) {
