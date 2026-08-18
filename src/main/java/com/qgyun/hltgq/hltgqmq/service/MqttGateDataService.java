@@ -54,6 +54,8 @@ public class MqttGateDataService {
     private static final double MAX_OPEN_DEGREE = 50;
     /** FFFFFFFF(4294967295) 传感器通讯异常哨兵值 */
     private static final double SENSOR_COMM_ERR = 4294967295.0;
+    /** 通讯异常哨兵值归一化入库值：FFFFFFFF → -9991，与PLC上报的 -999(设备不存在)区分 */
+    private static final double COMM_ERROR_INSERT_VALUE = -9991;
 
     /**
      * MQTT 前缀 → 站点/设备名称 (查 zzkaec 和 water_device.name 共用)
@@ -741,29 +743,37 @@ public class MqttGateDataService {
         map.put("status",      "#1#");
 
         // 水位（站级，每个闸孔行都填充）；守卫：>0且≤1000；
-        // 通讯异常哨兵值(FFFFFFFF/4294967295)不丢弃，归一化为-999入库表示设备异常
+        // 通讯异常哨兵值(FFFFFFFF/4294967295)不丢弃，归一化为-9991入库表示设备通讯异常；
+        // PLC上报-999(设备不存在)保持原值入库，与-9991区分
         if (upZ != null) {
             Double val = parseDoubleSafe(upZ, "up_z");
-            if (val == null && isCommErrorText(upZ)) val = -999.0;
-            if (val != null && (val == -999 || (val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR))) {
+            if (val == null && isCommErrorText(upZ)) val = COMM_ERROR_INSERT_VALUE;
+            else if (val != null && val == SENSOR_COMM_ERR) val = COMM_ERROR_INSERT_VALUE;
+            if (val != null && (val == -999 || val == COMM_ERROR_INSERT_VALUE
+                    || (val > 0 && val <= MAX_WATER_LEVEL))) {
                 map.put("up_z", val);
             }
         }
         if (downZ != null) {
             Double val = parseDoubleSafe(downZ, "down_z");
-            if (val == null && isCommErrorText(downZ)) val = -999.0;
-            if (val != null && (val == -999 || (val > 0 && val <= MAX_WATER_LEVEL && val != SENSOR_COMM_ERR))) {
+            if (val == null && isCommErrorText(downZ)) val = COMM_ERROR_INSERT_VALUE;
+            else if (val != null && val == SENSOR_COMM_ERR) val = COMM_ERROR_INSERT_VALUE;
+            if (val != null && (val == -999 || val == COMM_ERROR_INSERT_VALUE
+                    || (val > 0 && val <= MAX_WATER_LEVEL))) {
                 map.put("down_z", val);
             }
         }
 
         // 闸门开度 R_{gateNo-1} → open_degree；守卫：物理范围 [0, 50]m，越界不入库；
-        // 通讯异常哨兵值(FFFFFFFF)或PLC上报-999：以-999入库表示设备异常(不丢弃)
+        // 通讯异常哨兵值(FFFFFFFF/4294967295)以-9991入库表示设备通讯异常；
+        // PLC上报-999(设备不存在)保持原值入库，与-9991区分
         String rKey = "R_" + String.format("%03d", gateNo - 1);
         if (fields.containsKey(rKey)) {
             Double val = parseDoubleSafe(fields.get(rKey), "open_degree");
-            if (val == null && isCommErrorText(fields.get(rKey))) val = -999.0;
-            if (val != null && (val == -999 || (val >= 0 && val <= MAX_OPEN_DEGREE))) {
+            if (val == null && isCommErrorText(fields.get(rKey))) val = COMM_ERROR_INSERT_VALUE;
+            else if (val != null && val == SENSOR_COMM_ERR) val = COMM_ERROR_INSERT_VALUE;
+            if (val != null && (val == -999 || val == COMM_ERROR_INSERT_VALUE
+                    || (val >= 0 && val <= MAX_OPEN_DEGREE))) {
                 map.put("open_degree", val);
             }
         }
@@ -791,7 +801,7 @@ public class MqttGateDataService {
         }
     }
 
-    /** 文本形式的通讯异常哨兵值判断（十六进制FFFFFFFF/十进制4294967295），归一化为-999入库 */
+    /** 文本形式的通讯异常哨兵值判断（十六进制FFFFFFFF/十进制4294967295），归一化为-9991入库 */
     private static boolean isCommErrorText(String value) {
         if (value == null) return false;
         String t = value.trim();
