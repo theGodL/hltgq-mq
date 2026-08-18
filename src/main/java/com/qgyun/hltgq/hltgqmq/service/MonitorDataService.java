@@ -110,10 +110,12 @@ public class MonitorDataService {
     private static final long TM_MIN_EPOCH_MS = Timestamp.valueOf("2000-01-01 00:00:00").getTime();
     /** TM时间戳超前容忍度：晚于服务器时间2h视为设备时钟错误 */
     private static final long TM_MAX_AHEAD_MS = 2 * 3600000L;
-    /** TM时间戳滞后容忍度：早于服务器时间2h视为设备时钟错误(停摆/复位)，用服务器时间兜底 */
+    /** TM时间戳滞后容忍度：早于服务器时间2h时先做TM停滞检测(与本站最近业务TM相同=时钟停摆则兜底，否则按延迟/补传保留原TM) */
     private static final long TM_MAX_BEHIND_MS = 2 * 3600000L;
 
-    /** 各站最近一次业务测量时间TM（msgInfo的TM为平台转发时间不参与），用于TM停滞检测区分时钟停摆与延迟/补传 */
+    /** 各站各tag最近一次业务测量时间TM（msgInfo的TM为平台转发时间不参与），用于TM停滞检测区分时钟停摆与延迟/补传。
+     *  键=stcd|tag：同批次volInfo/wtInfo/riverInfo/rainInfo携带同一测量时刻TM是正常快照，跨tag比较会误判停摆；
+     *  只有同一tag的TM连续相同（设备时钟停摆恒停不前进）才触发兜底 */
     private final Map<String, Timestamp> lastBizTmByStcd = new ConcurrentHashMap<>();
 
     /** 设备表全限定名 */
@@ -457,7 +459,7 @@ public class MonitorDataService {
 
         } catch (Exception e) {
             long dropped = droppedMessageCount.incrementAndGet();
-            log.error("数据入库失败(累计丢弃{}条): {}", dropped, message, e);
+            log.error("报文处理失败, 丢弃消息(累计{}条): {}", dropped, message, e);
             // 不抛出异常，避免阻塞MQ消费
         }
     }
@@ -741,12 +743,14 @@ public class MonitorDataService {
             Double z1 = toDbDouble(fieldMap.get("z1"));
             if (z1 != null && z1 > 0) {
                 fieldMap.put("z1", z1 + datum);
+                applied = true;
             }
         }
         if (fieldMap.containsKey("z2")) {
             Double z2 = toDbDouble(fieldMap.get("z2"));
             if (z2 != null && z2 > 0) {
                 fieldMap.put("z2", z2 + datum);
+                applied = true;
             }
         }
         if (applied) {
@@ -796,9 +800,12 @@ public class MonitorDataService {
         // 仅对有效正值加高程，-9991(通讯异常)保持原值不加
         double datum = getWaterLevelDatum(stcd);
         if (datum > 0) {
-            if (z1 > 0) z1 += datum;
-            if (z2 > 0) z2 += datum;
-            log.info("闸站水位基准高程修正: stcd={}, 高程={}m", stcd, datum);
+            boolean adjusted = false;
+            if (z1 > 0) { z1 += datum; adjusted = true; }
+            if (z2 > 0) { z2 += datum; adjusted = true; }
+            if (adjusted) {
+                log.info("闸站水位基准高程修正: stcd={}, 高程={}m", stcd, datum);
+            }
         }
 
         // Z1/Z2有正值确定是闸站，直接用首闸孔设备，不依赖 epjutj
@@ -1058,7 +1065,11 @@ public class MonitorDataService {
             }
         }
 
-        log.info("gatesInfo闸门开度入库成功: stcd={}, 闸孔数={}, table={}", stcd, inserted, GATE_TABLE);
+        if (inserted > 0) {
+            log.info("gatesInfo闸门开度入库成功: stcd={}, 闸孔数={}, table={}", stcd, inserted, GATE_TABLE);
+        } else {
+            log.info("gatesInfo闸门开度重复/无效, 本次未入库: stcd={}, table={}", stcd, GATE_TABLE);
+        }
     }
 
     /**
@@ -1228,7 +1239,7 @@ public class MonitorDataService {
                 } else if (dtSec > 7200) {
                     log.warn("wtInfo流量积分间隔超2h(断报/停机), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
                 } else {
-                    // 报文1h周期，延迟≤30min(5400s)属正常区间抖动，超过才视为疑似缺报
+                    // 站点上报周期不固定(实测10min/20min/1h)，间隔≤1.5h(5400s)静默积分；超过才视为疑似缺报
                     if (dtSec > 5400) {
                         log.warn("wtInfo流量积分间隔超1.5h(疑似缺报), 积分为近似值: stcd={}, 间隔={}s", stcd, dtSec);
                     }
@@ -1398,29 +1409,40 @@ public class MonitorDataService {
             }
             // 时间合理性守卫：
             // 早于2000年(1970解析错误)、超前服务器时间2h(设备时钟快) → 服务器时间兜底。
-            // 滞后按TM停滞检测区分：与本站最近业务TM相同 → 设备时钟停摆(TM恒停不前进)，
+            // 滞后按TM停滞检测区分（同stcd+tag维度）：与本tag最近业务TM相同 → 设备时钟停摆(TM恒停不前进)，
             // 兜底服务器时间避免同批报文tm相同触发stcd+tm去重碰撞丢数据(9000000006站事故)；
             // TM随时间变化 → RTU断网恢复后的历史补传或延迟上报，保留原TM入库，
             // 若兜底成当前时间会把历史数据错标时间并污染当天流量积分。
             if (ts.getTime() < TM_MIN_EPOCH_MS
                     || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
-                log.warn("TM时间戳异常(早于2000年/超前2h), 使用服务器时间: TM={}",
-                         entity.get("TM").asText());
+                String tmText = entity.get("TM").asText();
+                // 0001-01-01是设备无时钟时上游转发的固定默认值(如3206400004/0005站)，
+                // 每2~5分钟一条属常态而非异常，WARN仅为日志噪音，降为debug；
+                // 其余早于2000年的值(1970解析错误等)与超前2h仍保持WARN告警
+                if (tmText.startsWith("0001-01-01")) {
+                    log.debug("TM时间戳异常(设备无时钟0001-01-01), 使用服务器时间: stcd={}, tag={}",
+                              stcd, tag);
+                } else {
+                    log.warn("TM时间戳异常(早于2000年/超前2h), 使用服务器时间: TM={}", tmText);
+                }
                 return fallback;
             }
+            // 停滞检测按 stcd+tag 维度：同批次多个tag携带同一测量时刻TM是正常快照(volInfo先到写入last，
+            // 若按stcd维度比较会把wtInfo/riverInfo/rainInfo误判为停摆，补传历史数据被错标服务器时间)
+            String bizKey = (stcd != null && !"msgInfo".equals(tag)) ? stcd + "|" + tag : null;
             if (ts.getTime() < fallback.getTime() - TM_MAX_BEHIND_MS) {
-                Timestamp last = stcd != null ? lastBizTmByStcd.get(stcd) : null;
+                Timestamp last = bizKey != null ? lastBizTmByStcd.get(bizKey) : null;
                 if (last != null && last.equals(ts)) {
-                    log.warn("TM停滞疑似时钟停摆, 使用服务器时间: stcd={}, TM={}",
-                             stcd, entity.get("TM").asText());
+                    log.warn("TM停滞疑似时钟停摆, 使用服务器时间: stcd={}, tag={}, TM={}",
+                             stcd, tag, entity.get("TM").asText());
                     return fallback;
                 }
-                log.debug("滞后数据保留原TM入库(延迟上报/历史补传): stcd={}, TM={}",
-                          stcd, entity.get("TM").asText());
+                log.debug("滞后数据保留原TM入库(延迟上报/历史补传): stcd={}, tag={}, TM={}",
+                          stcd, tag, entity.get("TM").asText());
             }
-            // 记录最近业务测量时间供TM停滞检测（msgInfo的TM是平台转发时间，不参与）
-            if (!"msgInfo".equals(tag) && stcd != null) {
-                lastBizTmByStcd.put(stcd, ts);
+            // 记录本tag最近业务测量时间供TM停滞检测（msgInfo的TM是平台转发时间，不参与）
+            if (bizKey != null) {
+                lastBizTmByStcd.put(bizKey, ts);
             }
             return ts;
         } catch (Exception e) {

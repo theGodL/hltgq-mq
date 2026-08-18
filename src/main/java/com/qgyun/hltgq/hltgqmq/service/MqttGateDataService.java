@@ -281,7 +281,7 @@ public class MqttGateDataService {
             });
             log.info("定时入库完成: {} 条记录 → {}", rows.size(), GATE_TABLE);
         } catch (Exception e) {
-            log.error("定时入库失败, 数据丢失 {} 条", rows.size(), e);
+            log.error("定时入库失败, {} 条记录写回缓存待重试", rows.size(), e);
             // 失败时写回缓存，下次再试
             for (Map<String, Object> row : rows) {
                 String cacheKey = row.get("site") + "_" + row.get("device") + "_" + row.get("gate_no");
@@ -488,7 +488,7 @@ public class MqttGateDataService {
             double ttf = (lastTtf != null) ? lastTtf + delta : delta;
             return new double[]{timetf, tf, ytf, ttf};
         } catch (Exception e) {
-            log.warn("计算累计流量失败, 累计列不入库: site={}, {}", siteId, e.getMessage());
+            log.warn("计算累计流量失败, 累计列按0入库: site={}, {}", siteId, e.getMessage());
             return new double[]{0, 0, 0, 0};
         }
     }
