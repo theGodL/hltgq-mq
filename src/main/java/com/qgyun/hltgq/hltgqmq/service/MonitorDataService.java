@@ -113,6 +113,9 @@ public class MonitorDataService {
     /** TM时间戳滞后容忍度：早于服务器时间2h视为设备时钟错误(停摆/复位)，用服务器时间兜底 */
     private static final long TM_MAX_BEHIND_MS = 2 * 3600000L;
 
+    /** 滞后分档阈值：滞后2h~24h按时钟停摆兜底服务器时间；超24h按历史补传保留原TM */
+    private static final long TM_BACKFILL_THRESHOLD_MS = 24 * 3600000L;
+
     /** 设备表全限定名 */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
 
@@ -1071,8 +1074,12 @@ public class MonitorDataService {
         if (zVal == null || zVal <= 0) return;
 
         String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
-        Timestamp oneHourAgo = new Timestamp(System.currentTimeMillis() - 3600000);
-        Timestamp twoHoursAgo = new Timestamp(System.currentTimeMillis() - 7200000);
+        // 查询基准用本行测量时间tm：历史补传行的"1h涨幅"应相对其自身时间轴，
+        // 若用系统当前时间会把跨月水位差误标为1h涨幅
+        Timestamp baseTm = toDbTimestamp(fieldMap.get("tm"));
+        if (baseTm == null) return;
+        Timestamp oneHourAgo = new Timestamp(baseTm.getTime() - 3600000);
+        Timestamp twoHoursAgo = new Timestamp(baseTm.getTime() - 7200000);
         try {
             List<Double> results;
             if (device != null) {
@@ -1120,8 +1127,12 @@ public class MonitorDataService {
 
         String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
 
+        // 查询基准用本行测量时间tm（与1h涨幅一致，历史补传行按自身时间轴计算时段降雨）
+        Timestamp baseTm = toDbTimestamp(fieldMap.get("tm"));
+        if (baseTm == null) return;
+
         if (isValidColumn(validColumns, "rainfall1h")) {
-            Double prev = queryPreviousDyp(stcd, device, 3600000);
+            Double prev = queryPreviousDyp(stcd, device, 3600000, baseTm);
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
                 if (diff >= 0) {
@@ -1137,7 +1148,7 @@ public class MonitorDataService {
             }
         }
         if (isValidColumn(validColumns, "rainfall3h")) {
-            Double prev = queryPreviousDyp(stcd, device, 3 * 3600000);
+            Double prev = queryPreviousDyp(stcd, device, 3 * 3600000, baseTm);
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
                 if (diff >= 0) {
@@ -1152,7 +1163,7 @@ public class MonitorDataService {
             }
         }
         if (isValidColumn(validColumns, "rainfall6h")) {
-            Double prev = queryPreviousDyp(stcd, device, 6 * 3600000);
+            Double prev = queryPreviousDyp(stcd, device, 6 * 3600000, baseTm);
             if (prev != null) {
                 double diff = trunc2(currentDyp - prev);
                 if (diff >= 0) {
@@ -1214,6 +1225,10 @@ public class MonitorDataService {
                 double dtSec = dtMs / 1000.0;
                 if (dtMs < 0) {
                     log.warn("wtInfo流量积分时间倒挂(补传乱序), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
+                } else if (dtSec < 1800) {
+                    // 1h周期报文不可能出现<30min的相邻行，短间隔必为TM兜底错标行/乱序补传所致，
+                    // 积分会把错标行与正常行之间的假时段算入累计，虚增流量
+                    log.warn("wtInfo流量积分间隔过小(疑似TM兜底错标/乱序), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
                 } else if (dtSec > 7200) {
                     log.warn("wtInfo流量积分间隔超2h(断报/停机), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
                 } else {
@@ -1243,11 +1258,11 @@ public class MonitorDataService {
         if (isValidColumn(validColumns, "ttf")) fieldMap.put("ttf", ttf);
     }
 
-    /** 查询指定时间前的DYP累计值（DYP永不重置，差值始终≥0） */
-    private Double queryPreviousDyp(String stcd, String device, long intervalMs) {
+    /** 查询基准时间前 intervalMs 窗口内的DYP累计值（DYP永不重置，差值始终≥0）；基准=本行测量时间tm */
+    private Double queryPreviousDyp(String stcd, String device, long intervalMs, Timestamp baseTm) {
         long lowerBoundMs = intervalMs * 2;
-        Timestamp from = new Timestamp(System.currentTimeMillis() - lowerBoundMs);
-        Timestamp to   = new Timestamp(System.currentTimeMillis() - intervalMs);
+        Timestamp from = new Timestamp(baseTm.getTime() - lowerBoundMs);
+        Timestamp to   = new Timestamp(baseTm.getTime() - intervalMs);
         try {
             List<Double> results;
             if (device != null) {
@@ -1385,15 +1400,26 @@ public class MonitorDataService {
                 // ISO 8601 "yyyy-MM-ddTHH:mm:ss" → 替换 T 为空格，兼容 Timestamp.valueOf()
                 ts = Timestamp.valueOf(tmNode.asText().replace('T', ' '));
             }
-            // 时间合理性守卫：早于2000年(1970解析错误)、超前服务器时间2h(设备时钟快)、
-            // 滞后服务器时间2h(设备时钟停摆/复位) → 服务器时间兜底。
-            // 2h内的历史补传数据保留原TM，不影响短时离线补传场景。
+            // 时间合理性守卫：
+            // 早于2000年(1970解析错误)、超前服务器时间2h(设备时钟快) → 服务器时间兜底；
+            // 滞后分档：2h~24h视为设备时钟停摆/复位(如TM停在00:00:00)，兜底服务器时间，
+            // 避免同批报文tm相同触发stcd+tm去重碰撞丢数据(9000000006站事故)；
+            // 滞后超24h视为RTU断网恢复后的合法补传(连续历史时间序列)，保留原TM入库，
+            // 若兜底成当前时间会把历史数据错标时间并污染当天流量积分。
             if (ts.getTime() < TM_MIN_EPOCH_MS
-                    || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS
-                    || ts.getTime() < fallback.getTime() - TM_MAX_BEHIND_MS) {
-                log.warn("TM时间戳异常(早于2000年/超前2h/滞后2h), 使用服务器时间: TM={}",
+                    || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
+                log.warn("TM时间戳异常(早于2000年/超前2h), 使用服务器时间: TM={}",
                          entity.get("TM").asText());
                 return fallback;
+            }
+            if (ts.getTime() < fallback.getTime() - TM_MAX_BEHIND_MS) {
+                if (fallback.getTime() - ts.getTime() <= TM_BACKFILL_THRESHOLD_MS) {
+                    log.warn("TM时钟停摆疑似(滞后2h~24h), 使用服务器时间: TM={}",
+                             entity.get("TM").asText());
+                    return fallback;
+                }
+                // 历史补传：保留原测量时间入库，时间轴正确，历史行不参与实时累计积分
+                log.debug("历史补传数据(滞后超24h), 保留原TM入库: TM={}", entity.get("TM").asText());
             }
             return ts;
         } catch (Exception e) {
