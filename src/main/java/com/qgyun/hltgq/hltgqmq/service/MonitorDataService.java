@@ -1625,9 +1625,14 @@ public class MonitorDataService {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Timestamp cutoff = new Timestamp(now.getTime() - 86400000L); // 24h前
             // 对所有入库表做 UNION ALL：任一表有 24h 内数据 → 在线，全部无数据 → 离线
+            // 仅遥测设备参与判定：有RTU站号(水位/雨量/墒情/闸站/流量经RabbitMQ stcd=iofhpi入库)
+            // 或存在MQTT闸站gate数据(site=id)；视频设备由大华对接项目单独维护，
+            // 本项目不参与其在线状态管理；点位等其他无遥测数据源的设备同样不参与
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                          "SET zebpsu = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
                          "WHERE zebpsu IS DISTINCT FROM '#2#' " +
+                         "AND (s.iofhpi IS NOT NULL " +
+                         "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
                          "AND NOT EXISTS (" +
                          "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE stcd = s.iofhpi AND tm >= ?" +
                          "  UNION ALL " +

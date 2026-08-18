@@ -148,6 +148,9 @@ public class MqttGateDataService {
 
                 String siteId = lookupSiteByName(baseName);
                 if (siteId == null) {
+                    // 已知前缀但站点名未匹配到平台站点(如平台侧改名zzkaec)：
+                    // 数据被静默丢弃且24h后会被checkOfflineSites误标离线，必须告警
+                    log.warn("MQTT站点名未匹配到平台站点, 报文跳过: prefix={}, siteName={}", prefix, baseName);
                     continue;
                 }
 
