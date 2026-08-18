@@ -250,6 +250,11 @@ public class MonitorDataService {
                 if ("stcd".equals(lowerKey)) {
                     continue;
                 }
+                // wtInfo 的 TF(设备累计流量)由设备计量、误差大不可信，不再入库，
+                // tf/timetf/ytf/ttf 四级累计均由服务端基于 Q 梯形积分计算(见 computeWtAccumulations)
+                if ("wtInfo".equals(tag) && "tf".equals(lowerKey)) {
+                    continue;
+                }
                 // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳
                 if ("tm".equals(lowerKey)) {
                     if (isValidColumn(validColumns, "tm")) {
@@ -351,8 +356,9 @@ public class MonitorDataService {
                 }
             }
             // === wtInfo 条件入库 ===
-            // Q/TF为0属正常(无流量，如冬季枯水期)；Q<0或>100视为异常；
+            // Q为0属正常(无流量，如冬季枯水期)；Q<0或>100视为异常；
             // 通讯异常哨兵值(FFFFFFFF/4294967295)不拦截，以-9991入库表示设备异常。
+            // 报文累计流量TF不再入库(设备计量误差大不可信)，四级累计由服务端计算。
             if ("wtInfo".equals(tag)) {
                 JsonNode qNode = entity.get("Q");
                 if (qNode == null || qNode.isNull()) {
@@ -366,19 +372,6 @@ public class MonitorDataService {
                     if (Double.isNaN(q) || q < 0 || q > MAX_FLOW) {
                         log.warn("wtInfo 瞬时流量异常(Q={}), 不入库: stcd={}", q, stcd);
                         return;
-                    }
-                }
-                // 累计流量TF：0属正常，负值视为通讯异常；哨兵值(FFFFFFFF)以-9991入库
-                JsonNode tfNode = entity.get("TF");
-                if (tfNode != null && !tfNode.isNull()) {
-                    if (isCommErrorValue(entity, "TF")) {
-                        log.warn("wtInfo 累计流量设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
-                    } else {
-                        double tf = parseDoubleSafe(tfNode);
-                        if (Double.isNaN(tf) || tf < 0) {
-                            log.warn("wtInfo 累计流量无效(通讯异常), 不入库: stcd={}, TF={}", stcd, tfNode.asText());
-                            return;
-                        }
                     }
                 }
             }
@@ -415,11 +408,13 @@ public class MonitorDataService {
                 return;
             }
 
-            // === 计算字段：水位涨幅、累计降雨 ===
+            // === 计算字段：水位涨幅、累计降雨、流量四级累计 ===
             if ("riverInfo".equals(tag)) {
                 computeWaterLevelRise1h(fieldMap, stcd, validColumns);
             } else if ("rainInfo".equals(tag)) {
                 computeRainfall(fieldMap, entity, stcd, validColumns);
+            } else if ("wtInfo".equals(tag)) {
+                computeWtAccumulations(fieldMap, stcd, validColumns);
             }
 
             // 去重：相同 stcd+tm 已存在则跳过（防止RabbitMQ重投产生重复行）
@@ -1171,6 +1166,81 @@ public class MonitorDataService {
                 }
             }
         }
+    }
+
+    /**
+     * 计算站点四级累计流量(服务端梯形积分)：timetf时段 / tf日 / ytf年 / ttf总，单位 m³。
+     * 查 wt_nfo 该站最近一行(RabbitMQ行，stcd匹配)，时段增量 delta = (lastQ + q) / 2 × Δt(Δt = 本行tm - 上行tm)。
+     * 日累计：同天继承 lastTf + delta，跨天/首行从 delta 起算；
+     * 年累计：同年继承 lastYtf + delta，跨年/首行从 delta 起算；
+     * 总累计：永远继承 lastTtf + delta。
+     * 改造前的旧行 tf 是设备累计(不可信)且无 ytf，以 lastYtf==null 判定旧行 → tf 不继承；
+     * 间隔超2h视为数据断层(断报/停机)，delta=0 不积分防止累计虚增；
+     * 1~1.5h属正常区间抖动静默积分，1.5~2h缺批容忍并积分(近似值)但WARN提醒排查；乱序补传(Δt<0)同样不积分；
+     * Q为通讯异常哨兵值(-9991)时不积分(累计列继承上值保持平顶)。
+     */
+    private void computeWtAccumulations(Map<String, Object> fieldMap, String stcd, Set<String> validColumns) {
+        Double q = toDbDouble(fieldMap.get("q"));
+        Timestamp tm = toDbTimestamp(fieldMap.get("tm"));
+        if (q == null || tm == null) {
+            return;
+        }
+
+        double timetf = 0, tf = 0, ytf = 0, ttf = 0;
+        try {
+            Timestamp dayStart = Timestamp.valueOf(tm.toLocalDateTime().toLocalDate().atStartOfDay());
+            Timestamp yearStart = Timestamp.valueOf(tm.toLocalDateTime().toLocalDate().withDayOfYear(1).atStartOfDay());
+
+            Timestamp lastTm = null;
+            Double lastQ = null;
+            Double lastTf = null;
+            Double lastYtf = null;
+            Double lastTtf = null;
+            String sql = "SELECT tm, q, tf, ytf, ttf FROM " + SCHEMA + "t_auto_hltgq_water_wt_nfo" +
+                    " WHERE stcd = ? AND tm < ? ORDER BY tm DESC LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, stcd, tm);
+            if (rows != null && !rows.isEmpty()) {
+                Map<String, Object> row = rows.get(0);
+                lastTm = toDbTimestamp(row.get("tm"));
+                lastQ = toDbDouble(row.get("q"));
+                lastTf = toDbDouble(row.get("tf"));
+                lastYtf = toDbDouble(row.get("ytf"));
+                lastTtf = toDbDouble(row.get("ttf"));
+            }
+
+            double delta = 0;
+            if (q >= 0 && lastTm != null && lastQ != null && lastQ >= 0) {
+                long dtMs = tm.getTime() - lastTm.getTime();
+                double dtSec = dtMs / 1000.0;
+                if (dtMs < 0) {
+                    log.warn("wtInfo流量积分时间倒挂(补传乱序), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
+                } else if (dtSec > 7200) {
+                    log.warn("wtInfo流量积分间隔超2h(断报/停机), 该段不积分: stcd={}, 间隔={}s", stcd, dtSec);
+                } else {
+                    // 报文1h周期，延迟≤30min(5400s)属正常区间抖动，超过才视为疑似缺报
+                    if (dtSec > 5400) {
+                        log.warn("wtInfo流量积分间隔超1.5h(疑似缺报), 积分为近似值: stcd={}, 间隔={}s", stcd, dtSec);
+                    }
+                    delta = (lastQ + q) / 2.0 * dtSec;
+                }
+            }
+            // 首行/上行无效/Q异常：delta=0，各级累计从0起算
+
+            timetf = delta;
+            boolean sameDay = lastTm != null && lastTm.getTime() >= dayStart.getTime();
+            boolean sameYear = lastTm != null && lastTm.getTime() >= yearStart.getTime();
+            // tf继承要求 lastYtf!=null：改造前旧行 tf 是设备累计(不可信)，只有改造后新行之间才继承日累计
+            tf = (sameDay && lastTf != null && lastYtf != null) ? lastTf + delta : delta;
+            ytf = (sameYear && lastYtf != null) ? lastYtf + delta : delta;
+            ttf = (lastTtf != null) ? lastTtf + delta : delta;
+        } catch (Exception e) {
+            log.warn("wtInfo计算累计流量失败, 累计列不入库: stcd={}, {}", stcd, e.getMessage());
+            return;
+        }
+        if (isValidColumn(validColumns, "timetf")) fieldMap.put("timetf", timetf);
+        if (isValidColumn(validColumns, "tf")) fieldMap.put("tf", tf);
+        if (isValidColumn(validColumns, "ytf")) fieldMap.put("ytf", ytf);
+        if (isValidColumn(validColumns, "ttf")) fieldMap.put("ttf", ttf);
     }
 
     /** 查询指定时间前的DYP累计值（DYP永不重置，差值始终≥0） */

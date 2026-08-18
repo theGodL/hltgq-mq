@@ -372,20 +372,21 @@ public class MqttGateDataService {
                 continue;
             }
 
-            // 日累计流量：梯形积分(Q×Δt)累加到当天0点起的日累计，随行入库 tf 字段
+            // 四级累计流量(服务端梯形积分)：timetf时段增量 → tf日 / ytf年 / ttf总
             Timestamp wtNow = new Timestamp(System.currentTimeMillis());
-            double dailyTf = computeDailyTf(siteId, wtNow, totalQ);
+            double[] acc = computeWtAccumulations(siteId, wtNow, totalQ);
             wtRows.add(buildWtRow(siteId, firstGateRow != null ? firstGateRow : sampleRow,
-                    upZ, totalQ, wtNow, dailyTf));
+                    upZ, totalQ, wtNow, acc));
         }
         return wtRows;
     }
 
     /**
-     * 组装 wt_nfo 站级一行：stcd 不写（MQTT 无 stcd），site + device 关联，z=上游水位，q=总流量，tf=日累计流量
+     * 组装 wt_nfo 站级一行：stcd 不写（MQTT 无 stcd），site + device 关联，
+     * z=上游水位，q=总流量，acc={timetf时段, tf日, ytf年, ttf总} 四级累计流量(服务端计算)
      */
     private Map<String, Object> buildWtRow(String siteId, Map<String, Object> gateRow,
-                                           double upZ, double totalQ, Timestamp tm, double tf) {
+                                           double upZ, double totalQ, Timestamp tm, double[] acc) {
         Map<String, Object> map = new LinkedHashMap<>();
 
         // 系统字段（与 RabbitMQ 行结构一致）
@@ -415,65 +416,80 @@ public class MqttGateDataService {
         if (wtColumns.isEmpty() || wtColumns.contains("tm")) {
             map.put("tm", tm);
         }
+        if (wtColumns.isEmpty() || wtColumns.contains("timetf")) {
+            map.put("timetf", acc[0]);
+        }
         if (wtColumns.isEmpty() || wtColumns.contains("tf")) {
-            map.put("tf", tf);
+            map.put("tf", acc[1]);
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("ytf")) {
+            map.put("ytf", acc[2]);
+        }
+        if (wtColumns.isEmpty() || wtColumns.contains("ttf")) {
+            map.put("ttf", acc[3]);
         }
         return map;
     }
 
     /**
-     * 计算站点日累计流量（当天0点起，梯形积分）：
-     * 查 wt_nfo 该站最近一行(MQTT行)，增量 = (lastQ + q) / 2 × Δt。
-     * 同一天：继承上行星 tf、以上行 tm 为积分起点；
-     * 跨天/首行：日累计归零，从当天 0 点起算（跨天首行仍用昨天 Q 做梯形底）。
-     * 间隔超 2h 视为数据断层(断报/停机)，该段不积分防止日累计虚增；
-     * 1~2h 缺批容忍并积分(近似值)但 WARN 提醒排查。
+     * 计算站点四级累计流量(服务端梯形积分)：timetf时段 / tf日 / ytf年 / ttf总，单位 m³。
+     * 查 wt_nfo 该站最近一行(MQTT行)，时段增量 delta = (lastQ + q) / 2 × Δt(Δt = now - 上行tm)。
+     * 日累计：同天继承 lastTf + delta，跨天/首行从 delta 起算；
+     * 年累计：同年继承 lastYtf + delta，跨年/首行从 delta 起算；
+     * 总累计：永远继承 lastTtf + delta(改造前旧行无 ttf 视为 0)。
+     * 间隔超 2h 视为数据断层(断报/停机)，delta=0 不积分防止累计虚增；
+     * 1~2h 缺批容忍并积分(近似值)但 WARN 提醒排查；乱序(Δt<0)同样不积分。
+     * 返回 double[]{timetf, tf, ytf, ttf}，异常时返回全 0。
      */
-    private double computeDailyTf(String siteId, Timestamp now, double q) {
+    private double[] computeWtAccumulations(String siteId, Timestamp now, double q) {
         try {
             Timestamp dayStart = Timestamp.valueOf(now.toLocalDateTime().toLocalDate().atStartOfDay());
-            double baseTf = 0;
-            double lastQ = q;
-            Timestamp effectiveStart = dayStart;
+            Timestamp yearStart = Timestamp.valueOf(now.toLocalDateTime().toLocalDate().withDayOfYear(1).atStartOfDay());
 
-            String sql = "SELECT tm, q, tf FROM " + WT_NFO_TABLE +
+            Timestamp lastTm = null;
+            Double lastQ = null;
+            Double lastTf = null;
+            Double lastYtf = null;
+            Double lastTtf = null;
+            String sql = "SELECT tm, q, tf, ytf, ttf FROM " + WT_NFO_TABLE +
                     " WHERE site = ? AND (stcd IS NULL OR stcd = '') AND tm < ? ORDER BY tm DESC LIMIT 1";
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId, now);
-            if (!rows.isEmpty()) {
+            if (rows != null && !rows.isEmpty()) {
                 Map<String, Object> row = rows.get(0);
-                Timestamp lastTm = toDbTimestamp(row.get("tm"));
-                Double lastQVal = toDouble(row.get("q"));
-                Double lastTfVal = toDouble(row.get("tf"));
-                if (lastTm != null && lastTm.getTime() >= dayStart.getTime() && lastQVal != null) {
-                    // 同一天：继承日累计，以上行 tm 为积分起点
-                    lastQ = lastQVal;
-                    effectiveStart = lastTm;
-                    if (lastTfVal != null) {
-                        baseTf = lastTfVal;
-                    }
-                }
-                // 跨天/上行无效：effectiveStart 保持 dayStart，baseTf=0 → 今天重新累计
+                lastTm = toDbTimestamp(row.get("tm"));
+                lastQ = toDouble(row.get("q"));
+                lastTf = toDouble(row.get("tf"));
+                lastYtf = toDouble(row.get("ytf"));
+                lastTtf = toDouble(row.get("ttf"));
             }
 
-            long dtMs = now.getTime() - effectiveStart.getTime();
-            if (dtMs < 0) {
-                dtMs = 0;
-            }
-            double dtSec = dtMs / 1000.0;
             double delta = 0;
-            if (dtSec > 7200) {
-                // 断层超2h：期间的流量曲线无从知晓，宁缺毋滥，不积分
-                log.warn("MQTT流量积分间隔超2h(断报/停机), 该段不积分: site={}, 间隔={}s", siteId, dtSec);
-            } else {
-                if (dtSec > 3600) {
-                    log.warn("MQTT流量积分间隔超1h(疑似缺批), 积分为近似值: site={}, 间隔={}s", siteId, dtSec);
+            if (lastTm != null && lastQ != null && lastQ >= 0) {
+                long dtMs = now.getTime() - lastTm.getTime();
+                double dtSec = dtMs / 1000.0;
+                if (dtMs < 0) {
+                    log.warn("MQTT流量积分时间倒挂(乱序), 该段不积分: site={}, 间隔={}s", siteId, dtSec);
+                } else if (dtSec > 7200) {
+                    log.warn("MQTT流量积分间隔超2h(断报/停机), 该段不积分: site={}, 间隔={}s", siteId, dtSec);
+                } else {
+                    if (dtSec > 3600) {
+                        log.warn("MQTT流量积分间隔超1h(疑似缺批), 积分为近似值: site={}, 间隔={}s", siteId, dtSec);
+                    }
+                    delta = (lastQ + q) / 2.0 * dtSec;
                 }
-                delta = (lastQ + q) / 2.0 * dtSec;
             }
-            return baseTf + delta;
+            // 首行/上行无效：delta=0，各级累计从 0 起算
+
+            double timetf = delta;
+            double tf = (lastTm != null && lastTm.getTime() >= dayStart.getTime() && lastTf != null)
+                    ? lastTf + delta : delta;
+            double ytf = (lastTm != null && lastTm.getTime() >= yearStart.getTime() && lastYtf != null)
+                    ? lastYtf + delta : delta;
+            double ttf = (lastTtf != null) ? lastTtf + delta : delta;
+            return new double[]{timetf, tf, ytf, ttf};
         } catch (Exception e) {
-            log.warn("计算日累计流量失败, tf不入库: site={}, {}", siteId, e.getMessage());
-            return 0;
+            log.warn("计算累计流量失败, 累计列不入库: site={}, {}", siteId, e.getMessage());
+            return new double[]{0, 0, 0, 0};
         }
     }
 
