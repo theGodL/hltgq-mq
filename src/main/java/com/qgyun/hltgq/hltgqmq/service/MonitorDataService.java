@@ -33,6 +33,10 @@ public class MonitorDataService {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    /** 告警入库服务（设备异常/站点失联/阈值越界） */
+    @Autowired
+    private AlertService alertService;
+
     /** 水位基准高程配置（stcd → 高程m，来自 application.properties，可热改配置重启生效） */
     @Autowired
     private WaterLevelDatumProperties waterLevelDatumProperties;
@@ -274,11 +278,20 @@ public class MonitorDataService {
                 fieldMap.put(lowerKey, convertValue(valueNode));
             }
 
+            // === 告警挂接公共上下文：站点名/设备ID/报文测量时间 ===
+            String siteName = getSiteName(site);
+            String deviceId = fieldMap.get("device") != null ? String.valueOf(fieldMap.get("device")) : null;
+            Timestamp bizTm = toDbTimestamp(fieldMap.get("tm"));
+            if (bizTm == null) {
+                bizTm = now;
+            }
+
             // === soilData 墒情字段守卫 ===
             // 含水量百分比物理范围 [0,100]，-999(设备不存在/无传感器)与
             // -9991(通讯异常FFFFFFFF归一化)照常入库；
             // 越界或无效值仅剔除该字段，不影响整条报文入库
             if ("soilData".equals(tag)) {
+                boolean soilCommError = false;
                 for (String col : SOIL_FIELD_MAP.values()) {
                     if (!fieldMap.containsKey(col)) continue;
                     Double v = toDbDouble(fieldMap.get(col));
@@ -286,7 +299,21 @@ public class MonitorDataService {
                         log.warn("soilData 墒情值异常, 剔除字段: stcd={}, col={}, value={}",
                                  stcd, col, fieldMap.get(col));
                         fieldMap.remove(col);
+                    } else if (v == COMM_ERROR_INSERT_VALUE) {
+                        soilCommError = true;
                     }
+                }
+                // 哨兵值→设备异常告警，无哨兵值→视为恢复正常
+                if (soilCommError) {
+                    alertService.reportDeviceError(site, deviceId, siteName, "墒情", bizTm);
+                } else {
+                    alertService.closeDeviceError(site, deviceId, siteName, "墒情");
+                }
+                // 墒情阈值判定：表层10cm(mten)，仅正常值参与
+                Double m10 = toDbDouble(fieldMap.get("mten"));
+                if (m10 != null && m10 >= 0 && m10 <= MAX_SOIL_MOISTURE) {
+                    alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_SOIL,
+                            siteName, "墒情", m10, bizTm);
                 }
             }
 
@@ -297,31 +324,47 @@ public class MonitorDataService {
                     // 通讯异常哨兵值(FFFFFFFF)不拦截，以-9991入库表示设备异常
                     if (isCommErrorValue(entity, "Z")) {
                         log.warn("riverInfo 水位设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                        alertService.reportDeviceError(site, deviceId, siteName, "水位", bizTm);
                     } else if (!isPositiveNumber(entity, "Z")) {
                         log.warn("riverInfo 水位Z无效, 跳过入库: stcd={}, Z={}", stcd,
                                  hasValue(entity, "Z") ? entity.get("Z").asText() : "null");
                         return;
+                    } else {
+                        alertService.closeDeviceError(site, deviceId, siteName, "水位");
                     }
-                    // 副水位Z1/Z2守卫：异常值仅剔除该字段（不入库），不影响Z主数据；
-                    // 通讯异常哨兵值(FFFFFFFF)不剔除，以-9991入库表示设备异常
+                    // 闸上/闸下水位Z1/Z2守卫（Z1/Z2为闸站专用字段，与Z互斥；水位站报文中
+                    // 同时出现Z1/Z2属异常报文，仍防御性处理）：异常值仅剔除该字段（不入库），
+                    // 不影响Z主数据；通讯异常哨兵值(FFFFFFFF)不剔除，以-9991入库表示设备异常
                     if (hasValue(entity, "Z1")) {
                         if (isCommErrorValue(entity, "Z1")) {
-                            log.warn("riverInfo 副水位Z1设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                            log.warn("riverInfo 闸上水位Z1设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                            alertService.reportDeviceError(site, deviceId, siteName, "闸前水位", bizTm);
                         } else if (!isPositiveNumber(entity, "Z1")) {
-                            log.warn("riverInfo 副水位Z1异常, 剔除该字段: stcd={}, Z1={}", stcd, entity.get("Z1").asText());
+                            log.warn("riverInfo 闸上水位Z1异常, 剔除该字段: stcd={}, Z1={}", stcd, entity.get("Z1").asText());
                             fieldMap.remove("z1");
+                        } else {
+                            alertService.closeDeviceError(site, deviceId, siteName, "闸前水位");
                         }
                     }
                     if (hasValue(entity, "Z2")) {
                         if (isCommErrorValue(entity, "Z2")) {
-                            log.warn("riverInfo 副水位Z2设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                            log.warn("riverInfo 闸下水位Z2设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                            alertService.reportDeviceError(site, deviceId, siteName, "闸后水位", bizTm);
                         } else if (!isPositiveNumber(entity, "Z2")) {
-                            log.warn("riverInfo 副水位Z2异常, 剔除该字段: stcd={}, Z2={}", stcd, entity.get("Z2").asText());
+                            log.warn("riverInfo 闸下水位Z2异常, 剔除该字段: stcd={}, Z2={}", stcd, entity.get("Z2").asText());
                             fieldMap.remove("z2");
+                        } else {
+                            alertService.closeDeviceError(site, deviceId, siteName, "闸后水位");
                         }
                     }
                     // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正
                     applyWaterLevelDatum(fieldMap, stcd);
+                    // 水位阈值判定：修正后入库值(海拔)，仅正常值参与
+                    Double z = toDbDouble(fieldMap.get("z"));
+                    if (z != null && z > 0) {
+                        alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_WATER_LEVEL,
+                                siteName, "水位", z, bizTm);
+                    }
                     // 继续走下方 river_info 表入库
                 } else {
                     // Z无值 → 闸站水位（闸前/闸后）：写 gate 表。
@@ -352,12 +395,14 @@ public class MonitorDataService {
                 }
                 if (isCommErrorValue(entity, "VOL")) {
                     log.warn("volInfo 电压设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                    alertService.reportDeviceError(site, deviceId, siteName, "电压", bizTm);
                 } else {
                     double vol = parseDoubleSafe(entity.get("VOL"));
                     if (Double.isNaN(vol) || vol <= 0 || vol > MAX_VOLTAGE) {
                         log.warn("volInfo 电压异常, 不入库: stcd={}, VOL={}", stcd, entity.get("VOL").asText());
                         return;
                     }
+                    alertService.closeDeviceError(site, deviceId, siteName, "电压");
                 }
             }
             // === wtInfo 条件入库 ===
@@ -372,20 +417,30 @@ public class MonitorDataService {
                 }
                 if (isCommErrorValue(entity, "Q")) {
                     log.warn("wtInfo 瞬时流量设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                    alertService.reportDeviceError(site, deviceId, siteName, "流量", bizTm);
                 } else {
                     double q = parseDoubleSafe(qNode);
                     if (Double.isNaN(q) || q < 0 || q > MAX_FLOW) {
                         log.warn("wtInfo 瞬时流量异常(Q={}), 不入库: stcd={}", q, stcd);
                         return;
                     }
+                    alertService.closeDeviceError(site, deviceId, siteName, "流量");
+                    // 流量阈值判定：瞬时流量Q，仅正常值参与（Q=0无流量属正常工况，正常值含0）
+                    alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_FLOW,
+                            siteName, "流量", q, bizTm);
                 }
             }
             // === rainInfo 条件入库：DYP≤0说明设备无雨量监测能力或报文异常，跳过入库 ===
             // DRP可为0（今日无雨），DYP是RTU安装以来累计值，为0则设备不匹配；
             // 通讯异常哨兵值(FFFFFFFF)不拦截，以-9991入库表示设备异常
             if ("rainInfo".equals(tag)) {
+                // DYP 哨兵 → 设备异常告警；DYP 是累计雨量传感器，DRP 正常/缺失不代表 DYP 恢复，
+                // 只有 DYP 本身正常时才允许关闭"雨量"设备异常告警
+                boolean dypCommError = false;
                 if (isCommErrorValue(entity, "DYP")) {
                     log.warn("rainInfo 雨量设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
+                    dypCommError = true;
+                    alertService.reportDeviceError(site, deviceId, siteName, "雨量", bizTm);
                 } else {
                     double dyp = hasValue(entity, "DYP") ? parseDoubleSafe(entity.get("DYP")) : Double.NaN;
                     if (Double.isNaN(dyp) || dyp <= 0) {
@@ -398,13 +453,18 @@ public class MonitorDataService {
                 if (hasValue(entity, "DRP")) {
                     if (isCommErrorValue(entity, "DRP")) {
                         log.warn("rainInfo 日雨量设备异常(FFFFFFFF), DRP以-9991入库: stcd={}", stcd);
+                        alertService.reportDeviceError(site, deviceId, siteName, "雨量", bizTm);
                     } else {
                         double drp = parseDoubleSafe(entity.get("DRP"));
                         if (Double.isNaN(drp) || drp < 0 || drp > MAX_DAILY_RAINFALL) {
                             log.warn("rainInfo 日雨量DRP异常, 剔除该字段: stcd={}, DRP={}", stcd, entity.get("DRP").asText());
                             fieldMap.remove("drp");
+                        } else if (!dypCommError) {
+                            alertService.closeDeviceError(site, deviceId, siteName, "雨量");
                         }
                     }
+                } else if (!dypCommError) {
+                    alertService.closeDeviceError(site, deviceId, siteName, "雨量");
                 }
             }
             // === nmIspInfo / pcpInfo 暂不录入，等待后续设备接入 ===
@@ -418,6 +478,12 @@ public class MonitorDataService {
                 computeWaterLevelRise1h(fieldMap, stcd, validColumns);
             } else if ("rainInfo".equals(tag)) {
                 computeRainfall(fieldMap, entity, stcd, validColumns);
+                // 雨量阈值判定：日雨量DRP，仅正常值参与（DRP=0今日无雨属正常工况，正常值含0）
+                Double drp = toDbDouble(fieldMap.get("drp"));
+                if (drp != null && drp >= 0) {
+                    alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_RAINFALL,
+                            siteName, "雨量", drp, bizTm);
+                }
             } else if ("wtInfo".equals(tag)) {
                 computeWtAccumulations(fieldMap, stcd, validColumns);
             }
@@ -815,6 +881,22 @@ public class MonitorDataService {
             log.error("riverInfo→gate 设备缺失, 跳过: stcd={}", stcd);
             return;
         }
+        // 设备异常/恢复告警 + 水位阈值判定（闸前/闸后水位属 #1# 水位类，行业上同样有保证/警戒/设计值；
+        // 判定值用基准高程修正后的入库值，与通用水位站口径一致）
+        if (z1 == COMM_ERROR_INSERT_VALUE) {
+            alertService.reportDeviceError(siteId, device, siteName, "闸前水位", tm);
+        } else if (z1 > 0) {
+            alertService.closeDeviceError(siteId, device, siteName, "闸前水位");
+            alertService.evaluateThreshold(siteId, device, AlertService.TYPE_WATER_LEVEL,
+                    siteName, "闸前水位", z1, tm);
+        }
+        if (z2 == COMM_ERROR_INSERT_VALUE) {
+            alertService.reportDeviceError(siteId, device, siteName, "闸后水位", tm);
+        } else if (z2 > 0) {
+            alertService.closeDeviceError(siteId, device, siteName, "闸后水位");
+            alertService.evaluateThreshold(siteId, device, AlertService.TYPE_WATER_LEVEL,
+                    siteName, "闸后水位", z2, tm);
+        }
         // 确保 stcdDeviceCache 指向正确的首闸孔设备（覆盖可能存在的"待接入"缓存）
         String oldCached = stcdDeviceCache.put(stcd, device);
         if (oldCached != null && !oldCached.equals(device)) {
@@ -1002,6 +1084,16 @@ public class MonitorDataService {
             if (deviceId == null) {
                 log.error("gatesInfo 设备缺失, 跳过闸孔{}: stcd={}, deviceName={}", i, stcd, deviceName);
                 continue;
+            }
+            // 开度告警：哨兵值-9991→设备异常；正常值→关闭设备异常告警并做#4#闸门阈值判定；
+            // -999(设备不存在)保持原值入库，不告警不判定
+            String gateMetric = "闸孔" + i;
+            if (openDegree == COMM_ERROR_INSERT_VALUE) {
+                alertService.reportDeviceError(siteId, deviceId, siteName, gateMetric, tm);
+            } else if (openDegree >= 0) {
+                alertService.closeDeviceError(siteId, deviceId, siteName, gateMetric);
+                alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_GATE,
+                        siteName, gateMetric, openDegree, tm);
             }
 
             // 去重：相同 stcd+tm+gate_no 已存在则跳过（防止RabbitMQ重投）
@@ -1591,6 +1683,8 @@ public class MonitorDataService {
             int rows = jdbcTemplate.update(sql, now, siteId);
             if (rows > 0) {
                 log.debug("站点标记在线: site={}", siteId);
+                // 站点恢复通信：关闭该站全部失联告警
+                alertService.closeOfflineAlerts(siteId);
             }
         } catch (Exception e) {
             log.debug("标记站点在线失败, site={}: {}", siteId, e.getMessage());
@@ -1598,8 +1692,9 @@ public class MonitorDataService {
     }
 
     /**
-     * 每小时检查：直接查所有入库表，判断站点 24h 内是否有数据到达。
+     * 每天0点检查离线：直接查所有入库表，判断站点 24h 内是否有数据到达。
      * 不依赖 updated_at 代理字段，以实际入库记录为准。
+     * 在线由报文驱动：任何来源收到该站报文即通过 markSiteOnline 标回在线，巡检不负责标在线。
      * <p>
      * 数据源覆盖：
      * <pre>
@@ -1619,7 +1714,9 @@ public class MonitorDataService {
      *   pcp_info   — pcpInfo 暂不录入
      * </pre>
      */
-    @Scheduled(fixedRate = 3600000)
+    // 每天0点5分执行：等0点整的 flushToDb 先完成入库，
+    // 避免MQTT缓存(23:30~23:59收到的报文)尚未落库被误判"24h无数据"而误标离线
+    @Scheduled(cron = "0 5 0 * * ?")
     public void checkOfflineSites() {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
@@ -1628,32 +1725,65 @@ public class MonitorDataService {
             // 仅遥测设备参与判定：有RTU站号(水位/雨量/墒情/闸站/流量经RabbitMQ stcd=iofhpi入库)
             // 或存在MQTT闸站gate数据(site=id)；视频设备由大华对接项目单独维护，
             // 本项目不参与其在线状态管理；点位等其他无遥测数据源的设备同样不参与
+            String offlineBody =
+                    "(s.iofhpi IS NOT NULL " +
+                    "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
+                    "AND NOT EXISTS (" +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_vol_info   WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_wt_nfo     WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_river_info WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_rain_info  WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE site = s.id     AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_nmisp_info WHERE stcd = s.iofhpi AND tm >= ?" +
+                    ")";
+
+            // 1) 先标离线（UPDATE 后到达的报文会通过 markSiteOnline 把 zebpsu 标回 #1#）
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                          "SET zebpsu = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
-                         "WHERE zebpsu IS DISTINCT FROM '#2#' " +
-                         "AND (s.iofhpi IS NOT NULL " +
-                         "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
-                         "AND NOT EXISTS (" +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE stcd = s.iofhpi AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_vol_info   WHERE stcd = s.iofhpi AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_wt_nfo     WHERE stcd = s.iofhpi AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_river_info WHERE stcd = s.iofhpi AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_rain_info  WHERE stcd = s.iofhpi AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE stcd = s.iofhpi AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE site = s.id     AND tm >= ?" +
-                         "  UNION ALL " +
-                         "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_nmisp_info WHERE stcd = s.iofhpi AND tm >= ?" +
-                         ")";
+                         "WHERE zebpsu IS DISTINCT FROM '#2#' AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
                     cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
                 log.info("标记离线站点: {} 个", rows);
+            }
+
+            // 2) 确认仍离线的站点（UPDATE 后恢复通信的站点 zebpsu 已标回 #1#，不在此列）
+            // 含站点名与该站任一设备，供失联告警生成；无设备的站跳过告警（无设备即无数据源，仅标离线）
+            String confirmCond = "s.zebpsu = '#2#' AND " + offlineBody;
+            String selectSql = "SELECT s.id, s.zzkaec, " +
+                    "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id LIMIT 1) AS device_id " +
+                    "FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s WHERE " + confirmCond;
+            List<Map<String, Object>> offlineSites = jdbcTemplate.queryForList(selectSql,
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+
+            // 3) 逐站复核状态后生成失联告警（站点失联=24h无报文，告警内容明确描述失联场景）。
+            // 复核防 SELECT 与告警生成之间报文恢复：此时 zebpsu 已标回 #1#，跳过告警；
+            // 若复核后报文才恢复，markSiteOnline 的 closeOfflineAlerts 在本告警之后执行，正常关闭。
+            for (Map<String, Object> siteRow : offlineSites) {
+                String siteId = String.valueOf(siteRow.get("id"));
+                String siteName = (String) siteRow.get("zzkaec");
+                String siteDevice = siteRow.get("device_id") != null
+                        ? String.valueOf(siteRow.get("device_id")) : null;
+                try {
+                    String zeb = jdbcTemplate.queryForObject(
+                            "SELECT zebpsu FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef WHERE id = ?",
+                            String.class, siteId);
+                    if (!"#2#".equals(zeb)) {
+                        continue; // 已恢复在线，不报失联
+                    }
+                } catch (Exception e) {
+                    log.debug("失联告警前复核站点状态失败, 放行: {}", e.getMessage());
+                }
+                alertService.reportOffline(siteId, siteDevice, siteName, now);
             }
         } catch (Exception e) {
             log.error("离线站点检查失败", e);

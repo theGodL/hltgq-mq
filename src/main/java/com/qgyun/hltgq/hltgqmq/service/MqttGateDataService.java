@@ -35,6 +35,10 @@ public class MqttGateDataService {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    /** 告警入库服务（设备异常/站点失联/阈值越界） */
+    @Autowired
+    private AlertService alertService;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private static final String SCHEMA = "\"qixiao-apaas\".";
@@ -174,6 +178,17 @@ public class MqttGateDataService {
                     }
                 }
 
+                // 站级水位告警独立检查：不依赖 1 号孔开度数据是否存在（1 号孔无 R_/B_ 标签时也要检查），
+                // 挂靠 1 号孔设备（与 RabbitMQ 闸站路径设备粒度一致）
+                if (upZ != null || downZ != null) {
+                    String gate1DeviceId = lookupOrCreateDevice(baseName + "1#", siteId);
+                    if (gate1DeviceId != null) {
+                        Map<String, Object> wlFieldMap = buildFieldMap(
+                                siteId, gate1DeviceId, 1, fields, upZ, downZ, now);
+                        checkStationWaterLevelAlerts(siteId, gate1DeviceId, baseName, wlFieldMap, now);
+                    }
+                }
+
                 for (Integer gateNo : gateNos) {
                     String deviceName = baseName + gateNo + "#";
                     String deviceId = lookupOrCreateDevice(deviceName, siteId);
@@ -183,6 +198,8 @@ public class MqttGateDataService {
 
                     Map<String, Object> fieldMap = buildFieldMap(
                             siteId, deviceId, gateNo, fields, upZ, downZ, now);
+                    // 设备异常/阈值告警（开度按闸孔分别检查，站级水位已在上方独立检查）
+                    checkDeviceAlerts(siteId, deviceId, baseName, gateNo, fieldMap, now);
                     // 缓存，key = siteId_deviceId_gateNo，每次覆盖最新值
                     String cacheKey = siteId + "_" + deviceId + "_" + gateNo;
                     latestDataCache.put(cacheKey, fieldMap);
@@ -841,6 +858,48 @@ public class MqttGateDataService {
 
     // ======================== 站点状态 ========================
 
+    /**
+     * MQTT 开度告警挂接（按闸孔检查）：哨兵值-9991→设备异常告警；正常值→关闭设备异常告警
+     * 并做 #4# 闸门阈值判定；-999(设备不存在)不告警不判定。
+     */
+    private void checkDeviceAlerts(String siteId, String deviceId, String siteName,
+                                   int gateNo, Map<String, Object> fieldMap, Timestamp tm) {
+        String metric = "闸孔" + gateNo;
+        Double open = toDouble(fieldMap.get("open_degree"));
+        if (open != null && open == COMM_ERROR_INSERT_VALUE) {
+            alertService.reportDeviceError(siteId, deviceId, siteName, metric, tm);
+        } else if (open != null && open >= 0) {
+            alertService.closeDeviceError(siteId, deviceId, siteName, metric);
+            alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_GATE,
+                    siteName, metric, open, tm);
+        }
+    }
+
+    /**
+     * MQTT 站级水位(闸前/闸后)告警挂接：独立于闸孔循环执行一次（不依赖 1 号孔开度数据是否存在），
+     * 挂靠 1 号孔设备。哨兵值-9991→设备异常告警；正常值→关闭设备异常告警并做 #1# 水位阈值判定
+     * （按入库值判定，MQTT 无基准高程修正，口径为原始值）。
+     */
+    private void checkStationWaterLevelAlerts(String siteId, String deviceId, String siteName,
+                                              Map<String, Object> fieldMap, Timestamp tm) {
+        Double upZ = toDouble(fieldMap.get("up_z"));
+        if (upZ != null && upZ == COMM_ERROR_INSERT_VALUE) {
+            alertService.reportDeviceError(siteId, deviceId, siteName, "闸前水位", tm);
+        } else if (upZ != null && upZ > 0) {
+            alertService.closeDeviceError(siteId, deviceId, siteName, "闸前水位");
+            alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_WATER_LEVEL,
+                    siteName, "闸前水位", upZ, tm);
+        }
+        Double downZ = toDouble(fieldMap.get("down_z"));
+        if (downZ != null && downZ == COMM_ERROR_INSERT_VALUE) {
+            alertService.reportDeviceError(siteId, deviceId, siteName, "闸后水位", tm);
+        } else if (downZ != null && downZ > 0) {
+            alertService.closeDeviceError(siteId, deviceId, siteName, "闸后水位");
+            alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_WATER_LEVEL,
+                    siteName, "闸后水位", downZ, tm);
+        }
+    }
+
     /** 已标记在线的站点ID集合（当天去重） */
     private final Set<String> todayOnlineSet = ConcurrentHashMap.newKeySet();
 
@@ -857,6 +916,8 @@ public class MqttGateDataService {
             int rows = jdbcTemplate.update(sql, now, siteId);
             if (rows > 0) {
                 log.debug("MQTT站点标记在线: site={}", siteId);
+                // 站点恢复通信：关闭该站全部失联告警
+                alertService.closeOfflineAlerts(siteId);
             }
         } catch (Exception e) {
             log.debug("MQTT标记站点在线失败, site={}: {}", siteId, e.getMessage());
