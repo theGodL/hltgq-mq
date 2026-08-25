@@ -37,6 +37,10 @@ public class MonitorDataService {
     @Autowired
     private AlertService alertService;
 
+    /** 召测服务（召测应答识别，仅用于日志闭环验证） */
+    @Autowired
+    private RecallService recallService;
+
     /** 水位基准高程配置（stcd → 高程m，来自 application.properties，可热改配置重启生效） */
     @Autowired
     private WaterLevelDatumProperties waterLevelDatumProperties;
@@ -214,6 +218,22 @@ public class MonitorDataService {
 
             // 收到报文即标记站点在线
             markSiteOnline(site);
+
+            // 召测应答识别：以报文的上游转发时间 ctime 为判据——ctime 早于召测发出时刻说明是
+            // 积压旧报文（不算应答）；ctime 晚于/等于召测时刻才视为 RTU 应答后的加报，
+            // 确认后通知 RecallService 唤醒同步等待的接口线程（展示层拿到返回后刷新）
+            long recallSentAt = recallService.getRecallSentTime(stcd);
+            if (recallSentAt > 0) {
+                long ctimeMillis = parseCtimeMillis(root);
+                if (ctimeMillis > 0 && ctimeMillis < recallSentAt) {
+                    log.info("召测窗口内收到积压旧报文(上游转发时间早于召测时刻), 继续等待应答: stcd={}, tag={}, ctime={}",
+                             stcd, tag, root.get("ctime").asText());
+                } else {
+                    recallService.notifyRecallResponse(stcd);
+                    log.info("召测应答到达: stcd={}, tag={}, 距召测发出 {} 秒",
+                             stcd, tag, (System.currentTimeMillis() - recallSentAt) / 1000);
+                }
+            }
 
             // 提取纯表名用于列名校验（去掉 schema 前缀）
             String pureTableName = tableName.substring(tableName.indexOf('.') + 1);
@@ -1799,4 +1819,30 @@ public class MonitorDataService {
         todayOnlineSet.clear();
         log.debug("todayOnlineSet已重置, {} 个站点可重新标记在线", size);
     }
+
+    /**
+     * 解析报文的上游转发时间 ctime（格式如 "8/24/2026 9:01:41 PM"，Locale.US）。
+     * 召测应答识别用：ctime 早于召测发出时刻 → 积压旧报文；解析失败返回 -1（按应答处理）。
+     */
+    private long parseCtimeMillis(JsonNode root) {
+        JsonNode ctimeNode = root.get("ctime");
+        if (ctimeNode == null) {
+            return -1;
+        }
+        String ctime = ctimeNode.asText();
+        if (ctime == null || ctime.isEmpty()) {
+            return -1;
+        }
+        try {
+            java.util.Date d = CTIME_FORMAT.get().parse(ctime);
+            return d != null ? d.getTime() : -1;
+        } catch (Exception e) {
+            log.debug("ctime解析失败, 按召测应答处理: ctime={}, {}", ctime, e.getMessage());
+            return -1;
+        }
+    }
+
+    /** ctime 解析器（SimpleDateFormat 非线程安全，用 ThreadLocal 隔离） */
+    private static final ThreadLocal<java.text.SimpleDateFormat> CTIME_FORMAT =
+            ThreadLocal.withInitial(() -> new java.text.SimpleDateFormat("M/d/yyyy h:mm:ss a", Locale.US));
 }
