@@ -25,11 +25,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 2. 站点失联：24h 无任何入库数据 → 内容"{站点名} 连续24小时未收到任何报文，疑似站点失联！"，级别 #3#
  * 3. 阈值越界：低于保证值/高于警戒值 #3#，高于设计值 #4#（无阈值配置不判定）
  *
+ * 告警类型(type)字典（告警表字段，区分业务类别，与阈值指标类型 TYPE_* 无关）：
+ * #1# 阈值超限（阈值越界类） #2# 异常告警（设备异常/站点失联类）
+ *
  * 告警语义（审计定版）：
  * - 新增默认 status=#1#(未确认)，同一未关闭告警(content相同)不重复新增；
  * - 数据恢复正常时自动置 status=#4#(已关闭)，平台侧也可手动维护状态（自动+手动结合）；
  * - 阈值判定"放权给客户"：threshold/guarantee/num 填了才判定（>0 视为启用，空/0 不判定）；
- * - type 字典：#1#水位 #2#雨量 #3#流量 #4#闸门 #7#墒情（#5#视频由大华项目维护、#8#水质无数据源，本项目不处理）。
+ * - 阈值表 type 字典：#1#水位 #2#雨量 #3#流量 #4#闸门 #7#墒情（#5#视频由大华项目维护、#8#水质无数据源，本项目不处理）。
+ *   注意：告警表 type 与阈值表 type 是同名列、两套字典，展示层/平台查询时勿混淆。
  */
 @Service
 public class AlertService {
@@ -57,6 +61,10 @@ public class AlertService {
     /** 处理状态：#1#未确认(新增默认) #4#已关闭(恢复) */
     private static final String STATUS_UNCONFIRMED = "#1#";
     private static final String STATUS_CLOSED      = "#4#";
+
+    /** 告警类型字典：#1#阈值超限(阈值越界类) #2#异常告警(设备异常/站点失联类)；与阈值指标类型 TYPE_* 是两套字典 */
+    public static final String ALERT_TYPE_THRESHOLD = "#1#";
+    public static final String ALERT_TYPE_ABNORMAL  = "#2#";
 
     /** 阈值类型字典（type 单选，一指标一条记录） */
     public static final String TYPE_WATER_LEVEL = "#1#";
@@ -128,7 +136,7 @@ public class AlertService {
         if (existsUnclosed(siteId, deviceId, content)) {
             return;
         }
-        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, tm);
+        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm);
         log.warn("新增设备异常告警: site={}, device={}, content={}", siteId, deviceId, content);
     }
 
@@ -153,7 +161,7 @@ public class AlertService {
             return;
         }
         String content = siteName + " 连续24小时未收到任何报文，疑似站点失联！";
-        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, tm);
+        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm);
         log.warn("新增站点失联告警: site={}, content={}", siteId, content);
     }
 
@@ -224,7 +232,7 @@ public class AlertService {
         if (existsUnclosed(siteId, deviceId, content)) {
             return;
         }
-        insertAlert(siteId, deviceId, content, level, tm);
+        insertAlert(siteId, deviceId, content, level, ALERT_TYPE_THRESHOLD, tm);
         log.warn("新增阈值告警: site={}, device={}, content={}", siteId, deviceId, content);
     }
 
@@ -291,12 +299,14 @@ public class AlertService {
 
     // ======================== 基础方法 ========================
 
-    /** 新增告警行（动态列适配，status 默认 #1# 未确认，time=报文测量时间） */
-    private void insertAlert(String siteId, String deviceId, String content, String level, Timestamp tm) {
+    /** 新增告警行（动态列适配，status 默认 #1# 未确认，type 区分阈值超限/异常告警，time=报文测量时间） */
+    private void insertAlert(String siteId, String deviceId, String content, String level,
+                             String alertType, Timestamp tm) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Map<String, Object> fm = new LinkedHashMap<>();
-            fm.put("id",         IdGenerator.generate());
+            String alertId = IdGenerator.generate();
+            fm.put("id",         alertId);
             fm.put("corp_code",  corpCode);
             fm.put("created_at", now);
             fm.put("created_by", "SYSTEM");
@@ -306,6 +316,7 @@ public class AlertService {
             fm.put("site",       siteId);
             fm.put("device",     deviceId);
             fm.put("content",    content);
+            fm.put("type",       alertType);
             fm.put("level",      level);
             fm.put("status",     STATUS_UNCONFIRMED);
             fm.put("time",       tm != null ? tm : now);
@@ -318,16 +329,17 @@ public class AlertService {
                     continue; // 列不存在则跳过（动态列适配）
                 }
                 if (cols.length() > 0) { cols.append(", "); phs.append(", "); }
-                // level 为 SQL 保留字，需加双引号（其余列名与库内小写列名一致，无需引号）
-                String col = "level".equalsIgnoreCase(e.getKey()) ? "\"level\"" : e.getKey();
+                // level/type 为 SQL 保留字或方言关键字，需加双引号（其余列名与库内小写列名一致，无需引号）
+                String col = ("level".equalsIgnoreCase(e.getKey()) || "type".equalsIgnoreCase(e.getKey()))
+                        ? "\"" + e.getKey() + "\"" : e.getKey();
                 cols.append(col);
                 phs.append("?");
                 vals.add(e.getValue());
             }
             String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", ALERT_TABLE, cols, phs);
             jdbcTemplate.update(sql, vals.toArray());
-            // 告警新增成功 → 自动生成工单（同一未关闭告警不重复生成，工单侧去重双保险）
-            workOrderService.createIfAbsent(siteId, deviceId, deriveWorkOrderTitle(content), content);
+            // 告警新增成功 → 自动生成工单（alert 字段存告警ID形成精确关联，平台可按告警 type 区分工单类别）
+            workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveWorkOrderTitle(content), content);
         } catch (Exception e) {
             log.error("告警入库失败, site={}, device={}, content={}: {}", siteId, deviceId, content, e.getMessage());
         }

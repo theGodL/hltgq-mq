@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 规则（与平台约定）：
  * - 三类告警（设备异常/站点失联/阈值越界）新增时同步生成工单，status=#1# 待处理；
  * - 同一 site+device+title 的未关闭工单（status 非 #3#/#4#）不重复生成，与告警去重同构；
+ * - alert 字段存告警ID，形成工单↔告警精确关联（平台可按告警 type 区分工单类别，工单表无需 type）；
  * - 告警恢复自动关闭时同步关闭对应工单（status=#3# 已关闭），形成自动闭环；
  * - org 固定存部门 ID：库上站点 → 库上防汛办，其余站点 → 库下防汛办
  *   （org 表按 code 00000003/00000004 解析 ID，启动时加载）；
@@ -143,10 +144,10 @@ public class WorkOrderService {
 
     /**
      * 告警新增成功后同步生成工单（告警去重已通过，此处再做工单侧去重双保险）。
-     * title 由告警 content 派生（去结尾"！"），content 与告警 content 一致，
-     * 关闭时按 content 匹配（与告警关闭条件同构）。
+     * alert 字段存告警ID精确关联；title 由告警 content 派生（去结尾"！"），
+     * content 与告警 content 一致，关闭时按 content 匹配（与告警关闭条件同构）。
      */
-    public void createIfAbsent(String siteId, String deviceId, String title, String content) {
+    public void createIfAbsent(String alertId, String siteId, String deviceId, String title, String content) {
         if (siteId == null || title == null) return;
         if (existsUnclosed(siteId, deviceId, title)) {
             return;
@@ -155,7 +156,7 @@ public class WorkOrderService {
         if (orgId == null) {
             log.warn("工单负责部门未解析, org留空: site={}, title={}", siteId, title);
         }
-        insertWorkOrder(siteId, deviceId, title, content, orgId);
+        insertWorkOrder(alertId, siteId, deviceId, title, content, orgId);
     }
 
     /** 同一 site+device+title 的未关闭工单（非 #3#已关闭/#4#已取消）是否存在 */
@@ -191,8 +192,8 @@ public class WorkOrderService {
         return downOrgId;
     }
 
-    /** 工单入库：status=#1# 待处理，user/time/result/file 留空 */
-    private void insertWorkOrder(String siteId, String deviceId, String title, String content, String orgId) {
+    /** 工单入库：alert 存告警ID，status=#1# 待处理，user/time/result/file 留空 */
+    private void insertWorkOrder(String alertId, String siteId, String deviceId, String title, String content, String orgId) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Map<String, Object> fm = new LinkedHashMap<>();
@@ -207,7 +208,8 @@ public class WorkOrderService {
             fm.put("content",    content);
             fm.put("site",       siteId);
             if (deviceId != null) fm.put("device", deviceId);
-            if (orgId != null)   fm.put("org", orgId);
+            if (alertId != null)  fm.put("alert", alertId);
+            if (orgId != null)    fm.put("org", orgId);
             fm.put("status",     STATUS_PENDING);
 
             StringBuilder cols = new StringBuilder();
