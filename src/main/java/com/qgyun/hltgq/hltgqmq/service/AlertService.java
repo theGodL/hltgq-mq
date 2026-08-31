@@ -39,6 +39,9 @@ public class AlertService {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private WorkOrderService workOrderService;
+
     /** 人大金仓 schema（带双引号，因为含连字符） */
     private static final String SCHEMA = "\"qixiao-apaas\".";
 
@@ -137,6 +140,8 @@ public class AlertService {
         if (rows > 0) {
             log.info("设备恢复正常, 关闭告警 {} 条: site={}, device={}, content={}", rows, siteId, deviceId, content);
         }
+        // 告警恢复 → 同步自动关闭对应工单
+        workOrderService.closeByContent(siteId, deviceId, content);
     }
 
     // ======================== 站点失联告警 ========================
@@ -167,6 +172,8 @@ public class AlertService {
         } catch (Exception e) {
             log.debug("关闭失联告警失败, site={}: {}", siteId, e.getMessage());
         }
+        // 告警恢复 → 同步自动关闭该站失联类工单
+        workOrderService.closeByLike(siteId, "%失联%");
     }
 
     // ======================== 阈值告警 ========================
@@ -251,6 +258,9 @@ public class AlertService {
         } catch (Exception e) {
             log.debug("关闭阈值告警失败, site={}, device={}, metric={}: {}", siteId, deviceId, metric, e.getMessage());
         }
+        // 告警恢复 → 同步自动关闭该站该设备该指标的阈值类工单
+        workOrderService.closeThreshold(siteId, deviceId, siteName + metric + "%",
+                " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')");
     }
 
     /**
@@ -316,9 +326,17 @@ public class AlertService {
             }
             String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", ALERT_TABLE, cols, phs);
             jdbcTemplate.update(sql, vals.toArray());
+            // 告警新增成功 → 自动生成工单（同一未关闭告警不重复生成，工单侧去重双保险）
+            workOrderService.createIfAbsent(siteId, deviceId, deriveWorkOrderTitle(content), content);
         } catch (Exception e) {
             log.error("告警入库失败, site={}, device={}, content={}: {}", siteId, deviceId, content, e.getMessage());
         }
+    }
+
+    /** 工单标题派生：告警内容去掉结尾"！"（与告警 content 同源，工单关闭时按 content 匹配） */
+    private static String deriveWorkOrderTitle(String content) {
+        return (content != null && content.endsWith("！"))
+                ? content.substring(0, content.length() - 1) : content;
     }
 
     /** 同站点-设备-内容且未关闭的告警是否存在（新增去重） */
