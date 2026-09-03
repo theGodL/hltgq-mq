@@ -136,6 +136,7 @@ public class MonitorDataService {
         SITE_TYPE_DEVICE_MAP.put("2", "雨量计");     // 雨量站
         SITE_TYPE_DEVICE_MAP.put("3", "流量计");     // 流量站
         SITE_TYPE_DEVICE_MAP.put("6", "泵站");       // 泵站
+        SITE_TYPE_DEVICE_MAP.put("7", "墒情探测");   // 墒情站
         SITE_TYPE_DEVICE_MAP.put("8", "水质监测仪"); // 水质
     }
 
@@ -586,6 +587,7 @@ public class MonitorDataService {
      * 闸站(#4#): 生成闸孔1设备 "{siteName}1#"，所有站级数据指向它
      * 非闸站已知类型: 生成RTU设备 "{siteName}{类型后缀}#"
      * 非闸站未知类型: 先查是否已有 "{siteName}1#" 闸孔设备，有则复用(epjutj未及时更新场景)；无则兜底 "{siteName}待接入#"
+     * 历史"待接入#"设备自愈：类型已知(含从设备自身type推断)时自动改名为正确名称并复用，无需人工改库
      */
     private String lookupOrCreateRtuDevice(String stcd, String siteId) {
         return stcdDeviceCache.computeIfAbsent(stcd, s -> {
@@ -599,13 +601,22 @@ public class MonitorDataService {
                 deviceName = siteName + "1#";
                 deviceType = "#4#";
             } else {
-                // 非闸站: 按站点类型生成 RTU 设备
-                String typeCode = extractPrimarySiteType(epjutj);
-                String suffix = SITE_TYPE_DEVICE_MAP.get(typeCode); // 已知类型直接取，未知返回null
+                // 非闸站: 按站点类型定后缀；站点类型未知时回退用旧"待接入#"设备自身的type推断
+                String suffix = SITE_TYPE_DEVICE_MAP.get(extractPrimarySiteType(epjutj));
+                deviceType = epjutj;
+                if (suffix == null) {
+                    String orphanId = findExistingDevice(siteName + "待接入#");
+                    String orphanType = orphanId != null ? getDeviceType(orphanId) : null;
+                    String orphanSuffix = SITE_TYPE_DEVICE_MAP.get(extractPrimarySiteType(orphanType));
+                    if (orphanSuffix != null) {
+                        suffix = orphanSuffix;
+                        deviceType = orphanType;
+                    }
+                }
                 if (suffix != null) {
-                    // 已知非闸站类型（水位计/雨量计等），直接使用，不查闸孔设备
+                    // 已知类型: 自动纠正历史"待接入#"设备名称并复用(id不变，子表数据无需迁移)
                     deviceName = siteName + suffix + "#";
-                    deviceType = epjutj;
+                    renamePendingDevice(siteName, deviceName, deviceType);
                 } else {
                     // 类型未知：先检查是否已有闸孔1#设备（epjutj可能尚未更新为#4#的闸站）
                     String gateDeviceName = siteName + "1#";
@@ -622,6 +633,50 @@ public class MonitorDataService {
             }
             return lookupOrCreateDeviceByName(deviceName, siteId, deviceType);
         });
+    }
+
+    /**
+     * 已知类型场景下自愈历史"待接入#"设备：查到旧设备时直接改名为正确名称
+     * (如"太湖毕岭墒情探测#")并补齐type，id不变、子表数据无需迁移。
+     * 正确名称设备已存在时跳过改名，避免同站重名设备。
+     * 改名成功后同步刷新 deviceCache，防止新旧名称分裂。
+     */
+    private void renamePendingDevice(String siteName, String correctName, String type) {
+        String orphanName = siteName + "待接入#";
+        String orphanId = findExistingDevice(orphanName);
+        if (orphanId == null) {
+            return; // 无历史待接入设备
+        }
+        if (findExistingDevice(correctName) != null) {
+            log.warn("正确名称设备已存在，跳过待接入改名: orphan={}, correct={}", orphanName, correctName);
+            return;
+        }
+        try {
+            String sql = "UPDATE " + DEVICE_TABLE +
+                    " SET name = ?, type = ?, updated_at = ?, updated_by = 'SYSTEM' WHERE id = ?";
+            int n = jdbcTemplate.update(sql, correctName, type, new Timestamp(System.currentTimeMillis()), orphanId);
+            if (n > 0) {
+                deviceCache.remove(orphanName);
+                deviceCache.put(correctName, orphanId);
+                log.info("已自愈待接入设备名称: {} -> {}, id={}", orphanName, correctName, orphanId);
+            }
+        } catch (Exception e) {
+            log.warn("自愈待接入设备名称失败: {} -> {}: {}", orphanName, correctName, e.getMessage());
+        }
+    }
+
+    /** 按设备ID查 type 字段（无缓存，仅自愈路径低频调用） */
+    private String getDeviceType(String deviceId) {
+        try {
+            String sql = "SELECT type FROM " + DEVICE_TABLE + " WHERE id = ?";
+            List<String> results = jdbcTemplate.queryForList(sql, String.class, deviceId);
+            if (results != null && !results.isEmpty() && results.get(0) != null) {
+                return results.get(0);
+            }
+        } catch (Exception e) {
+            log.warn("查找设备类型失败, deviceId={}: {}", deviceId, e.getMessage());
+        }
+        return null;
     }
 
     /** 按设备名称查找或创建（共享缓存），可选写入 type 字段 */
