@@ -86,6 +86,13 @@ public class ArrivalStatsService {
     @Value("${stats.start-date:}")
     private String statsStartDateCfg;
 
+    /**
+     * 按 stcd 前缀整体排除的渠道站（可选，与产品口径对齐）。
+     * 例：stats.exclude-stcd-prefix=9000000（召测渠道站不参与统计）
+     */
+    @Value("${stats.exclude-stcd-prefix:}")
+    private String excludeStcdPrefixCfg;
+
     /** 统计上下文短缓存（volatile 双检，并发下重复加载无害仅浪费一次聚合） */
     private volatile long ctxTimeMs = 0;
     private volatile StatsContext cachedCtx = null;
@@ -112,7 +119,8 @@ public class ArrivalStatsService {
         long todayStartMs;
         long monthStartMs;
         long nowMs;
-        LocalDate statStartDate; // 本月统计起始日（流水上线日，可配置覆盖）
+        LocalDate statStartDate; // 流水上线日（可配置覆盖），用于月均窗口起点
+        LocalDate effStartDate;  // 本月统计起始日 = max(statStartDate, 本月1日)，响应输出用
         List<SiteInfo> sites;
         Map<String, SiteInfo> siteById;
         List<Map<String, Object>> msgRows;
@@ -154,6 +162,7 @@ public class ArrivalStatsService {
         ctx.statStartDate = resolveStatStartDate(ctx);
         // 有效起始 = max(流水上线日, 本月1日)：跨月后统计窗口跟随本月，不回退到上线日之前
         LocalDate effStartDate = ctx.statStartDate.isBefore(monthStartDate) ? monthStartDate : ctx.statStartDate;
+        ctx.effStartDate = effStartDate;
         long effStartMs = Timestamp.valueOf(effStartDate.atStartOfDay()).getTime();
 
         // === 参与站点（离线判定同口径：有stcd且有设备或本月流水的遥测站 + 有MQTT gate数据的闸站，剔除测试站） ===
@@ -271,7 +280,7 @@ public class ArrivalStatsService {
             int days = 0;
             for (Map.Entry<LocalDate, Map<String, Set<Long>>> entry : ctx.dailyWindows.entrySet()) {
                 LocalDate d = entry.getKey();
-                if (d.isBefore(ctx.statStartDate)) continue; // 防御：流水上线日之前的日不参与月均
+                if (d.isBefore(ctx.effStartDate)) continue; // 防御：统计起始日之前的日不参与月均
                 Map<String, Set<Long>> bySite = entry.getValue();
                 long arrival = 0;
                 long expected = 0;
@@ -294,7 +303,7 @@ public class ArrivalStatsService {
         data.put("todayArrivalRate", round2(totalExpected > 0 ? totalArrival * 100.0 / totalExpected : 0));
         data.put("monthAvgArrivalRate", round2(monthAvg));
         data.put("todayMissRate", round2(totalMeasured > 0 ? totalMiss * 100.0 / totalMeasured : 0));
-        data.put("statStartDate", ctx.statStartDate != null ? ctx.statStartDate.toString() : ctx.today.toString());
+        data.put("statStartDate", ctx.effStartDate != null ? ctx.effStartDate.toString() : ctx.today.toString());
         data.put("noReportSites", noReportSites);
         data.put("missedSites", missedSites);
         return data;
@@ -687,6 +696,13 @@ public class ArrivalStatsService {
                     || (s.stcd != null && s.stcd.startsWith("9999"));
             if (testSite) {
                 log.info("统计剔除测试站: id={}, name={}, stcd={}", s.id, s.name, s.stcd);
+                continue;
+            }
+            // 渠道前缀站整体排除（可选配置）：召测渠道站等非正式上报站不计应报，避免拉低到报率
+            if (excludeStcdPrefixCfg != null && !excludeStcdPrefixCfg.trim().isEmpty()
+                    && s.stcd != null && s.stcd.startsWith(excludeStcdPrefixCfg.trim())) {
+                log.info("统计剔除渠道前缀站(stats.exclude-stcd-prefix={}): id={}, name={}, stcd={}",
+                        excludeStcdPrefixCfg.trim(), s.id, s.name, s.stcd);
                 continue;
             }
             result.add(s);
