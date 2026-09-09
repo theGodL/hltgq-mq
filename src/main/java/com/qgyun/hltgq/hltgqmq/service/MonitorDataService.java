@@ -72,10 +72,10 @@ public class MonitorDataService {
         TAG_TABLE_MAP.put("rainInfo",   SCHEMA + "t_auto_hltgq_water_rain_info");
         TAG_TABLE_MAP.put("gatesInfo",  SCHEMA + "t_auto_hltgq_water_gate");
         TAG_TABLE_MAP.put("gateInfo",   SCHEMA + "t_auto_hltgq_water_gate");
-        TAG_TABLE_MAP.put("soilData",   SCHEMA + "t_auto_hltgq_water_nmisp_info");
+        TAG_TABLE_MAP.put("soilData",   SCHEMA + "t_auto_hltgq_water_soil_data");
     }
 
-    /** soilData 墒情报文字段名 → nmisp_info 表列名 映射（M10→mten等） */
+    /** soilData 墒情报文字段名 → soil_data 表列名 映射（M10→mten等） */
     private static final Map<String, String> SOIL_FIELD_MAP = new LinkedHashMap<>();
     static {
         SOIL_FIELD_MAP.put("m10",   "mten");
@@ -274,7 +274,7 @@ public class MonitorDataService {
             while (fieldNames.hasNext()) {
                 String fieldName = fieldNames.next();
                 String lowerKey = fieldName.toLowerCase();
-                // soilData 墒情报文字段名与表列名不一致，先做映射（M10→mten等）
+                // soilData 墒情报文字段名与 soil_data 表列名不一致，先做映射（M10→mten等）
                 if ("soilData".equals(tag)) {
                     String mapped = SOIL_FIELD_MAP.get(lowerKey);
                     if (mapped != null) {
@@ -288,6 +288,26 @@ public class MonitorDataService {
                 // wtInfo 的 TF(设备累计流量)由设备计量、误差大不可信，不再入库，
                 // tf/timetf/ytf/ttf 四级累计均由服务端基于 Q 梯形积分计算(见 computeWtAccumulations)
                 if ("wtInfo".equals(tag) && "tf".equals(lowerKey)) {
+                    continue;
+                }
+                // spt 列是 TIMESTAMP 类型：报文 SPT 文本 "yyyy-MM-ddTHH:mm:ss" 需转 Timestamp 才能写入，
+                // 否则 JdbcTemplate 传入字符串隐式转换可能失败；转换失败跳过该列
+                if ("spt".equals(lowerKey)) {
+                    if (isValidColumn(validColumns, "spt")) {
+                        Object v = convertValue(entity.get(fieldName));
+                        if (v instanceof String) {
+                            try {
+                                String sptText = ((String) v).trim().replace('T', ' ');
+                                int tzIdx = sptText.indexOf('+');
+                                if (tzIdx > 0) sptText = sptText.substring(0, tzIdx).trim();
+                                fieldMap.put("spt", Timestamp.valueOf(sptText));
+                            } catch (Exception e) {
+                                log.debug("spt解析失败, 跳过spt列: stcd={}, tag={}, SPT={}", stcd, tag, v);
+                            }
+                        } else {
+                            fieldMap.put("spt", v);
+                        }
+                    }
                     continue;
                 }
                 // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳；
@@ -522,8 +542,7 @@ public class MonitorDataService {
                 }
             }
             // === 水质类报文列名匹配自检 ===
-            // pcp_info/nmisp_info 表列名无法离线核对，部署后以日志为准：
-            // 无业务字段入库说明报文字段名与表列名不匹配，需补映射(参照 SOIL_FIELD_MAP)
+            // 部署后以日志核对实际入库字段数；无业务字段入库说明表列名与报文字段不匹配
             if ("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) {
                 long bizCols = fieldMap.keySet().stream().filter(k -> !SYSTEM_FIELDS.contains(k)).count();
                 if (bizCols == 0) {
@@ -548,13 +567,15 @@ public class MonitorDataService {
                 computeWtAccumulations(fieldMap, stcd, validColumns);
             }
 
-            // 去重：相同 stcd+tm 已存在则跳过（防止RabbitMQ重投产生重复行）
-            if (fieldMap.containsKey("tm") && fieldMap.get("tm") != null) {
+            // 去重：相同 stcd+业务时间 已存在则跳过（防止RabbitMQ重投产生重复行）；
+            // 表无 tm 列时(如 pcp_info 历史结构)以 spt 采样时间列作为去重键
+            String dedupCol = fieldMap.containsKey("tm") ? "tm" : (fieldMap.containsKey("spt") ? "spt" : null);
+            if (dedupCol != null && fieldMap.get(dedupCol) != null) {
                 try {
-                    String checkSql = "SELECT COUNT(*) FROM " + tableName + " WHERE stcd = ? AND tm = ?";
-                    int count = jdbcTemplate.queryForObject(checkSql, Integer.class, stcd, fieldMap.get("tm"));
+                    String checkSql = "SELECT COUNT(*) FROM " + tableName + " WHERE stcd = ? AND " + dedupCol + " = ?";
+                    int count = jdbcTemplate.queryForObject(checkSql, Integer.class, stcd, fieldMap.get(dedupCol));
                     if (count > 0) {
-                        log.debug("报文重复, 跳过入库: tag={}, stcd={}, tm={}", tag, stcd, fieldMap.get("tm"));
+                        log.debug("报文重复, 跳过入库: tag={}, stcd={}, {}={}", tag, stcd, dedupCol, fieldMap.get(dedupCol));
                         return;
                     }
                 } catch (Exception e) {
@@ -1942,7 +1963,8 @@ public class MonitorDataService {
      *   river_info — 水位（riverInfo，Z 空时跳过；闸站 Z1/Z2 走 gate 表）
      *   rain_info  — 雨量（rainInfo，DYP≤0 时跳过）
      *   gate       — 闸门开度/水位（gateInfo/gatesInfo 开度，riverInfo 闸站水位 Z1/Z2）
-     *   nmisp_info — 土壤墒情（soilData）/ 水质（nmIspInfo）
+     *   soil_data  — 土壤墒情（soilData）
+     *   nmisp_info — 水质监测（nmIspInfo）
      *   pcp_info   — 水质理化（pcpInfo）
      *
      * MQTT (site 直接匹配 id):
@@ -1957,9 +1979,13 @@ public class MonitorDataService {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Timestamp cutoff = new Timestamp(now.getTime() - 86400000L); // 24h前
             // 对所有入库表做 UNION ALL：任一表有 24h 内数据 → 在线，全部无数据 → 离线
-            // 仅遥测设备参与判定：有RTU站号(水位/雨量/墒情/闸站/流量经RabbitMQ stcd=iofhpi入库)
+            // 仅遥测设备参与判定：有RTU站号(水位/雨量/墒情/闸站/流量/水质经RabbitMQ stcd=iofhpi入库)
             // 或存在MQTT闸站gate数据(site=id)；视频设备由大华对接项目单独维护，
             // 本项目不参与其在线状态管理；点位等其他无遥测数据源的设备同样不参与
+            // pcp_info 表无 tm 列(历史结构)，以 spt 采样时间列作为时间判定列
+            Set<String> pcpCols = tableColumnsCache.getOrDefault(
+                    "t_auto_hltgq_water_pcp_info", Collections.emptySet());
+            String pcpTimeCol = pcpCols.contains("tm") ? "tm" : "spt";
             String offlineBody =
                     "(s.iofhpi IS NOT NULL " +
                     "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
@@ -1978,9 +2004,11 @@ public class MonitorDataService {
                     "  UNION ALL " +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE site = s.id     AND tm >= ?" +
                     "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_soil_data WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_nmisp_info WHERE stcd = s.iofhpi AND tm >= ?" +
                     "  UNION ALL " +
-                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_pcp_info   WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_pcp_info   WHERE stcd = s.iofhpi AND " + pcpTimeCol + " >= ?" +
                     ")";
 
             // 1) 先标离线（UPDATE 后到达的报文会通过 markSiteOnline 把 zebpsu 标回 #1#）
@@ -1988,7 +2016,7 @@ public class MonitorDataService {
                          "SET zebpsu = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
                          "WHERE zebpsu IS DISTINCT FROM '#2#' AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
-                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
                 log.info("标记离线站点: {} 个", rows);
             }
@@ -2000,7 +2028,7 @@ public class MonitorDataService {
                     "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id LIMIT 1) AS device_id " +
                     "FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s WHERE " + confirmCond;
             List<Map<String, Object>> offlineSites = jdbcTemplate.queryForList(selectSql,
-                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
 
             // 3) 逐站复核状态后生成失联告警（站点失联=24h无报文，告警内容明确描述失联场景）。
             // 复核防 SELECT 与告警生成之间报文恢复：此时 zebpsu 已标回 #1#，跳过告警；

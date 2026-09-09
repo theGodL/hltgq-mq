@@ -56,7 +56,8 @@ public class ArrivalStatsService {
     private static final String RIVER_TABLE = SCHEMA + "t_auto_hltgq_water_river_info";
     private static final String RAIN_TABLE  = SCHEMA + "t_auto_hltgq_water_rain_info";
     private static final String WT_TABLE    = SCHEMA + "t_auto_hltgq_water_wt_nfo";
-    private static final String NMISP_TABLE = SCHEMA + "t_auto_hltgq_water_nmisp_info";
+    /** 墒情表（soilData）；nmisp_info/pcp_info 为水质表，水质站不参与缺测判定 */
+    private static final String SOIL_TABLE = SCHEMA + "t_auto_hltgq_water_soil_data";
     private static final String GATE_TABLE  = SCHEMA + "t_auto_hltgq_water_gate";
 
     /** 采集状态统计维度（按大屏列表顺序；视频归 site/device） */
@@ -66,7 +67,7 @@ public class ArrivalStatsService {
         COLLECT_DIMS.put(WT_TABLE,    "流量数据");
         COLLECT_DIMS.put(RAIN_TABLE,  "雨量数据");
         COLLECT_DIMS.put(GATE_TABLE,  "闸门开度");
-        COLLECT_DIMS.put(NMISP_TABLE, "墒情数据");
+        COLLECT_DIMS.put(SOIL_TABLE, "墒情数据");
     }
 
     /** 窗长(毫秒) */
@@ -187,7 +188,7 @@ public class ArrivalStatsService {
         loadValidWindows(ctx, RIVER_TABLE, "z > 0");
         loadValidWindows(ctx, RAIN_TABLE, "dyp > 0");
         loadValidWindows(ctx, WT_TABLE, "q >= 0");
-        loadValidWindows(ctx, NMISP_TABLE, "mten >= 0");
+        loadValidWindows(ctx, SOIL_TABLE, "mten >= 0");
         loadValidWindows(ctx, GATE_TABLE, "(up_z > 0 OR down_z > 0 OR open_degree >= 0)");
 
         // === 到报聚合 ===
@@ -514,16 +515,24 @@ public class ArrivalStatsService {
         // === 今日入库行数（各业务表合计，逐表容错：单表失败不影响其他表） ===
         long todayStored = 0;
         Timestamp ts = new Timestamp(ctx.todayStartMs);
-        String[] storeTables = {RIVER_TABLE, RAIN_TABLE, WT_TABLE, NMISP_TABLE, GATE_TABLE,
-                SCHEMA + "t_auto_hltgq_water_vol_info", SCHEMA + "t_auto_hltgq_water_sluice_discharge",
-                SCHEMA + "t_auto_hltgq_water_pcp_info"};
-        for (String table : storeTables) {
+        // pcp_info 无 tm 列(历史结构)，以 spt 采样时间列统计今日行数
+        Map<String, String> storeTables = new LinkedHashMap<>();
+        storeTables.put(RIVER_TABLE, "tm");
+        storeTables.put(RAIN_TABLE, "tm");
+        storeTables.put(WT_TABLE, "tm");
+        storeTables.put(SOIL_TABLE, "tm");
+        storeTables.put(GATE_TABLE, "tm");
+        storeTables.put(SCHEMA + "t_auto_hltgq_water_vol_info", "tm");
+        storeTables.put(SCHEMA + "t_auto_hltgq_water_sluice_discharge", "tm");
+        storeTables.put(SCHEMA + "t_auto_hltgq_water_nmisp_info", "tm");
+        storeTables.put(SCHEMA + "t_auto_hltgq_water_pcp_info", "spt");
+        for (Map.Entry<String, String> e : storeTables.entrySet()) {
             try {
-                String sql = "SELECT COUNT(*) FROM " + table + " WHERE tm >= ?";
+                String sql = "SELECT COUNT(*) FROM " + e.getKey() + " WHERE " + e.getValue() + " >= ?";
                 Number n = jdbcTemplate.queryForObject(sql, Number.class, ts);
                 todayStored += n != null ? n.longValue() : 0;
-            } catch (Exception e) {
-                log.warn("统计今日入库行数失败(表{}不计入): {}", table, e.getMessage());
+            } catch (Exception ex) {
+                log.warn("统计今日入库行数失败(表{}不计入): {}", e.getKey(), ex.getMessage());
             }
         }
 
@@ -773,7 +782,7 @@ public class ArrivalStatsService {
         if (s.epjutj.contains("#2#")) tables.add(RAIN_TABLE);
         if (s.epjutj.contains("#3#")) tables.add(WT_TABLE);
         if (s.epjutj.contains("#4#")) tables.add(GATE_TABLE);
-        if (s.epjutj.contains("#7#")) tables.add(NMISP_TABLE);
+        if (s.epjutj.contains("#7#")) tables.add(SOIL_TABLE);
         return tables;
     }
 
