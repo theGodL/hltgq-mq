@@ -515,7 +515,8 @@ public class ArrivalStatsService {
         long todayStored = 0;
         Timestamp ts = new Timestamp(ctx.todayStartMs);
         String[] storeTables = {RIVER_TABLE, RAIN_TABLE, WT_TABLE, NMISP_TABLE, GATE_TABLE,
-                SCHEMA + "t_auto_hltgq_water_vol_info", SCHEMA + "t_auto_hltgq_water_sluice_discharge"};
+                SCHEMA + "t_auto_hltgq_water_vol_info", SCHEMA + "t_auto_hltgq_water_sluice_discharge",
+                SCHEMA + "t_auto_hltgq_water_pcp_info"};
         for (String table : storeTables) {
             try {
                 String sql = "SELECT COUNT(*) FROM " + table + " WHERE tm >= ?";

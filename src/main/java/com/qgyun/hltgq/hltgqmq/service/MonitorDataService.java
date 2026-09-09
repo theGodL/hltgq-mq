@@ -88,6 +88,11 @@ public class MonitorDataService {
         SOIL_FIELD_MAP.put("m100",  "mhundred");
     }
 
+    /** 动态入库的系统字段（不含业务字段），用于水质类报文列名匹配自检日志 */
+    private static final Set<String> SYSTEM_FIELDS = new HashSet<>(Arrays.asList(
+            "id", "corp_code", "created_at", "created_by", "updated_at", "updated_by",
+            "site", "device", "stcd", "tm"));
+
     /** gate 表全限定名（riverInfo 闸站水位路由目标） */
     private static final String GATE_TABLE = SCHEMA + "t_auto_hltgq_water_gate";
 
@@ -285,10 +290,15 @@ public class MonitorDataService {
                 if ("wtInfo".equals(tag) && "tf".equals(lowerKey)) {
                     continue;
                 }
-                // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳
+                // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳；
+                // 水质类报文(pcpInfo/nmIspInfo)无 TM 字段，以采样时间 SPT 作为业务时间入库
                 if ("tm".equals(lowerKey)) {
                     if (isValidColumn(validColumns, "tm")) {
-                        fieldMap.put("tm", extractTm(entity, now, stcd, tag));
+                        if (("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) && !hasValue(entity, "TM")) {
+                            fieldMap.put("tm", extractTmFromSpt(entity, now, stcd, tag));
+                        } else {
+                            fieldMap.put("tm", extractTm(entity, now, stcd, tag));
+                        }
                     }
                     continue;
                 }
@@ -491,10 +501,36 @@ public class MonitorDataService {
                     alertService.closeDeviceError(site, deviceId, siteName, "雨量");
                 }
             }
-            // === nmIspInfo / pcpInfo 暂不录入，等待后续设备接入 ===
-            if ("nmIspInfo".equals(tag) || "pcpInfo".equals(tag)) {
-                log.debug("{} 暂不录入, 等待设备接入, stcd={}", tag, stcd);
-                return;
+            // === pcpInfo 水质理化守卫 ===
+            // pH 物理范围 (0,14]：pH=0 表示该探头未采集/未接入，剔除该字段；
+            // COND 电导率物理上恒>0：0 表示探头未采集，剔除；字段剔除不影响其余字段入库。
+            // nmIspInfo 水质参数 0 值合法(低于检出限)，无需守卫，null 字段由 convertValue+列名校验跳过。
+            if ("pcpInfo".equals(tag)) {
+                if (hasValue(entity, "PH")) {
+                    double ph = parseDoubleSafe(entity.get("PH"));
+                    if (!(ph > 0 && ph <= 14)) {
+                        log.warn("pcpInfo pH无效(探头未采集), 剔除字段: stcd={}, PH={}", stcd, entity.get("PH").asText());
+                        fieldMap.remove("ph");
+                    }
+                }
+                if (hasValue(entity, "COND")) {
+                    double cond = parseDoubleSafe(entity.get("COND"));
+                    if (cond <= 0) {
+                        log.warn("pcpInfo 电导率无效(探头未采集), 剔除字段: stcd={}, COND={}", stcd, entity.get("COND").asText());
+                        fieldMap.remove("cond");
+                    }
+                }
+            }
+            // === 水质类报文列名匹配自检 ===
+            // pcp_info/nmisp_info 表列名无法离线核对，部署后以日志为准：
+            // 无业务字段入库说明报文字段名与表列名不匹配，需补映射(参照 SOIL_FIELD_MAP)
+            if ("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) {
+                long bizCols = fieldMap.keySet().stream().filter(k -> !SYSTEM_FIELDS.contains(k)).count();
+                if (bizCols == 0) {
+                    log.warn("{} 无匹配表列的业务字段(表列名可能不匹配), 仅系统字段入库: stcd={}", tag, stcd);
+                } else {
+                    log.info("{} 业务字段{}个准备入库: stcd={}", tag, bizCols, stcd);
+                }
             }
 
             // === 计算字段：水位涨幅、累计降雨、流量四级累计 ===
@@ -1720,6 +1756,31 @@ public class MonitorDataService {
     }
 
     /**
+     * 水质类报文(pcpInfo/nmIspInfo)无 TM 字段，以 SPT(采样时间)作为业务时间入库。
+     * SPT 格式 "yyyy-MM-ddTHH:mm:ss"(可能带时区后缀)；解析失败或时间异常
+     * (早于2000年/超前服务器2h)用服务器时间兜底。
+     */
+    private Timestamp extractTmFromSpt(JsonNode entity, Timestamp fallback, String stcd, String tag) {
+        if (!hasValue(entity, "SPT")) return fallback;
+        try {
+            String spt = entity.get("SPT").asText().trim().replace('T', ' ');
+            // 截掉可能携带的时区后缀(+08:00等)，Timestamp.valueOf 只认 "yyyy-MM-dd HH:mm:ss[.fff]"
+            int tzIdx = spt.indexOf('+');
+            if (tzIdx > 0) spt = spt.substring(0, tzIdx).trim();
+            Timestamp ts = Timestamp.valueOf(spt);
+            if (ts.getTime() < TM_MIN_EPOCH_MS || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
+                log.warn("SPT采样时间异常(早于2000年/超前2h), 使用服务器时间: stcd={}, tag={}, SPT={}",
+                        stcd, tag, entity.get("SPT").asText());
+                return fallback;
+            }
+            return ts;
+        } catch (Exception e) {
+            log.debug("无法解析SPT字段, 使用兜底时间: stcd={}, tag={}, SPT={}", stcd, tag, entity.get("SPT"));
+            return fallback;
+        }
+    }
+
+    /**
      * 取 stcd 最新闸站水位（仅读 gate 表，不改库）：
      * 查近 2 小时内最近一条带 up_z 的闸孔行（含水位缓存行和完整行）。
      * 只读历史数据，不产生任何等待、缓存或滞留。返回 {upZ, downZ}，缺失为 -1。
@@ -1881,13 +1942,11 @@ public class MonitorDataService {
      *   river_info — 水位（riverInfo，Z 空时跳过；闸站 Z1/Z2 走 gate 表）
      *   rain_info  — 雨量（rainInfo，DYP≤0 时跳过）
      *   gate       — 闸门开度/水位（gateInfo/gatesInfo 开度，riverInfo 闸站水位 Z1/Z2）
-     *   nmisp_info — 土壤墒情（soilData）
+     *   nmisp_info — 土壤墒情（soilData）/ 水质（nmIspInfo）
+     *   pcp_info   — 水质理化（pcpInfo）
      *
      * MQTT (site 直接匹配 id):
      *   gate       — 闸门监测（无 stcd，仅 site 字段）
-     *
-     * 不入库的表（已跳过，无需检查）：
-     *   pcp_info   — pcpInfo 暂不录入
      * </pre>
      */
     // 每天0点5分执行：等0点整的 flushToDb 先完成入库，
@@ -1920,6 +1979,8 @@ public class MonitorDataService {
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE site = s.id     AND tm >= ?" +
                     "  UNION ALL " +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_nmisp_info WHERE stcd = s.iofhpi AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_pcp_info   WHERE stcd = s.iofhpi AND tm >= ?" +
                     ")";
 
             // 1) 先标离线（UPDATE 后到达的报文会通过 markSiteOnline 把 zebpsu 标回 #1#）
@@ -1927,7 +1988,7 @@ public class MonitorDataService {
                          "SET zebpsu = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
                          "WHERE zebpsu IS DISTINCT FROM '#2#' AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
-                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
                 log.info("标记离线站点: {} 个", rows);
             }
@@ -1939,7 +2000,7 @@ public class MonitorDataService {
                     "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id LIMIT 1) AS device_id " +
                     "FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s WHERE " + confirmCond;
             List<Map<String, Object>> offlineSites = jdbcTemplate.queryForList(selectSql,
-                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
 
             // 3) 逐站复核状态后生成失联告警（站点失联=24h无报文，告警内容明确描述失联场景）。
             // 复核防 SELECT 与告警生成之间报文恢复：此时 zebpsu 已标回 #1#，跳过告警；
