@@ -152,18 +152,21 @@ public class ArrivalStatsService {
 
         // === 统计起始日（流水上线日）：配置优先，否则取 msg_info 表 msg_text 非空首日 ===
         ctx.statStartDate = resolveStatStartDate(ctx);
+        // 有效起始 = max(流水上线日, 本月1日)：跨月后统计窗口跟随本月，不回退到上线日之前
+        LocalDate effStartDate = ctx.statStartDate.isBefore(monthStartDate) ? monthStartDate : ctx.statStartDate;
+        long effStartMs = Timestamp.valueOf(effStartDate.atStartOfDay()).getTime();
 
-        // === 参与站点（与离线判定同口径：有stcd的遥测站 + 有MQTT gate数据的闸站，剔除测试站） ===
-        ctx.sites = querySites();
+        // === 参与站点（离线判定同口径：有stcd且有设备或本月流水的遥测站 + 有MQTT gate数据的闸站，剔除测试站） ===
+        ctx.sites = querySites(ctx.monthStartMs);
         ctx.siteById = new HashMap<>();
         for (SiteInfo s : ctx.sites) {
             ctx.siteById.put(s.id, s);
         }
 
-        // === 报文流水（本月一次查出：今日到报 + 本月逐日到报共用） ===
+        // === 报文流水（有效起始日至今一次查出：今日到报 + 本月逐日到报共用） ===
         ctx.msgRows = jdbcTemplate.queryForList(
                 "SELECT site, tm, msg FROM " + SCHEMA + "t_auto_hltgq_water_msg_info WHERE tm >= ?",
-                new Timestamp(ctx.monthStartMs));
+                new Timestamp(effStartMs));
 
         // === 有效数据（缺测判定）：按主监测要素聚合 table -> siteId -> 有效时间点集合 ===
         ctx.validByTable = new HashMap<>();
@@ -185,7 +188,7 @@ public class ArrivalStatsService {
             String siteId = String.valueOf(row.get("site"));
             if (tm == null || siteId == null || "null".equals(siteId)) continue;
             LocalDate day = tm.toLocalDateTime().toLocalDate();
-            if (day.isBefore(monthStartDate)) continue;
+            if (day.isBefore(effStartDate)) continue;
             SiteInfo s = ctx.siteById.get(siteId);
             if (s == null) continue;
             long win = s.mqtt ? WINDOW_10MIN_MS : WINDOW_1H_MS;
@@ -268,6 +271,7 @@ public class ArrivalStatsService {
             int days = 0;
             for (Map.Entry<LocalDate, Map<String, Set<Long>>> entry : ctx.dailyWindows.entrySet()) {
                 LocalDate d = entry.getKey();
+                if (d.isBefore(ctx.statStartDate)) continue; // 防御：流水上线日之前的日不参与月均
                 Map<String, Set<Long>> bySite = entry.getValue();
                 long arrival = 0;
                 long expected = 0;
@@ -286,6 +290,7 @@ public class ArrivalStatsService {
         }
 
         Map<String, Object> data = new LinkedHashMap<>();
+        data.put("stationTotal", ctx.sites.size());
         data.put("todayArrivalRate", round2(totalExpected > 0 ? totalArrival * 100.0 / totalExpected : 0));
         data.put("monthAvgArrivalRate", round2(monthAvg));
         data.put("todayMissRate", round2(totalMeasured > 0 ? totalMiss * 100.0 / totalMeasured : 0));
@@ -658,13 +663,19 @@ public class ArrivalStatsService {
         return ctx.today;
     }
 
-    /** 查询参与统计的站点（离线判定同口径，剔除测试站） */
-    private List<SiteInfo> querySites() {
+    /**
+     * 查询参与统计的站点：有stcd的遥测站须"有设备档案 或 本月有报文流水"，
+     * 防止新建档从未接设备的渠道站(9000000xxx)计入应报拉低到报率；MQTT闸站有gate数据即参与；剔除测试站。
+     */
+    private List<SiteInfo> querySites(long monthStartTs) {
         String sql = "SELECT s.id, s.zzkaec, s.iofhpi, s.epjutj FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
-                "WHERE s.iofhpi IS NOT NULL " +
+                "WHERE (s.iofhpi IS NOT NULL AND (" +
+                "   EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_device d WHERE d.site = s.id)" +
+                "   OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info m " +
+                "        WHERE m.site = s.id AND m.tm >= ?))) " +
                 "   OR EXISTS (SELECT 1 FROM " + GATE_TABLE + " g WHERE g.site = s.id)";
         List<SiteInfo> result = new ArrayList<>();
-        for (Map<String, Object> row : jdbcTemplate.queryForList(sql)) {
+        for (Map<String, Object> row : jdbcTemplate.queryForList(sql, new Timestamp(monthStartTs))) {
             SiteInfo s = new SiteInfo();
             s.id = String.valueOf(row.get("id"));
             s.name = row.get("zzkaec") != null ? String.valueOf(row.get("zzkaec")) : s.id;
@@ -680,6 +691,7 @@ public class ArrivalStatsService {
             }
             result.add(s);
         }
+        log.info("统计参与站点 {} 个(已剔除测试站与无设备无流水站点)", result.size());
         return result;
     }
 
