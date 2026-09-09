@@ -48,6 +48,7 @@ public class MqttGateDataService {
 
     private static final String GATE_TABLE   = SCHEMA + "t_auto_hltgq_water_gate";
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
+    private static final String MSG_TABLE    = SCHEMA + "t_auto_hltgq_water_msg_info";
     private static final String WT_NFO_TABLE = SCHEMA + "t_auto_hltgq_water_wt_nfo";
     private static final String SLUICE_TABLE = SCHEMA + "t_auto_hltgq_water_sluice_discharge";
 
@@ -86,6 +87,9 @@ public class MqttGateDataService {
 
     /** wt_nfo 流量表有效列名缓存 */
     private Set<String> wtColumns = Collections.emptySet();
+
+    /** msg_info 报文流水表有效列名缓存 */
+    private Set<String> msgColumns = Collections.emptySet();
 
     /** 最新数据缓存: key = "siteId_deviceId_gateNo", value = fieldMap (会持续更新) */
     private final ConcurrentMap<String, Map<String, Object>> latestDataCache = new ConcurrentHashMap<>();
@@ -128,6 +132,18 @@ public class MqttGateDataService {
         } catch (Exception e) {
             log.error("加载流量表列名元数据失败", e);
         }
+        try {
+            String sql = "SELECT column_name FROM information_schema.columns " +
+                    "WHERE table_schema = 'qixiao-apaas' AND table_name = 't_auto_hltgq_water_msg_info'";
+            List<String> cols = jdbcTemplate.queryForList(sql, String.class);
+            msgColumns = new HashSet<>();
+            for (String col : cols) {
+                msgColumns.add(col.toLowerCase());
+            }
+            log.info("已加载报文流水表列名元数据: {} 列", msgColumns.size());
+        } catch (Exception e) {
+            log.error("加载报文流水表列名元数据失败", e);
+        }
     }
 
     /**
@@ -160,6 +176,9 @@ public class MqttGateDataService {
 
                 // MQTT报文也标记站点在线
                 markSiteOnline(siteId);
+
+                // 报文监测流水：MQTT原始报文留痕(站级无stcd，msg=前缀标识，旁路写入失败不影响主流程)
+                insertMsgLog(baseName, prefix, siteId, payload, now);
 
                 String upZ   = fields.get("RX_020");
                 String downZ = fields.get("RX_021");
@@ -211,6 +230,53 @@ public class MqttGateDataService {
 
         } catch (Exception e) {
             log.error("MQTT 数据解析失败", e);
+        }
+    }
+
+    /**
+     * 报文监测流水：MQTT 原始报文留痕到 msg_info 表(msg_text=原始报文全文)。
+     * MQTT 为站级报文无 stcd，device 挂靠闸孔1设备(与站级水位/流量口径一致)；
+     * tm=入库时间(服务器时间)；sendtm 取入库时间兜底(MQTT报文无设备时间戳)；
+     * afn 功能码 MQTT 无则留空；msg=报文标识(前缀)。
+     * 旁路写入：失败仅告警日志，不影响主流程。
+     */
+    private void insertMsgLog(String baseName, String prefix, String siteId, String rawPayload, Timestamp now) {
+        if (msgColumns.isEmpty() || !msgColumns.contains("msg_text")) {
+            log.debug("msg_info 列元数据缺失(未加载或未加msg_text列), 跳过报文流水: prefix={}", prefix);
+            return;
+        }
+        String device = lookupOrCreateDevice(baseName + "1#", siteId);
+
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id",          IdGenerator.generate());
+        m.put("corp_code",   corpCode);
+        m.put("created_at",  now);
+        m.put("created_by",  "SYSTEM");
+        m.put("updated_at",  now);
+        m.put("updated_by",  "SYSTEM");
+        if (msgColumns.contains("site"))      m.put("site",      siteId);
+        if (msgColumns.contains("device"))    m.put("device",    device);
+        if (msgColumns.contains("tm"))        m.put("tm",        now);
+        if (msgColumns.contains("sendtm"))    m.put("sendtm",    now);
+        if (msgColumns.contains("msg"))       m.put("msg",       prefix);
+        if (msgColumns.contains("msg_text"))  m.put("msg_text",  rawPayload);
+
+        StringBuilder cols = new StringBuilder();
+        StringBuilder phs = new StringBuilder();
+        List<Object> vals = new ArrayList<>();
+        for (Map.Entry<String, Object> e : m.entrySet()) {
+            if (cols.length() > 0) { cols.append(", "); phs.append(", "); }
+            cols.append(e.getKey());
+            phs.append("?");
+            vals.add(e.getValue());
+        }
+        try {
+            String sql = String.format("INSERT INTO %s (%s) VALUES (%s)",
+                    MSG_TABLE, cols.toString(), phs.toString());
+            jdbcTemplate.update(sql, vals.toArray());
+            log.debug("MQTT报文流水已留痕: site={}, prefix={}", siteId, prefix);
+        } catch (Exception e) {
+            log.warn("MQTT报文流水留痕失败: site={}, prefix={}: {}", siteId, prefix, e.getMessage());
         }
     }
 

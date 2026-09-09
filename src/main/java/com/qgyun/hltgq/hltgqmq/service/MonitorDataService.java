@@ -299,6 +299,9 @@ public class MonitorDataService {
                 fieldMap.put(lowerKey, convertValue(valueNode));
             }
 
+            // === 报文监测流水：所有tag统一留痕到 msg_info 表(旁路写入，失败不影响主流程) ===
+            insertMsgLog(entity, tag, message, fieldMap, now);
+
             // === 告警挂接公共上下文：站点名/设备ID/报文测量时间 ===
             String siteName = getSiteName(site);
             String deviceId = fieldMap.get("device") != null ? String.valueOf(fieldMap.get("device")) : null;
@@ -400,12 +403,12 @@ public class MonitorDataService {
                 insertGateFromGatesInfo(entity, site, stcd);
                 return;
             }
-            // === msgInfo 条件入库：msg为空或空白则跳过 ===
+            // === msgInfo：MSG为空或空白跳过(报文流水已在入口统一留痕，此处不再走通用动态入库，防双写) ===
             if ("msgInfo".equals(tag)) {
                 if (!hasValue(entity, "MSG") || entity.get("MSG").asText().trim().isEmpty()) {
-                    log.debug("msgInfo 报文(MSG)为空, 跳过入库, stcd={}", stcd);
-                    return;
+                    log.debug("msgInfo 报文(MSG)为空, 跳过留痕, stcd={}", stcd);
                 }
+                return;
             }
             // === volInfo 条件入库：VOL为空/≤0/超过100V均视为无效或异常 ===
             // 通讯异常哨兵值(FFFFFFFF)不拦截，以-9991入库表示设备异常
@@ -677,6 +680,104 @@ public class MonitorDataService {
             log.warn("查找设备类型失败, deviceId={}: {}", deviceId, e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * 报文监测流水：将收到的原始报文统一留痕到 msg_info 表(msg_text=原始报文全文)。
+     * 所有 tag 在业务守卫/路由之前调用，被拦截的报文同样留痕，供设备方排查。
+     * 字段语义：tm=入库时间(服务器时间)；sendtm=设备发送时间(报文业务TM)；afn=功能码(报文有则记)；
+     * msg=报文标识(msgInfo取MSG文本，其他tag取tag名)；msg_text=原始报文JSON全文。
+     * 旁路写入：失败仅告警日志，不影响业务入库主流程。
+     */
+    private void insertMsgLog(JsonNode entity, String tag, String rawPayload,
+                              Map<String, Object> fieldMap, Timestamp now) {
+        Set<String> msgCols = tableColumnsCache.getOrDefault("t_auto_hltgq_water_msg_info", Collections.emptySet());
+        if (msgCols.isEmpty() || !msgCols.contains("msg_text")) {
+            log.debug("msg_info 列元数据缺失(未加载或未加msg_text列), 跳过报文流水: tag={}", tag);
+            return;
+        }
+        // msg 列非空约束：msgInfo 取 MSG 文本(空则整条不入库)，其他 tag 取 tag 名
+        String msg;
+        if ("msgInfo".equals(tag)) {
+            if (!hasValue(entity, "MSG") || entity.get("MSG").asText().trim().isEmpty()) {
+                return;
+            }
+            msg = entity.get("MSG").asText();
+        } else {
+            msg = tag;
+        }
+        // 设备发送时间：优先取报文 SendTM 字段(与 sendtm 列语义一致)，缺失/异常时退业务TM，再兜底入库时间
+        Timestamp sendtm = null;
+        if (entity.has("SendTM")) {
+            sendtm = parseSendTm(entity.get("SendTM").asText(), now);
+        }
+        if (sendtm == null) {
+            sendtm = toDbTimestamp(fieldMap.get("tm"));
+        }
+        if (sendtm == null) {
+            sendtm = now;
+        }
+        // 功能码：部分报文(entity.AFN)携带，无则留空
+        Integer afn = null;
+        if (entity.has("AFN")) {
+            double af = parseDoubleSafe(entity.get("AFN"));
+            if (!Double.isNaN(af)) {
+                afn = (int) af;
+            }
+        }
+
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id",          IdGenerator.generate());
+        m.put("corp_code",   corpCode);
+        m.put("created_at",  now);
+        m.put("created_by",  "SYSTEM");
+        m.put("updated_at",  now);
+        m.put("updated_by",  "SYSTEM");
+        if (msgCols.contains("site"))      m.put("site",      fieldMap.get("site"));
+        if (msgCols.contains("device"))    m.put("device",    fieldMap.get("device"));
+        if (msgCols.contains("stcd"))      m.put("stcd",      fieldMap.get("stcd"));
+        if (msgCols.contains("tm"))        m.put("tm",        now);
+        if (msgCols.contains("sendtm"))    m.put("sendtm",    sendtm);
+        if (msgCols.contains("afn"))       m.put("afn",       afn);
+        if (msgCols.contains("msg"))       m.put("msg",       msg);
+        if (msgCols.contains("msg_text"))  m.put("msg_text",  rawPayload);
+
+        StringBuilder cols = new StringBuilder();
+        StringBuilder phs = new StringBuilder();
+        List<Object> vals = new ArrayList<>();
+        for (Map.Entry<String, Object> e : m.entrySet()) {
+            if (cols.length() > 0) { cols.append(", "); phs.append(", "); }
+            cols.append(e.getKey());
+            phs.append("?");
+            vals.add(e.getValue());
+        }
+        try {
+            String sql = String.format("INSERT INTO %s (%s) VALUES (%s)",
+                    SCHEMA + "t_auto_hltgq_water_msg_info", cols.toString(), phs.toString());
+            jdbcTemplate.update(sql, vals.toArray());
+            log.debug("报文流水已留痕: stcd={}, tag={}, sendtm={}", fieldMap.get("stcd"), tag, sendtm);
+        } catch (Exception e) {
+            log.warn("报文流水留痕失败: stcd={}, tag={}: {}", fieldMap.get("stcd"), tag, e.getMessage());
+        }
+    }
+
+    /**
+     * 解析设备发送时间 SendTM（ISO文本），应用与TM一致的合理性守卫：
+     * 早于2000年(如0001-01-01设备无时钟)或超前服务器2h均视为无效返回null(由调用方回退)。
+     */
+    private Timestamp parseSendTm(String text, Timestamp fallback) {
+        if (text == null || text.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            Timestamp ts = Timestamp.valueOf(text.replace('T', ' '));
+            if (ts.getTime() < TM_MIN_EPOCH_MS || ts.getTime() > fallback.getTime() + TM_MAX_AHEAD_MS) {
+                return null;
+            }
+            return ts;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 按设备名称查找或创建（共享缓存），可选写入 type 字段 */
