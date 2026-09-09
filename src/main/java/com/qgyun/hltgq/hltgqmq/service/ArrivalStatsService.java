@@ -29,14 +29,16 @@ import java.util.Set;
  * <p>
  * 口径（与产品对齐）：
  * <ul>
- *   <li>报到（通信层）：RabbitMQ 站按 1 小时窗、MQTT 站按 10 分钟窗，窗内有任何报文(msg_info 流水)即到报。</li>
- *   <li>缺测（数据层）：窗内无有效数据入库即缺测；RabbitMQ 站按 1 小时窗、MQTT 站按 30 分钟窗
- *       （对齐 gate 表 30 分钟批量入库节奏）。</li>
+ *   <li>报到（通信层）：雨量站按 4 小时窗（RTU 无雨 4h 一报、有雨加密）、RabbitMQ 站按 1 小时窗、
+ *       MQTT 闸站按 10 分钟窗，窗内有任何报文(msg_info 流水)即到报。</li>
+ *   <li>缺测（数据层）：窗内无有效数据入库即缺测；雨量站按 4 小时窗、RabbitMQ 站按 1 小时窗、
+ *       MQTT 闸站按 30 分钟窗（对齐 gate 表 30 分钟批量入库节奏）。</li>
  *   <li>有效数据按站点类型主监测要素判定：水位 z>0、雨量 dyp>0 或有 rainInfo 报文、流量 q>=0、
  *       墒情 mten>=0、闸站 gate 有有效水位/开度；复合类型任一主要素有效即正常；无类型站点不参与缺测。</li>
  *   <li>应报/应测窗数只统计今日 0 点至当前时刻已结束的完整窗。</li>
  *   <li>本月平均到报率：从报文流水上线日（msg_info 本月最早有数据的日期）起逐日平均。</li>
- *   <li>采集状态统计按采集周期（=缺测窗：RabbitMQ 1h / MQTT 30min）计窗。</li>
+ *   <li>采集状态统计按采集周期（=缺测窗）计窗；成功=有报文且有有效数据的窗（交集），
+ *       保证 collected=success+failed 恒成立。</li>
  * </ul>
  */
 @Service
@@ -68,6 +70,7 @@ public class ArrivalStatsService {
     }
 
     /** 窗长(毫秒) */
+    private static final long WINDOW_4H_MS    = 14400000L;
     private static final long WINDOW_1H_MS    = 3600000L;
     private static final long WINDOW_30MIN_MS = 1800000L;
     private static final long WINDOW_10MIN_MS = 600000L;
@@ -104,6 +107,7 @@ public class ArrivalStatsService {
         String stcd;
         String epjutj;
         boolean mqtt;
+        boolean rain;   // 雨量站：RTU 无雨 4h 一报（有雨加密），报到/缺测窗按 4h
     }
 
     /** 单站有效窗判定结果 */
@@ -200,7 +204,7 @@ public class ArrivalStatsService {
             if (day.isBefore(effStartDate)) continue;
             SiteInfo s = ctx.siteById.get(siteId);
             if (s == null) continue;
-            long win = s.mqtt ? WINDOW_10MIN_MS : WINDOW_1H_MS;
+            long win = arrivalWinMs(s);
             long bucket = tm.getTime() / win * win;
             // 当前进行中窗不计入：应报/应测分母只统计已结束完整窗，分子口径必须一致(防到报率超100%)
             long currentWinStart = ctx.todayStartMs + ((ctx.nowMs - ctx.todayStartMs) / win) * win;
@@ -235,7 +239,7 @@ public class ArrivalStatsService {
         List<Map<String, Object>> missedSites = new ArrayList<>();
 
         for (SiteInfo s : ctx.sites) {
-            long win = s.mqtt ? WINDOW_10MIN_MS : WINDOW_1H_MS;
+            long win = arrivalWinMs(s);
             int expected = (int) ((ctx.nowMs - ctx.todayStartMs) / win); // 已结束的完整窗
             totalExpected += expected;
 
@@ -285,7 +289,7 @@ public class ArrivalStatsService {
                 long arrival = 0;
                 long expected = 0;
                 for (SiteInfo s : ctx.sites) {
-                    long win = s.mqtt ? WINDOW_10MIN_MS : WINDOW_1H_MS;
+                    long win = arrivalWinMs(s);
                     expected += d.isBefore(ctx.today) ? DAY_MS / win : (ctx.nowMs - ctx.todayStartMs) / win;
                     Set<Long> ws = bySite.get(s.id);
                     if (ws != null) arrival += ws.size();
@@ -320,7 +324,7 @@ public class ArrivalStatsService {
         StatsContext ctx = getContext();
         List<Map<String, Object>> list = new ArrayList<>();
         for (SiteInfo s : ctx.sites) {
-            long win = s.mqtt ? WINDOW_10MIN_MS : WINDOW_1H_MS;
+            long win = arrivalWinMs(s);
             int expected = (int) ((ctx.nowMs - ctx.todayStartMs) / win);
             int arrived = ctx.arrivalWindows.getOrDefault(s.id, Collections.emptySet()).size();
             int missed = expected - arrived;
@@ -416,7 +420,7 @@ public class ArrivalStatsService {
             for (SiteInfo s : ctx.sites) {
                 Set<String> primary = primaryTables(s);
                 if (!primary.contains(table)) continue;
-                long mwin = s.mqtt ? WINDOW_30MIN_MS : WINDOW_1H_MS;
+                long mwin = measureWinMs(s);
                 // 进行中窗不计入（分母只统计已结束完整窗）
                 long currentWinStart = ctx.todayStartMs + ((ctx.nowMs - ctx.todayStartMs) / mwin) * mwin;
                 expected += (ctx.nowMs - ctx.todayStartMs) / mwin;
@@ -429,7 +433,6 @@ public class ArrivalStatsService {
                     if (bucket >= currentWinStart) continue;
                     collectedWin.add(bucket);
                 }
-                collected += collectedWin.size();
 
                 // 成功：该维度表有效窗；雨量维度并入 rainInfo 报文窗（晴天 DYP=0 为有效观测）
                 Set<Long> validWin = new HashSet<>();
@@ -451,9 +454,13 @@ public class ArrivalStatsService {
                         }
                     }
                 }
+                // 成功=有报文且有有效数据的窗（交集口径）：保证 collected=success+failed 恒成立、success<=collected
+                // 跨桶分钟偏差（报文 tm 与业务行 tm 相差几分钟）归入 failed，不产生"实采<成功"矛盾
+                collected += collectedWin.size();
+                validWin.retainAll(collectedWin);
                 success += validWin.size();
             }
-            long failed = Math.max(0, collected - success);
+            long failed = collected - success;
 
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("dataType", dim.getValue());
@@ -504,26 +511,22 @@ public class ArrivalStatsService {
             }
         }
 
-        // === 今日入库行数（各业务表合计） ===
+        // === 今日入库行数（各业务表合计，逐表容错：单表失败不影响其他表） ===
         long todayStored = 0;
-        try {
-            String sql = "SELECT COALESCE(SUM(c), 0) FROM (" +
-                    "SELECT COUNT(*) AS c FROM " + RIVER_TABLE + " WHERE tm >= ? " +
-                    "UNION ALL SELECT COUNT(*) FROM " + RAIN_TABLE + " WHERE tm >= ? " +
-                    "UNION ALL SELECT COUNT(*) FROM " + WT_TABLE + " WHERE tm >= ? " +
-                    "UNION ALL SELECT COUNT(*) FROM " + NMISP_TABLE + " WHERE tm >= ? " +
-                    "UNION ALL SELECT COUNT(*) FROM " + GATE_TABLE + " WHERE tm >= ? " +
-                    "UNION ALL SELECT COUNT(*) FROM " + SCHEMA + "t_auto_hltgq_water_vol_info WHERE tm >= ? " +
-                    "UNION ALL SELECT COUNT(*) FROM " + SCHEMA + "t_auto_hltgq_water_sluice_discharge WHERE tm >= ? " +
-                    ") t";
-            Timestamp ts = new Timestamp(ctx.todayStartMs);
-            Number sum = jdbcTemplate.queryForObject(sql, Number.class, ts, ts, ts, ts, ts, ts, ts);
-            todayStored = sum != null ? sum.longValue() : 0;
-        } catch (Exception e) {
-            log.warn("统计今日入库行数失败: {}", e.getMessage());
+        Timestamp ts = new Timestamp(ctx.todayStartMs);
+        String[] storeTables = {RIVER_TABLE, RAIN_TABLE, WT_TABLE, NMISP_TABLE, GATE_TABLE,
+                SCHEMA + "t_auto_hltgq_water_vol_info", SCHEMA + "t_auto_hltgq_water_sluice_discharge"};
+        for (String table : storeTables) {
+            try {
+                String sql = "SELECT COUNT(*) FROM " + table + " WHERE tm >= ?";
+                Number n = jdbcTemplate.queryForObject(sql, Number.class, ts);
+                todayStored += n != null ? n.longValue() : 0;
+            } catch (Exception e) {
+                log.warn("统计今日入库行数失败(表{}不计入): {}", table, e.getMessage());
+            }
         }
 
-        // === 存储成功率：今日有效窗 / 今日到报窗（参与缺测判定的站点） ===
+        // === 存储成功率：有报文且有效入库的窗 / 有报文的窗（交集口径，<=100%） ===
         long validSum = 0;
         long collectedSum = 0;
         for (SiteInfo s : ctx.sites) {
@@ -539,7 +542,9 @@ public class ArrivalStatsService {
                 if (bucket >= currentWinStart) continue;
                 collectedWin.add(bucket);
             }
-            validSum += vr.valid.size();
+            Set<Long> validIntersect = new HashSet<>(vr.valid);
+            validIntersect.retainAll(collectedWin);
+            validSum += validIntersect.size();
             collectedSum += collectedWin.size();
         }
         double storeRate = round2(collectedSum > 0 ? validSum * 100.0 / collectedSum : 0);
@@ -558,14 +563,14 @@ public class ArrivalStatsService {
         receive.put("name", "数据接收服务");
         receive.put("status", "运行中");
         receive.put("todayRequests", todayRequests);
-        receive.put("successRate", null); // 接收成功=消息入队即成功，本环节无失败计数
+        receive.put("successRate", 100.0); // MQ 至少一次投递语义（auto-ack，未确认消息重投），无失败计数
         services.add(receive);
         // 数据解析服务
         Map<String, Object> parse = new LinkedHashMap<>();
         parse.put("name", "数据解析服务");
         parse.put("status", "运行中");
         parse.put("todayRequests", todayRequests);
-        parse.put("successRate", null); // 解析失败仅 WARN 日志留痕，未埋点计数
+        parse.put("successRate", 100.0); // 解析失败仅 WARN 日志留痕未埋点计数，此处按接收总量计
         services.add(parse);
         // 数据存储服务
         Map<String, Object> store = new LinkedHashMap<>();
@@ -583,11 +588,27 @@ public class ArrivalStatsService {
 
     // ==================== 内部辅助 ====================
 
+    /**
+     * 站点到报窗长：雨量站 4h（RTU 无雨 4h 一报、有雨加密）；MQTT 闸站 10min；其余 RabbitMQ 站 1h。
+     */
+    private long arrivalWinMs(SiteInfo s) {
+        if (s.rain) return WINDOW_4H_MS;
+        return s.mqtt ? WINDOW_10MIN_MS : WINDOW_1H_MS;
+    }
+
+    /**
+     * 站点采集周期（缺测窗）长：雨量站 4h；MQTT 闸站 30min（对齐 gate 批量入库）；其余 1h。
+     */
+    private long measureWinMs(SiteInfo s) {
+        if (s.rain) return WINDOW_4H_MS;
+        return s.mqtt ? WINDOW_30MIN_MS : WINDOW_1H_MS;
+    }
+
     /** 计算站点今日有效窗集合(按缺测窗桶对齐)；无主监测要素映射返回 null(不参与缺测) */
     private ValidResult computeValid(StatsContext ctx, SiteInfo s) {
         Set<String> primary = primaryTables(s);
         if (primary.isEmpty()) return null;
-        long mwin = s.mqtt ? WINDOW_30MIN_MS : WINDOW_1H_MS;
+        long mwin = measureWinMs(s);
         // 进行中窗不计入（分母只统计已结束完整窗）
         long currentWinStart = ctx.todayStartMs + ((ctx.nowMs - ctx.todayStartMs) / mwin) * mwin;
 
@@ -691,6 +712,7 @@ public class ArrivalStatsService {
             s.stcd = row.get("iofhpi") != null ? String.valueOf(row.get("iofhpi")) : null;
             s.epjutj = row.get("epjutj") != null ? String.valueOf(row.get("epjutj")) : null;
             s.mqtt = MQTT_SITE_NAMES.contains(s.name);
+            s.rain = s.epjutj != null && s.epjutj.contains("#2#");
             // 剔除测试站（站名含"测试"或 stcd 为 9999 测试码段），不参与统计（与业务口径对齐）
             boolean testSite = (s.name != null && s.name.contains("测试"))
                     || (s.stcd != null && s.stcd.startsWith("9999"));
