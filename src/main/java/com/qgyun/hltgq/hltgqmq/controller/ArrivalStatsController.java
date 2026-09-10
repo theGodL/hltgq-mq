@@ -46,10 +46,12 @@ public class ArrivalStatsController {
         try {
             LocalDate[] range = parseRange(startDate, endDate);
             if (range == null) return error("日期参数格式非法，应为 yyyy-MM-dd");
+            if (range == TODAY_RANGE) {
+                return ok(arrivalStatsService.getStats()); // 无参：原今日路径（完全向后兼容）
+            }
             String rangeErr = validateRange(range[0], range[1], false);
             if (rangeErr != null) return error(rangeErr);
-            return ok(range == TODAY_RANGE ? arrivalStatsService.getStats()
-                    : arrivalStatsService.getStats(range[0], range[1]));
+            return ok(arrivalStatsService.getStats(range[0], range[1]));
         } catch (Exception e) {
             log.error("到报率统计异常", e);
             return error("统计查询异常: " + e.getMessage());
@@ -63,10 +65,12 @@ public class ArrivalStatsController {
         try {
             LocalDate[] range = parseRange(startDate, endDate);
             if (range == null) return error("日期参数格式非法，应为 yyyy-MM-dd");
+            if (range == TODAY_RANGE) {
+                return ok(arrivalStatsService.getArrivalDetail());
+            }
             String rangeErr = validateRange(range[0], range[1], false);
             if (rangeErr != null) return error(rangeErr);
-            return ok(range == TODAY_RANGE ? arrivalStatsService.getArrivalDetail()
-                    : arrivalStatsService.getArrivalDetail(range[0], range[1]));
+            return ok(arrivalStatsService.getArrivalDetail(range[0], range[1]));
         } catch (Exception e) {
             log.error("站点到报明细查询异常", e);
             return error("到报明细查询异常: " + e.getMessage());
@@ -80,10 +84,12 @@ public class ArrivalStatsController {
         try {
             LocalDate[] range = parseRange(startDate, endDate);
             if (range == null) return error("日期参数格式非法，应为 yyyy-MM-dd");
+            if (range == TODAY_RANGE) {
+                return ok(arrivalStatsService.getMissDetail());
+            }
             String rangeErr = validateRange(range[0], range[1], true);
             if (rangeErr != null) return error(rangeErr);
-            return ok(range == TODAY_RANGE ? arrivalStatsService.getMissDetail()
-                    : arrivalStatsService.getMissDetail(range[0], range[1]));
+            return ok(arrivalStatsService.getMissDetail(range[0], range[1]));
         } catch (Exception e) {
             log.error("缺测明细查询异常", e);
             return error("缺测明细查询异常: " + e.getMessage());
@@ -97,10 +103,12 @@ public class ArrivalStatsController {
         try {
             LocalDate[] range = parseRange(startDate, endDate);
             if (range == null) return error("日期参数格式非法，应为 yyyy-MM-dd");
+            if (range == TODAY_RANGE) {
+                return ok(arrivalStatsService.getCollectStats());
+            }
             String rangeErr = validateRange(range[0], range[1], false);
             if (rangeErr != null) return error(rangeErr);
-            return ok(range == TODAY_RANGE ? arrivalStatsService.getCollectStats()
-                    : arrivalStatsService.getCollectStats(range[0], range[1]));
+            return ok(arrivalStatsService.getCollectStats(range[0], range[1]));
         } catch (Exception e) {
             log.error("采集状态统计异常", e);
             return error("采集状态统计异常: " + e.getMessage());
@@ -114,10 +122,12 @@ public class ArrivalStatsController {
         try {
             LocalDate[] range = parseRange(startDate, endDate);
             if (range == null) return error("日期参数格式非法，应为 yyyy-MM-dd");
+            if (range == TODAY_RANGE) {
+                return ok(arrivalStatsService.getServiceStatus());
+            }
             String rangeErr = validateRange(range[0], range[1], false);
             if (rangeErr != null) return error(rangeErr);
-            return ok(range == TODAY_RANGE ? arrivalStatsService.getServiceStatus()
-                    : arrivalStatsService.getServiceStatus(range[0], range[1]));
+            return ok(arrivalStatsService.getServiceStatus(range[0], range[1]));
         } catch (Exception e) {
             log.error("服务状态查询异常", e);
             return error("服务状态查询异常: " + e.getMessage());
@@ -127,19 +137,27 @@ public class ArrivalStatsController {
     /** 今日默认区间哨兵：控制器无参时走原今日路径（与历史接口完全一致） */
     private static final LocalDate[] TODAY_RANGE = new LocalDate[0];
 
-    /** 解析可选日期参数：均缺省返回 TODAY_RANGE 哨兵（走今日路径），任一给出则补全另一端 */
+    /**
+     * 解析可选日期参数：均缺省返回 TODAY_RANGE 哨兵（走今日路径）；
+     * 只传 startDate = 该日至今日；只传 endDate = 该单日（start 兜底为 end，非今天）；
+     * 两个都传 = 原样区间。
+     */
     private LocalDate[] parseRange(String startDate, String endDate) {
-        if ((startDate == null || startDate.trim().isEmpty())
-                && (endDate == null || endDate.trim().isEmpty())) {
+        boolean hasStart = startDate != null && !startDate.trim().isEmpty();
+        boolean hasEnd = endDate != null && !endDate.trim().isEmpty();
+        if (!hasStart && !hasEnd) {
             return TODAY_RANGE;
         }
         try {
             LocalDate today = LocalDate.now();
-            LocalDate start = (startDate != null && !startDate.trim().isEmpty())
-                    ? LocalDate.parse(startDate.trim()) : today;
-            LocalDate end = (endDate != null && !endDate.trim().isEmpty())
-                    ? LocalDate.parse(endDate.trim()) : today;
-            return new LocalDate[]{start, end};
+            if (hasStart && !hasEnd) {
+                return new LocalDate[]{LocalDate.parse(startDate.trim()), today};
+            }
+            if (!hasStart) {
+                LocalDate d = LocalDate.parse(endDate.trim());
+                return new LocalDate[]{d, d};
+            }
+            return new LocalDate[]{LocalDate.parse(startDate.trim()), LocalDate.parse(endDate.trim())};
         } catch (Exception e) {
             return null;
         }
