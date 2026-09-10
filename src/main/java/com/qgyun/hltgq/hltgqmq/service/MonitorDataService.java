@@ -618,6 +618,8 @@ public class MonitorDataService {
 
             jdbcTemplate.update(sql, values.toArray());
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
+            // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm（大屏实时查看用）
+            updateSiteCoreIndicator(tag, fieldMap, site);
 
         } catch (Exception e) {
             long dropped = droppedMessageCount.incrementAndGet();
@@ -1948,6 +1950,40 @@ public class MonitorDataService {
 
     /** 已标记在线的站点ID集合（当天），用于去重减少DB写 */
     private final Set<String> todayOnlineSet = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 站点核心指标实时刷新：水位站(riverInfo)最新水位、雨量站(rainInfo)最新日雨量入库后，
+     * 同步站点档案表 ccnhtm 字段，供大屏实时查看最新核心指标。
+     * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
+     */
+    private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId) {
+        Double value = null;
+        if ("riverInfo".equals(tag)) {
+            // 修正后入库水位(海拔)，与 river_info 表 z 列同值
+            Double z = toDbDouble(fieldMap.get("z"));
+            if (z != null && z > 0) {
+                value = z;
+            }
+        } else if ("rainInfo".equals(tag)) {
+            // 日雨量 DRP（可为0=今日无雨；异常剔除时字段不存在，保留旧值）
+            Double drp = toDbDouble(fieldMap.get("drp"));
+            if (drp != null && drp >= 0) {
+                value = drp;
+            }
+        }
+        if (value == null) {
+            return;
+        }
+        try {
+            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET ccnhtm = ? WHERE id = ?";
+            int rows = jdbcTemplate.update(sql, value, siteId);
+            if (rows > 0) {
+                log.debug("站点核心指标已刷新: site={}, tag={}, ccnhtm={}", siteId, tag, value);
+            }
+        } catch (Exception e) {
+            log.warn("刷新站点核心指标失败, site={}, tag={}: {}", siteId, tag, e.getMessage());
+        }
+    }
 
     /**
      * 收到报文即标记站点在线（当天首次才写DB）
