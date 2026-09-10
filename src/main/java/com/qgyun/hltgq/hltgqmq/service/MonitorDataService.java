@@ -269,6 +269,15 @@ public class MonitorDataService {
             }
             if (isValidColumn(validColumns, "stcd"))   fieldMap.put("stcd", stcd);
 
+            // 水质类报文(pcpInfo/nmIspInfo)无 TM 字段，循环内 tm 分支不会触发，
+            // 需在此主动以采样时间 SPT 作为业务时间入库(nmisp_info 离线判定/统计依赖 tm 列；
+            // pcp_info 表无 tm 列时 isValidColumn 为 false 自动跳过)
+            if (isValidColumn(validColumns, "tm")
+                    && ("pcpInfo".equals(tag) || "nmIspInfo".equals(tag))
+                    && !hasValue(entity, "TM")) {
+                fieldMap.put("tm", extractTmFromSpt(entity, now, stcd, tag));
+            }
+
             // 遍历entity字段，转为小写作为数据库列名（仅当列存在时才添加）
             Iterator<String> fieldNames = entity.fieldNames();
             while (fieldNames.hasNext()) {
@@ -311,14 +320,10 @@ public class MonitorDataService {
                     continue;
                 }
                 // tm 字段统一用 extractTm() 解析，兼容 ISO 8601 格式和数字时间戳；
-                // 水质类报文(pcpInfo/nmIspInfo)无 TM 字段，以采样时间 SPT 作为业务时间入库
+                // 水质类报文正常无 TM 字段(循环外已以 SPT 兑底 tm)，此处仅防御上游改版后带 TM 的水质报文
                 if ("tm".equals(lowerKey)) {
                     if (isValidColumn(validColumns, "tm")) {
-                        if (("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) && !hasValue(entity, "TM")) {
-                            fieldMap.put("tm", extractTmFromSpt(entity, now, stcd, tag));
-                        } else {
-                            fieldMap.put("tm", extractTm(entity, now, stcd, tag));
-                        }
+                        fieldMap.put("tm", extractTm(entity, now, stcd, tag));
                     }
                     continue;
                 }
@@ -331,6 +336,16 @@ public class MonitorDataService {
 
             // === 报文监测流水：所有tag统一留痕到 msg_info 表(旁路写入，失败不影响主流程) ===
             insertMsgLog(entity, tag, message, fieldMap, now);
+
+            // === 水质类报文站点类型守卫 ===
+            // nmIspInfo/pcpInfo 仅水质站(epjutj含#8#)入库；非水质站(如渠道站 9000000xxx)
+            // 只留痕不写业务表，避免非水质站的水质报文污染 nmisp_info/pcp_info。
+            // 守卫放在留痕之后：msg_info 保持完整反映上游投递事实(守卫前统一留痕原则)。
+            if (("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) && !isWaterQualitySite(site)) {
+                log.warn("{} 非水质站报文, 仅留痕不入库: stcd={}, site={}, epjutj={}",
+                         tag, stcd, site, getSiteType(site));
+                return;
+            }
 
             // === 告警挂接公共上下文：站点名/设备ID/报文测量时间 ===
             String siteName = getSiteName(site);
@@ -609,6 +624,14 @@ public class MonitorDataService {
             log.error("报文处理失败, 丢弃消息(累计{}条): {}", dropped, message, e);
             // 不抛出异常，避免阻塞MQ消费
         }
+    }
+
+    /**
+     * 站点是否为水质站：epjutj 含 #8#（主类型或组合类型之一）
+     */
+    private boolean isWaterQualitySite(String siteId) {
+        String epjutj = getSiteType(siteId);
+        return epjutj != null && epjutj.contains("#8#");
     }
 
     /**

@@ -196,6 +196,10 @@ public class ArrivalStatsService {
         long storedRows;
         /** 逐日到报率（区间平均到报率用）：date -> [到报窗, 应报窗] */
         Map<LocalDate, long[]> dailyArrival = new LinkedHashMap<>();
+        /** 区间最后有效时间批量结果：table -> siteId -> MAX(tm)，缺测站 lastValidTm 内存组装用 */
+        Map<String, Map<String, Timestamp>> lastValidByTable = new HashMap<>();
+        /** 区间 rainInfo 报文最后时间：siteId -> MAX(tm)（雨量站晴天有效观测口径） */
+        Map<String, Timestamp> rainLastValidBySite = new HashMap<>();
     }
 
     // ==================== 共享上下文（带缓存） ====================
@@ -351,16 +355,16 @@ public class ArrivalStatsService {
     }
 
     /**
-     * 计算指定自然日的统计快照（今日走共享缓存上下文，与现有今日接口数字一致；
+     * 计算指定自然日的统计快照（今日走单日上下文 + 60s 短缓存，与无参今日接口同套口径数字一致；
      * 历史日走单日上下文 + 长TTL缓存）。供每日汇总任务与区间查询共用。
+     * <p>今日不复用全月 getContext：区间/缺测接口缓存 miss 时避免叠加全月聚合拖慢导致上游读超时。
      */
     public DaySnapshot computeDaySnapshot(LocalDate day) {
-        if (day.equals(LocalDate.now())) {
-            return buildSnapshot(getContext());
-        }
+        boolean isToday = day.equals(LocalDate.now());
+        long ttl = isToday ? CACHE_TTL_MS : DAY_SNAP_TTL_MS;
         DaySnapshot cached = daySnapCache.get(day);
         long[] t = daySnapTimes.get(day);
-        if (cached != null && t != null && System.currentTimeMillis() - t[0] < DAY_SNAP_TTL_MS) {
+        if (cached != null && t != null && System.currentTimeMillis() - t[0] < ttl) {
             return cached;
         }
         DaySnapshot snap = buildSnapshot(loadDayContext(day));
@@ -867,7 +871,23 @@ public class ArrivalStatsService {
                 && System.currentTimeMillis() - cachedTime[0] < CACHE_TTL_MS) {
             return cached;
         }
+        // 双检锁：大屏多端点并发缓存 miss 时只加载一份，避免重复全量聚合互相拖慢导致上游读超时
+        synchronized (this) {
+            cachedTime = rangeTimes.get(key);
+            cached = rangeCache.get(key);
+            if (cached != null && cachedTime != null
+                    && System.currentTimeMillis() - cachedTime[0] < CACHE_TTL_MS) {
+                return cached;
+            }
+            RangeContext rc = buildRangeContext(start, end);
+            rangeCache.put(key, rc);
+            rangeTimes.put(key, new long[]{System.currentTimeMillis()});
+            return rc;
+        }
+    }
 
+    /** 构建区间聚合（由 loadRangeContext 锁内单线程执行）：历史日读日汇总表 + 当日实时合并 */
+    private RangeContext buildRangeContext(LocalDate start, LocalDate end) {
         RangeContext rc = new RangeContext();
         rc.start = start;
         rc.end = end;
@@ -882,6 +902,9 @@ public class ArrivalStatsService {
         for (SiteInfo s : rc.sites) {
             rc.siteById.put(s.id, s);
         }
+
+        // 区间缺测站最后有效时间：批量 GROUP BY 一次性加载（避免缺测站多时逐站查库导致读超时）
+        loadRangeLastValid(rc);
 
         // === 历史日部分：日汇总表聚合 ===
         LocalDate histEnd = rc.includesToday ? today.minusDays(1) : end;
@@ -965,9 +988,6 @@ public class ArrivalStatsService {
             }
             rc.dailyArrival.put(today, tArr);
         }
-
-        rangeCache.put(key, rc);
-        rangeTimes.put(key, new long[]{System.currentTimeMillis()});
         return rc;
     }
 
@@ -987,39 +1007,63 @@ public class ArrivalStatsService {
         return expected;
     }
 
-    /** 区间缺测站最后有效时间（实时查，仅缺测站低频调用）；雨量站并入 rainInfo 报文时间 */
-    private Timestamp queryLastValidTm(SiteInfo s, LocalDate start, LocalDate end) {
-        Timestamp from = Timestamp.valueOf(start.atStartOfDay());
-        Timestamp to = Timestamp.valueOf(end.plusDays(1).atStartOfDay());
-        Timestamp last = null;
+    /**
+     * 区间缺测站最后有效时间批量加载：每表一条 GROUP BY 查询全部站点（与逐站 MAX 查询同口径），
+     * 缺测站多时避免 N 站 × M 表次查库；雨量站并入 rainInfo 报文时间（晴天有效观测口径）。
+     */
+    private void loadRangeLastValid(RangeContext rc) {
+        Timestamp from = Timestamp.valueOf(rc.start.atStartOfDay());
+        Timestamp to = Timestamp.valueOf(rc.end.plusDays(1).atStartOfDay());
         Map<String, String> conds = new LinkedHashMap<>();
         conds.put(RIVER_TABLE, "z > 0");
         conds.put(RAIN_TABLE, "dyp > 0");
         conds.put(WT_TABLE, "q >= 0");
         conds.put(SOIL_TABLE, "mten >= 0");
         conds.put(GATE_TABLE, "(up_z > 0 OR down_z > 0 OR open_degree >= 0)");
-        for (String table : primaryTables(s)) {
+        for (Map.Entry<String, String> e : conds.entrySet()) {
             try {
-                String sql = "SELECT MAX(tm) FROM " + table
-                        + " WHERE site = ? AND tm >= ? AND tm < ? AND " + conds.get(table);
-                Timestamp t = jdbcTemplate.queryForObject(sql, Timestamp.class, s.id, from, to);
-                if (t != null && (last == null || t.after(last))) {
-                    last = t;
+                String sql = "SELECT site, MAX(tm) last_tm FROM " + e.getKey()
+                        + " WHERE tm >= ? AND tm < ? AND " + e.getValue() + " GROUP BY site";
+                Map<String, Timestamp> bySite = new HashMap<>();
+                for (Map<String, Object> row : jdbcTemplate.queryForList(sql, from, to)) {
+                    String siteId = row.get("site") != null ? String.valueOf(row.get("site")) : null;
+                    Timestamp t = toTimestamp(row.get("last_tm"));
+                    if (siteId == null || "null".equals(siteId) || t == null) continue;
+                    bySite.put(siteId, t);
                 }
-            } catch (Exception e) {
-                log.debug("区间最后有效时间查询失败, table={}: {}", table, e.getMessage());
+                rc.lastValidByTable.put(e.getKey(), bySite);
+            } catch (Exception ex) {
+                log.warn("区间最后有效时间批量查询失败, table={}: {}", e.getKey(), ex.getMessage());
+                rc.lastValidByTable.put(e.getKey(), Collections.emptyMap());
+            }
+        }
+        try {
+            String sql = "SELECT site, MAX(tm) last_tm FROM " + SCHEMA + "t_auto_hltgq_water_msg_info"
+                    + " WHERE msg = 'rainInfo' AND tm >= ? AND tm < ? GROUP BY site";
+            for (Map<String, Object> row : jdbcTemplate.queryForList(sql, from, to)) {
+                String siteId = row.get("site") != null ? String.valueOf(row.get("site")) : null;
+                Timestamp t = toTimestamp(row.get("last_tm"));
+                if (siteId == null || "null".equals(siteId) || t == null) continue;
+                rc.rainLastValidBySite.put(siteId, t);
+            }
+        } catch (Exception ex) {
+            log.warn("区间 rainInfo 最后时间批量查询失败: {}", ex.getMessage());
+        }
+    }
+
+    /** 区间缺测站最后有效时间（内存组装：主表 MAX(tm) 与 rainInfo 报文时间取更晚者） */
+    private Timestamp lastValidForSite(RangeContext rc, SiteInfo s) {
+        Timestamp last = null;
+        for (String table : primaryTables(s)) {
+            Timestamp t = rc.lastValidByTable.getOrDefault(table, Collections.emptyMap()).get(s.id);
+            if (t != null && (last == null || t.after(last))) {
+                last = t;
             }
         }
         if (s.rain) {
-            try {
-                String sql = "SELECT MAX(tm) FROM " + SCHEMA + "t_auto_hltgq_water_msg_info"
-                        + " WHERE site = ? AND msg = 'rainInfo' AND tm >= ? AND tm < ?";
-                Timestamp t = jdbcTemplate.queryForObject(sql, Timestamp.class, s.id, from, to);
-                if (t != null && (last == null || t.after(last))) {
-                    last = t;
-                }
-            } catch (Exception e) {
-                log.debug("区间 rainInfo 最后时间查询失败: {}", e.getMessage());
+            Timestamp t = rc.rainLastValidBySite.get(s.id);
+            if (t != null && (last == null || t.after(last))) {
+                last = t;
             }
         }
         return last;
@@ -1057,7 +1101,7 @@ public class ArrivalStatsService {
             long missWin = col[3];
             totalMissWin += missWin;
             if (missWin > 0) {
-                Timestamp lastValid = queryLastValidTm(s, rc.start, rc.end);
+                Timestamp lastValid = lastValidForSite(rc, s);
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("siteId", s.id);
                 item.put("siteName", s.name);
@@ -1382,11 +1426,22 @@ public class ArrivalStatsService {
         return ctx.today;
     }
 
+    /** 参与站点按月缓存（key=月起始时间戳）：miss-detail 逐日构建与回填任务共享，
+     *  避免同月 N 天重复执行站点全量查询（4 表 EXISTS 关联），60s TTL 与统计缓存对齐 */
+    private final Map<Long, List<SiteInfo>> monthSitesCache = new ConcurrentHashMap<>();
+    private final Map<Long, long[]> monthSitesTimes = new ConcurrentHashMap<>();
+    private static final long SITES_TTL_MS = 60_000L;
+
     /**
      * 查询参与统计的站点：有stcd的遥测站须"有设备档案 或 本月有报文流水"，
      * 防止新建档从未接设备的渠道站(9000000xxx)计入应报拉低到报率；MQTT闸站有gate数据即参与；剔除测试站。
      */
     private List<SiteInfo> querySites(long monthStartTs) {
+        List<SiteInfo> cached = monthSitesCache.get(monthStartTs);
+        long[] t = monthSitesTimes.get(monthStartTs);
+        if (cached != null && t != null && System.currentTimeMillis() - t[0] < SITES_TTL_MS) {
+            return cached;
+        }
         String sql = "SELECT s.id, s.zzkaec, s.iofhpi, s.epjutj FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                 "WHERE (s.iofhpi IS NOT NULL AND (" +
                 "   EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_device d WHERE d.site = s.id)" +
@@ -1419,6 +1474,8 @@ public class ArrivalStatsService {
             result.add(s);
         }
         log.info("统计参与站点 {} 个(已剔除测试站与无设备无流水站点)", result.size());
+        monthSitesCache.put(monthStartTs, result);
+        monthSitesTimes.put(monthStartTs, new long[]{System.currentTimeMillis()});
         return result;
     }
 
