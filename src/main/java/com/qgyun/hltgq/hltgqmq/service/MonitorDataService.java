@@ -108,6 +108,8 @@ public class MonitorDataService {
     private static final double MAX_FLOW = 100;
     /** 日降雨量上限(mm)，极端台风日也不超过此值 */
     private static final double MAX_DAILY_RAINFALL = 5000;
+    /** 核心指标时效窗口(ms)：水位/雨量站整点上报，超 1 周期(1h) + 5 分钟摇摆仍无新业务报文 → 核心指标文本列置 '--' */
+    private static final long CORE_INDICATOR_STALE_MS = 65 * 60 * 1000L;
     /** 土壤墒情含水量上限(%)，含水量百分比物理上限100 */
     private static final double MAX_SOIL_MOISTURE = 100;
     /** 1h/3h/6h时段降雨量物理上限(mm)，拦截DYP跳变导致的离奇降雨 */
@@ -619,7 +621,7 @@ public class MonitorDataService {
 
             jdbcTemplate.update(sql, values.toArray());
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
-            // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm（大屏实时查看用）
+            // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm/ccnhtm1、ijzsby/ijzsby1（大屏实时查看用）
             updateSiteCoreIndicator(tag, fieldMap, site, stcd);
 
         } catch (Exception e) {
@@ -1653,6 +1655,11 @@ public class MonitorDataService {
         return (v >= 0 ? Math.floor(v * 100.0) : Math.ceil(v * 100.0)) / 100.0;
     }
 
+    /** 核心指标文本列展示值：截断后固定2位小数（如 42.47、0.00），供 ccnhtm1/ijzsby1 使用 */
+    private static String format2(double v) {
+        return String.format(Locale.US, "%.2f", v);
+    }
+
     /**
      * 判断 entity 中指定字段是否有有效值（非 null、非 NullNode）
      */
@@ -1953,15 +1960,19 @@ public class MonitorDataService {
     private final Set<String> todayOnlineSet = ConcurrentHashMap.newKeySet();
 
     /**
-     * 站点核心指标实时刷新：核心指标字段拆分——ccnhtm(核心指标-水位)、ijzsby(核心指标-雨量)。
-     * riverInfo 入库成功 → ccnhtm=最新水位(修正后海拔)；rainInfo 入库成功 → ijzsby=最新降雨(DYP增量)。
+     * 站点核心指标实时刷新：核心指标拆为水位/雨量两组（数值+文本各一列）——
+     * 数值列 ccnhtm(核心指标-水位)/ijzsby(核心指标-雨量) 存入库值，
+     * 文本列 ccnhtm1(核心指标-水位)/ijzsby1(核心指标-雨量) 存截断2位小数的展示值；
+     * 站点掉线时文本列置 '--'（checkOfflineSites 联动），恢复在线后由下一份业务报文刷新。
+     * riverInfo 入库成功 → 写 ccnhtm/ccnhtm1；rainInfo 入库成功 → 写 ijzsby/ijzsby1。
      * 双上报站(如带雨量计的水位站)两字段各写各的互不覆盖；闸站水位走 gate 表提前返回不受影响。
      * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
      * （不用报文DRP：花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
     private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
-        String column;
+        String textColumn; // 文本列：展示值(截断2位小数)，掉线时置 '--'
+        String numColumn;  // 数值列：入库值(图表/统计用)
         Double value;
         if ("riverInfo".equals(tag)) {
             // 修正后入库水位(海拔)，与 river_info 表 z 列同值
@@ -1969,8 +1980,9 @@ public class MonitorDataService {
             if (z == null || z <= 0) {
                 return;
             }
-            column = "ccnhtm";
-            value = z;
+            textColumn = "ccnhtm1";
+            numColumn = "ccnhtm";
+            value = trunc2(z);
         } else if ("rainInfo".equals(tag)) {
             Double dyp = toDbDouble(fieldMap.get("dyp"));
             if (dyp == null || dyp <= 0) {
@@ -1989,19 +2001,21 @@ public class MonitorDataService {
                 log.warn("核心指标降雨量超上限(DYP跳变), 不更新ijzsby: stcd={}, dyp={}, base={}", stcd, dyp, base);
                 return;
             }
-            column = "ijzsby";
+            textColumn = "ijzsby1";
+            numColumn = "ijzsby";
             value = trunc2(cur);
         } else {
             return;
         }
+        String text = format2(value);
         try {
-            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET " + column + " = ? WHERE id = ?";
-            int rows = jdbcTemplate.update(sql, value, siteId);
+            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET " + textColumn + " = ?, " + numColumn + " = ? WHERE id = ?";
+            int rows = jdbcTemplate.update(sql, text, value, siteId);
             if (rows > 0) {
-                log.info("站点核心指标已刷新: site={}, stcd={}, tag={}, {}={}", siteId, stcd, tag, column, value);
+                log.info("站点核心指标已刷新: site={}, stcd={}, tag={}, {}={}", siteId, stcd, tag, textColumn, text);
             }
         } catch (Exception e) {
-            log.warn("刷新站点核心指标失败, site={}, tag={}, column={}: {}", siteId, tag, column, e.getMessage());
+            log.warn("刷新站点核心指标失败, site={}, tag={}, column={}: {}", siteId, tag, textColumn, e.getMessage());
         }
     }
 
@@ -2113,8 +2127,10 @@ public class MonitorDataService {
                     ")";
 
             // 1) 先标离线（UPDATE 后到达的报文会通过 markSiteOnline 把 zebpsu 标回 #1#）
+            // 同步将核心指标文本列置 '--'：客户要求掉线状态展示无数据而非陈旧值，
+            // 恢复在线后由下一份业务报文(riverInfo/rainInfo)重新刷新真实值
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
-                         "SET zebpsu = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
+                         "SET zebpsu = '#2#', ccnhtm1 = '--', ijzsby1 = '--', updated_at = ?, updated_by = 'SYSTEM' " +
                          "WHERE zebpsu IS DISTINCT FROM '#2#' AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
                     cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
@@ -2153,6 +2169,34 @@ public class MonitorDataService {
             }
         } catch (Exception e) {
             log.error("离线站点检查失败", e);
+        }
+    }
+
+    /**
+     * 核心指标时效巡检（每5分钟）：水位/雨量站按整点周期上报，最近业务报文(river_info/rain_info)
+     * 距今超过 65 分钟(1周期+5分钟摇摆) → 核心指标文本列置 '--'，表示值已失效。
+     * 业务报文到达后由 updateSiteCoreIndicator 自动写回真实值。
+     * 不动 zebpsu 在线状态：通信在线与否仍由 24h 全类型报文判定(checkOfflineSites)，
+     * 避免心跳标在线与业务断流判掉线的状态抖动，也不触发失联告警。
+     */
+    @Scheduled(cron = "0 0/5 * * * ?")
+    public void expireStaleCoreIndicators() {
+        try {
+            Timestamp now = new Timestamp(System.currentTimeMillis());
+            Timestamp cutoff = new Timestamp(now.getTime() - CORE_INDICATOR_STALE_MS);
+            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
+                    "SET ccnhtm1 = '--', ijzsby1 = '--', updated_at = ?, updated_by = 'SYSTEM' " +
+                    "WHERE s.iofhpi IS NOT NULL " +
+                    "  AND (s.epjutj LIKE '#1#%' OR s.epjutj LIKE '#2#%') " +
+                    "  AND (s.ccnhtm1 IS DISTINCT FROM '--' OR s.ijzsby1 IS DISTINCT FROM '--') " +
+                    "  AND NOT EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_river_info r WHERE r.stcd = s.iofhpi AND r.tm >= ?) " +
+                    "  AND NOT EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_rain_info  r WHERE r.stcd = s.iofhpi AND r.tm >= ?)";
+            int rows = jdbcTemplate.update(sql, now, cutoff, cutoff);
+            if (rows > 0) {
+                log.info("核心指标时效失效置'--': {} 个水位/雨量站(超65分钟无业务报文)", rows);
+            }
+        } catch (Exception e) {
+            log.warn("核心指标时效巡检失败: {}", e.getMessage());
         }
     }
 
