@@ -621,7 +621,7 @@ public class MonitorDataService {
 
             jdbcTemplate.update(sql, values.toArray());
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
-            // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm/ccnhtm1、ijzsby/ijzsby1（大屏实时查看用）
+            // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm1/ijzsby1（大屏实时查看用）
             updateSiteCoreIndicator(tag, fieldMap, site, stcd);
 
         } catch (Exception e) {
@@ -1960,19 +1960,16 @@ public class MonitorDataService {
     private final Set<String> todayOnlineSet = ConcurrentHashMap.newKeySet();
 
     /**
-     * 站点核心指标实时刷新：核心指标拆为水位/雨量两组（数值+文本各一列）——
-     * 数值列 ccnhtm(核心指标-水位)/ijzsby(核心指标-雨量) 存入库值，
-     * 文本列 ccnhtm1(核心指标-水位)/ijzsby1(核心指标-雨量) 存截断2位小数的展示值；
-     * 站点掉线时文本列置 '--'（checkOfflineSites 联动），恢复在线后由下一份业务报文刷新。
-     * riverInfo 入库成功 → 写 ccnhtm/ccnhtm1；rainInfo 入库成功 → 写 ijzsby/ijzsby1。
+     * 站点核心指标实时刷新：仅写文本列 ccnhtm1(核心指标-水位)/ijzsby1(核心指标-雨量)——
+     * 展示值固定截断2位小数(如 42.47、0.00)，时效失效时由 expireStaleCoreIndicators 置 '--'。
+     * riverInfo 入库成功 → ccnhtm1=最新水位(修正后海拔)；rainInfo 入库成功 → ijzsby1=最新降雨(DYP增量)。
      * 双上报站(如带雨量计的水位站)两字段各写各的互不覆盖；闸站水位走 gate 表提前返回不受影响。
      * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
      * （不用报文DRP：花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
     private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
-        String textColumn; // 文本列：展示值(截断2位小数)，掉线时置 '--'
-        String numColumn;  // 数值列：入库值(图表/统计用)
+        String column; // 文本列：展示值(截断2位小数)，时效失效时置 '--'
         Double value;
         if ("riverInfo".equals(tag)) {
             // 修正后入库水位(海拔)，与 river_info 表 z 列同值
@@ -1980,8 +1977,7 @@ public class MonitorDataService {
             if (z == null || z <= 0) {
                 return;
             }
-            textColumn = "ccnhtm1";
-            numColumn = "ccnhtm";
+            column = "ccnhtm1";
             value = trunc2(z);
         } else if ("rainInfo".equals(tag)) {
             Double dyp = toDbDouble(fieldMap.get("dyp"));
@@ -1998,24 +1994,23 @@ public class MonitorDataService {
             }
             // 超日雨量上限视为DYP跳变异常，不覆盖保留旧值
             if (cur > MAX_DAILY_RAINFALL) {
-                log.warn("核心指标降雨量超上限(DYP跳变), 不更新ijzsby: stcd={}, dyp={}, base={}", stcd, dyp, base);
+                log.warn("核心指标降雨量超上限(DYP跳变), 不更新ijzsby1: stcd={}, dyp={}, base={}", stcd, dyp, base);
                 return;
             }
-            textColumn = "ijzsby1";
-            numColumn = "ijzsby";
+            column = "ijzsby1";
             value = trunc2(cur);
         } else {
             return;
         }
         String text = format2(value);
         try {
-            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET " + textColumn + " = ?, " + numColumn + " = ? WHERE id = ?";
-            int rows = jdbcTemplate.update(sql, text, value, siteId);
+            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET " + column + " = ? WHERE id = ?";
+            int rows = jdbcTemplate.update(sql, text, siteId);
             if (rows > 0) {
-                log.info("站点核心指标已刷新: site={}, stcd={}, tag={}, {}={}", siteId, stcd, tag, textColumn, text);
+                log.info("站点核心指标已刷新: site={}, stcd={}, tag={}, {}={}", siteId, stcd, tag, column, text);
             }
         } catch (Exception e) {
-            log.warn("刷新站点核心指标失败, site={}, tag={}, column={}: {}", siteId, tag, textColumn, e.getMessage());
+            log.warn("刷新站点核心指标失败, site={}, tag={}, column={}: {}", siteId, tag, column, e.getMessage());
         }
     }
 
