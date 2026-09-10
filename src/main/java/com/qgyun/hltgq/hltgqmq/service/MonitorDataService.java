@@ -1953,46 +1953,55 @@ public class MonitorDataService {
     private final Set<String> todayOnlineSet = ConcurrentHashMap.newKeySet();
 
     /**
-     * 站点核心指标实时刷新：水位站(riverInfo)最新水位、雨量站(rainInfo)最新降雨入库后，
-     * 同步站点档案表 ccnhtm 字段，供大屏实时查看最新核心指标。
+     * 站点核心指标实时刷新：核心指标字段拆分——ccnhtm(核心指标-水位)、ijzsby(核心指标-雨量)。
+     * riverInfo 入库成功 → ccnhtm=最新水位(修正后海拔)；rainInfo 入库成功 → ijzsby=最新降雨(DYP增量)。
+     * 双上报站(如带雨量计的水位站)两字段各写各的互不覆盖；闸站水位走 gate 表提前返回不受影响。
      * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
      * （不用报文DRP：花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
     private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
-        Double value = null;
+        String column;
+        Double value;
         if ("riverInfo".equals(tag)) {
             // 修正后入库水位(海拔)，与 river_info 表 z 列同值
             Double z = toDbDouble(fieldMap.get("z"));
-            if (z != null && z > 0) {
-                value = z;
+            if (z == null || z <= 0) {
+                return;
             }
+            column = "ccnhtm";
+            value = z;
         } else if ("rainInfo".equals(tag)) {
             Double dyp = toDbDouble(fieldMap.get("dyp"));
-            if (dyp != null && dyp > 0) {
-                Double base = queryHydroDayBaseDyp(stcd);
-                if (base != null) {
-                    double cur = dyp - base;
-                    // 超日雨量上限视为DYP跳变异常，不覆盖保留旧值
-                    if (cur >= 0 && cur <= MAX_DAILY_RAINFALL) {
-                        value = trunc2(cur);
-                    } else if (cur > MAX_DAILY_RAINFALL) {
-                        log.warn("核心指标降雨量超上限(DYP跳变), 不更新ccnhtm: stcd={}, dyp={}, base={}", stcd, dyp, base);
-                    }
-                }
+            if (dyp == null || dyp <= 0) {
+                return;
             }
-        }
-        if (value == null) {
+            Double base = queryHydroDayBaseDyp(stcd);
+            if (base == null) {
+                return;
+            }
+            double cur = dyp - base;
+            if (cur < 0) {
+                return; // DYP回退，保留旧值
+            }
+            // 超日雨量上限视为DYP跳变异常，不覆盖保留旧值
+            if (cur > MAX_DAILY_RAINFALL) {
+                log.warn("核心指标降雨量超上限(DYP跳变), 不更新ijzsby: stcd={}, dyp={}, base={}", stcd, dyp, base);
+                return;
+            }
+            column = "ijzsby";
+            value = trunc2(cur);
+        } else {
             return;
         }
         try {
-            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET ccnhtm = ? WHERE id = ?";
+            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef SET " + column + " = ? WHERE id = ?";
             int rows = jdbcTemplate.update(sql, value, siteId);
             if (rows > 0) {
-                log.debug("站点核心指标已刷新: site={}, tag={}, ccnhtm={}", siteId, tag, value);
+                log.info("站点核心指标已刷新: site={}, stcd={}, tag={}, {}={}", siteId, stcd, tag, column, value);
             }
         } catch (Exception e) {
-            log.warn("刷新站点核心指标失败, site={}, tag={}: {}", siteId, tag, e.getMessage());
+            log.warn("刷新站点核心指标失败, site={}, tag={}, column={}: {}", siteId, tag, column, e.getMessage());
         }
     }
 
