@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
 import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -619,7 +620,7 @@ public class MonitorDataService {
             jdbcTemplate.update(sql, values.toArray());
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
             // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm（大屏实时查看用）
-            updateSiteCoreIndicator(tag, fieldMap, site);
+            updateSiteCoreIndicator(tag, fieldMap, site, stcd);
 
         } catch (Exception e) {
             long dropped = droppedMessageCount.incrementAndGet();
@@ -1952,11 +1953,13 @@ public class MonitorDataService {
     private final Set<String> todayOnlineSet = ConcurrentHashMap.newKeySet();
 
     /**
-     * 站点核心指标实时刷新：水位站(riverInfo)最新水位、雨量站(rainInfo)最新日雨量入库后，
+     * 站点核心指标实时刷新：水位站(riverInfo)最新水位、雨量站(rainInfo)最新降雨入库后，
      * 同步站点档案表 ccnhtm 字段，供大屏实时查看最新核心指标。
+     * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
+     * （不用报文DRP：花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
-    private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId) {
+    private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
         Double value = null;
         if ("riverInfo".equals(tag)) {
             // 修正后入库水位(海拔)，与 river_info 表 z 列同值
@@ -1965,10 +1968,18 @@ public class MonitorDataService {
                 value = z;
             }
         } else if ("rainInfo".equals(tag)) {
-            // 日雨量 DRP（可为0=今日无雨；异常剔除时字段不存在，保留旧值）
-            Double drp = toDbDouble(fieldMap.get("drp"));
-            if (drp != null && drp >= 0) {
-                value = drp;
+            Double dyp = toDbDouble(fieldMap.get("dyp"));
+            if (dyp != null && dyp > 0) {
+                Double base = queryHydroDayBaseDyp(stcd);
+                if (base != null) {
+                    double cur = dyp - base;
+                    // 超日雨量上限视为DYP跳变异常，不覆盖保留旧值
+                    if (cur >= 0 && cur <= MAX_DAILY_RAINFALL) {
+                        value = trunc2(cur);
+                    } else if (cur > MAX_DAILY_RAINFALL) {
+                        log.warn("核心指标降雨量超上限(DYP跳变), 不更新ccnhtm: stcd={}, dyp={}, base={}", stcd, dyp, base);
+                    }
+                }
             }
         }
         if (value == null) {
@@ -1983,6 +1994,28 @@ public class MonitorDataService {
         } catch (Exception e) {
             log.warn("刷新站点核心指标失败, site={}, tag={}: {}", siteId, tag, e.getMessage());
         }
+    }
+
+    /**
+     * 当前水文日(8:00切分，8点整归当日)起点前基线DYP：rain_info 该站基线时刻前最近一条有效累计雨量。
+     * 与 site 雨量检测"当前降雨量"基线口径一致（基线随服务器当前时刻滑动）。
+     */
+    private Double queryHydroDayBaseDyp(String stcd) {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime today8 = now.toLocalDate().atTime(8, 0);
+        LocalDateTime hydroBase = now.isBefore(today8) ? today8.minusDays(1) : today8;
+        try {
+            String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
+                    "WHERE stcd = ? AND dyp IS NOT NULL AND dyp > 0 AND tm < ? " +
+                    "ORDER BY tm DESC LIMIT 1";
+            List<Double> rows = jdbcTemplate.queryForList(sql, Double.class, stcd, Timestamp.valueOf(hydroBase));
+            if (rows != null && !rows.isEmpty() && rows.get(0) != null) {
+                return rows.get(0);
+            }
+        } catch (Exception e) {
+            log.warn("查询水文日基线DYP失败, stcd={}: {}", stcd, e.getMessage());
+        }
+        return null;
     }
 
     /**
