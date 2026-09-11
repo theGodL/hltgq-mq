@@ -6,7 +6,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
@@ -24,6 +28,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 到报率/缺测率统计服务：供统计大屏各模块调用（到报明细/缺测明细/采集状态/服务状态/卡片聚合）。
@@ -110,20 +117,49 @@ public class ArrivalStatsService {
     @Value("${stats.exclude-stcd-prefix:}")
     private String excludeStcdPrefixCfg;
 
-    /** 统计上下文短缓存（volatile 双检，并发下重复加载无害仅浪费一次聚合） */
-    private volatile long ctxTimeMs = 0;
-    private volatile StatsContext cachedCtx = null;
+    /** 统计上下文短缓存（60s TTL；过期后 SWR：立即返回旧值 + 后台异步重建，请求不等待冷构建） */
+    private volatile CacheEntry<StatsContext> ctxEntry = new CacheEntry<>(0L, null);
+    /** getContext 独立锁：与区间缓存/日快照锁互不阻塞（分锁消除大屏并发串行等待） */
+    private final Object ctxLock = new Object();
 
-    /** 历史日快照缓存：key=日期, value=[加载时间, 快照]，TTL 后重建 */
-    private final Map<LocalDate, long[]> daySnapTimes = new ConcurrentHashMap<>();
-    private final Map<LocalDate, DaySnapshot> daySnapCache = new ConcurrentHashMap<>();
+    /** 历史日快照缓存：key=日期 → [构建时间, 快照]，今日 60s/历史 10min TTL */
+    private final Map<LocalDate, CacheEntry<DaySnapshot>> daySnapCache = new ConcurrentHashMap<>();
+    /** 区间聚合结果缓存：key=start|end → [构建时间, RangeContext]，60s TTL */
+    private final Map<String, CacheEntry<RangeContext>> rangeCache = new ConcurrentHashMap<>();
+
+    /** 固定桶锁替代按 key 无限增长的锁 map（1024 桶，哈希碰撞仅偶发串行一次构建） */
+    private static final Object[] DAY_LOCKS = new Object[1024];
+    private static final Object[] RANGE_LOCKS = new Object[1024];
+    static {
+        for (int i = 0; i < DAY_LOCKS.length; i++) {
+            DAY_LOCKS[i] = new Object();
+            RANGE_LOCKS[i] = new Object();
+        }
+    }
+
+    /** SWR 后台重建互斥标志：同一缓存同时最多一份重建（定时预热与请求兜底共用） */
+    private final AtomicBoolean ctxRebuilding = new AtomicBoolean(false);
+    private final AtomicBoolean daySnapRebuilding = new AtomicBoolean(false);
+    private final AtomicBoolean rangeRebuilding = new AtomicBoolean(false);
+    /** 缓存后台重建线程池（2 线程 daemon；预热与 SWR 重建共用，重建不占调度线程） */
+    private final ExecutorService rebuildPool = Executors.newFixedThreadPool(2, r -> {
+        Thread t = new Thread(r, "stats-cache-rebuild");
+        t.setDaemon(true);
+        return t;
+    });
 
     /** 统计起始日探测缓存（回填/逐日快照时避免重复 MIN(tm) 查询与日志刷屏） */
     private volatile LocalDate statStartDateResolved;
 
-    /** 区间聚合结果缓存：key=start|end, value=[加载时间, RangeContext]，60s TTL */
-    private final Map<String, long[]> rangeTimes = new ConcurrentHashMap<>();
-    private final Map<String, RangeContext> rangeCache = new ConcurrentHashMap<>();
+    /** 缓存条目：构建时间与值单引用原子替换，读端无时间戳/值撕裂窗口 */
+    private static final class CacheEntry<V> {
+        final long timeMs;
+        final V value;
+        CacheEntry(long timeMs, V value) {
+            this.timeMs = timeMs;
+            this.value = value;
+        }
+    }
 
     /** 站点统计信息 */
     private static class SiteInfo {
@@ -204,20 +240,84 @@ public class ArrivalStatsService {
 
     // ==================== 共享上下文（带缓存） ====================
 
-    private StatsContext getContext() {
-        StatsContext ctx = cachedCtx;
-        if (ctx != null && System.currentTimeMillis() - ctxTimeMs < CACHE_TTL_MS) {
-            return ctx;
+    /** 统计预热开关：启动后异步预热 + 定时刷新今日快照/今日区间缓存，保证首访命中热缓存 */
+    @Value("${stats.warmup-enabled:true}")
+    private boolean warmupEnabled;
+
+    /** 启动后异步预热一次：DB 未就绪时静默失败，由每分钟定时预热兜底 */
+    @PostConstruct
+    public void warmupOnStart() {
+        if (!warmupEnabled) {
+            return;
         }
-        synchronized (this) {
-            if (cachedCtx != null && System.currentTimeMillis() - ctxTimeMs < CACHE_TTL_MS) {
-                return cachedCtx;
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(5000); // 等数据源/连接池就绪
+                warmup();
+            } catch (Exception e) {
+                log.warn("统计启动预热失败: {}", e.getMessage());
             }
-            StatsContext c = loadContext();
-            cachedCtx = c;
-            ctxTimeMs = System.currentTimeMillis();
+        }, "stats-warmup-start");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 定时预热（默认每分钟，TTL 60s 无缝提前刷新）：强制重建今日快照/今日区间/统计上下文。
+     *  重建在后台线程执行不占调度线程；缓存 TTL 与刷新周期对齐，请求几乎总命中热缓存；
+     *  构建未完成期间到期的请求由 SWR 返回旧值兜底，首访与轮询均不阻塞 */
+    @Scheduled(cron = "${stats.warmup-cron:0 * * * * ?}")
+    public void warmup() {
+        if (!warmupEnabled) {
+            return;
+        }
+        LocalDate today = LocalDate.now();
+        forceRebuildDaySnap(today);
+        forceRebuildRange(today, today);
+        forceRebuildCtx();
+    }
+
+    /** 容器关闭时回收重建线程池 */
+    @PreDestroy
+    public void shutdownRebuildPool() {
+        rebuildPool.shutdown();
+    }
+
+    private StatsContext getContext() {
+        CacheEntry<StatsContext> e = ctxEntry;
+        if (e.value != null && System.currentTimeMillis() - e.timeMs < CACHE_TTL_MS) {
+            return e.value;
+        }
+        synchronized (ctxLock) {
+            e = ctxEntry;
+            if (e.value != null && System.currentTimeMillis() - e.timeMs < CACHE_TTL_MS) {
+                return e.value;
+            }
+            if (e.value != null) {
+                // 过期缓存 SWR：立即返回旧值，后台异步重建（请求不等待秒级冷构建）
+                forceRebuildCtx();
+                return e.value;
+            }
+            StatsContext c = loadContext(); // 冷启动无缓存（启动 5s 内预热未完成）才同步构建
+            ctxEntry = new CacheEntry<>(System.currentTimeMillis(), c);
             return c;
         }
+    }
+
+    /** 强制/兜底重建统计上下文（定时预热与 SWR 共用；已在重建则跳过不重复） */
+    private void forceRebuildCtx() {
+        if (!ctxRebuilding.compareAndSet(false, true)) {
+            return;
+        }
+        rebuildPool.execute(() -> {
+            try {
+                StatsContext c = loadContext();
+                ctxEntry = new CacheEntry<>(System.currentTimeMillis(), c);
+            } catch (Exception ex) {
+                log.warn("统计上下文后台重建失败: {}", ex.getMessage());
+            } finally {
+                ctxRebuilding.set(false);
+            }
+        });
     }
 
     private StatsContext loadContext() {
@@ -362,15 +462,50 @@ public class ArrivalStatsService {
     public DaySnapshot computeDaySnapshot(LocalDate day) {
         boolean isToday = day.equals(LocalDate.now());
         long ttl = isToday ? CACHE_TTL_MS : DAY_SNAP_TTL_MS;
-        DaySnapshot cached = daySnapCache.get(day);
-        long[] t = daySnapTimes.get(day);
-        if (cached != null && t != null && System.currentTimeMillis() - t[0] < ttl) {
-            return cached;
+        long dayEndMs = Timestamp.valueOf(day.plusDays(1).atStartOfDay()).getTime();
+        CacheEntry<DaySnapshot> e = daySnapCache.get(day);
+        if (isReusable(e, ttl, isToday, dayEndMs)) {
+            return e.value;
         }
-        DaySnapshot snap = buildSnapshot(loadDayContext(day));
-        daySnapCache.put(day, snap);
-        daySnapTimes.put(day, new long[]{System.currentTimeMillis()});
-        return snap;
+        // 按日期哈希桶锁双检：miss-detail 逐日与区间构建并行 miss 同一日时只构建一份
+        Object lock = DAY_LOCKS[(day.hashCode() & 0x7FFFFFFF) % DAY_LOCKS.length];
+        synchronized (lock) {
+            e = daySnapCache.get(day);
+            if (isReusable(e, ttl, isToday, dayEndMs)) {
+                return e.value;
+            }
+            if (isToday && e != null) {
+                // 今日过期缓存 SWR：返回旧值 + 后台重建；历史日必须同步精确构建（00:05 汇总任务依赖）
+                forceRebuildDaySnap(day);
+                return e.value;
+            }
+            DaySnapshot snap = buildSnapshot(loadDayContext(day));
+            daySnapCache.put(day, new CacheEntry<>(System.currentTimeMillis(), snap));
+            return snap;
+        }
+    }
+
+    /** 快照复用判定：TTL 未过期，且历史日快照必须构建于该日结束后（防跨午夜复用"当日"快照导致少最后 1 窗） */
+    private boolean isReusable(CacheEntry<DaySnapshot> e, long ttl, boolean isToday, long dayEndMs) {
+        return e != null && System.currentTimeMillis() - e.timeMs < ttl
+                && (isToday || e.timeMs >= dayEndMs);
+    }
+
+    /** 强制/兜底重建今日快照（定时预热与 SWR 共用；已在重建则跳过） */
+    private void forceRebuildDaySnap(LocalDate day) {
+        if (!daySnapRebuilding.compareAndSet(false, true)) {
+            return;
+        }
+        rebuildPool.execute(() -> {
+            try {
+                DaySnapshot snap = buildSnapshot(loadDayContext(day));
+                daySnapCache.put(day, new CacheEntry<>(System.currentTimeMillis(), snap));
+            } catch (Exception ex) {
+                log.warn("今日快照后台重建失败: {}", ex.getMessage());
+            } finally {
+                daySnapRebuilding.set(false);
+            }
+        });
     }
 
     /** 从单日上下文构造快照（口径与今日各接口完全一致） */
@@ -478,7 +613,8 @@ public class ArrivalStatsService {
         return table.replace(SCHEMA, "").replace("t_auto_hltgq_water_", "");
     }
 
-    /** 区间入库行数（各业务表合计，逐表容错；pcp_info 无 tm 列以 spt 采样时间列统计） */
+    /** 区间入库行数（各业务表合计，逐表容错；pcp_info 无 tm 列以 spt 采样时间列统计）
+     *  注：sluice_discharge 是流量计算配置表(无 tm 列)，不计入；闸站流量行已由 wt_nfo 计入 */
     long countStoredRows(long fromMs, long toMs) {
         long rows = 0;
         Map<String, String> storeTables = new LinkedHashMap<>();
@@ -488,7 +624,6 @@ public class ArrivalStatsService {
         storeTables.put(SOIL_TABLE, "tm");
         storeTables.put(GATE_TABLE, "tm");
         storeTables.put(SCHEMA + "t_auto_hltgq_water_vol_info", "tm");
-        storeTables.put(SCHEMA + "t_auto_hltgq_water_sluice_discharge", "tm");
         storeTables.put(SCHEMA + "t_auto_hltgq_water_nmisp_info", "tm");
         storeTables.put(SCHEMA + "t_auto_hltgq_water_pcp_info", "spt");
         for (Map.Entry<String, String> e : storeTables.entrySet()) {
@@ -865,25 +1000,44 @@ public class ArrivalStatsService {
      */
     private RangeContext loadRangeContext(LocalDate start, LocalDate end) {
         String key = start + "|" + end;
-        long[] cachedTime = rangeTimes.get(key);
-        RangeContext cached = rangeCache.get(key);
-        if (cached != null && cachedTime != null
-                && System.currentTimeMillis() - cachedTime[0] < CACHE_TTL_MS) {
-            return cached;
+        CacheEntry<RangeContext> e = rangeCache.get(key);
+        if (e != null && System.currentTimeMillis() - e.timeMs < CACHE_TTL_MS) {
+            return e.value;
         }
-        // 双检锁：大屏多端点并发缓存 miss 时只加载一份，避免重复全量聚合互相拖慢导致上游读超时
-        synchronized (this) {
-            cachedTime = rangeTimes.get(key);
-            cached = rangeCache.get(key);
-            if (cached != null && cachedTime != null
-                    && System.currentTimeMillis() - cachedTime[0] < CACHE_TTL_MS) {
-                return cached;
+        // 按 key 哈希桶锁双检：大屏多端点并发 miss 同一区间时只加载一份；
+        // 不同区间各自持锁互不阻塞（原全局锁让 4 个接口串行等首个线程的 8s 构建）
+        Object lock = RANGE_LOCKS[(key.hashCode() & 0x7FFFFFFF) % RANGE_LOCKS.length];
+        synchronized (lock) {
+            e = rangeCache.get(key);
+            if (e != null && System.currentTimeMillis() - e.timeMs < CACHE_TTL_MS) {
+                return e.value;
+            }
+            if (e != null) {
+                // 过期缓存 SWR：返回旧值 + 后台重建（历史区间数据不变，旧值即新值）
+                forceRebuildRange(start, end);
+                return e.value;
             }
             RangeContext rc = buildRangeContext(start, end);
-            rangeCache.put(key, rc);
-            rangeTimes.put(key, new long[]{System.currentTimeMillis()});
+            rangeCache.put(key, new CacheEntry<>(System.currentTimeMillis(), rc));
             return rc;
         }
+    }
+
+    /** 强制/兜底重建区间聚合（定时预热与 SWR 共用；已在重建则跳过） */
+    private void forceRebuildRange(LocalDate start, LocalDate end) {
+        if (!rangeRebuilding.compareAndSet(false, true)) {
+            return;
+        }
+        rebuildPool.execute(() -> {
+            try {
+                RangeContext rc = buildRangeContext(start, end);
+                rangeCache.put(start + "|" + end, new CacheEntry<>(System.currentTimeMillis(), rc));
+            } catch (Exception ex) {
+                log.warn("区间聚合后台重建失败: {}", ex.getMessage());
+            } finally {
+                rangeRebuilding.set(false);
+            }
+        });
     }
 
     /** 构建区间聚合（由 loadRangeContext 锁内单线程执行）：历史日读日汇总表 + 当日实时合并 */

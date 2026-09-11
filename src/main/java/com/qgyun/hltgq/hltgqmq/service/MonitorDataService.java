@@ -108,8 +108,14 @@ public class MonitorDataService {
     private static final double MAX_FLOW = 100;
     /** 日降雨量上限(mm)，极端台风日也不超过此值 */
     private static final double MAX_DAILY_RAINFALL = 5000;
-    /** 核心指标时效窗口(ms)：水位/雨量站整点上报，超 1 周期(1h) + 5 分钟摇摆仍无新业务报文 → 核心指标文本列置 '--' */
-    private static final long CORE_INDICATOR_STALE_MS = 65 * 60 * 1000L;
+    /** 核心指标时效宽限(ms)：超实测周期后再多宽限 5 分钟摇摆才置 0 */
+    private static final long CORE_INDICATOR_GRACE_MS = 5 * 60 * 1000L;
+    /** 默认上报周期(ms)：1h（客户例子整点上报），实测学习前使用 */
+    private static final long DEFAULT_REPORT_PERIOD_MS = 60 * 60 * 1000L;
+    /** 同批报文间隔阈值(ms)：小于此间隔视为同一批次(双上报站 river/rain 同批到达毫秒差)，不参与周期学习 */
+    private static final long MIN_BATCH_GAP_MS = 5 * 60 * 1000L;
+    /** 批次间隔学习上限(ms)：24h，长停报恢复的间隔不算正常周期 */
+    private static final long MAX_BATCH_GAP_MS = 24 * 3600 * 1000L;
     /** 土壤墒情含水量上限(%)，含水量百分比物理上限100 */
     private static final double MAX_SOIL_MOISTURE = 100;
     /** 1h/3h/6h时段降雨量物理上限(mm)，拦截DYP跳变导致的离奇降雨 */
@@ -133,6 +139,12 @@ public class MonitorDataService {
      *  键=stcd|tag：同批次volInfo/wtInfo/riverInfo/rainInfo携带同一测量时刻TM是正常快照，跨tag比较会误判停摆；
      *  只有同一tag的TM连续相同（设备时钟停摆恒停不前进）才触发兜底 */
     private final Map<String, Timestamp> lastBizTmByStcd = new ConcurrentHashMap<>();
+
+    /** stcd|tag -> {lastBizTs(最近业务报文到达时刻ms), periodMs(实测上报周期ms)}，
+     *  核心指标时效巡检用：水位/雨量分开记心跳(双上报站两要素上报周期不同，合并学习会互相污染)；
+     *  各站上报周期差异大(灌区站20min/整点站1h/320640水文站4h)，统一窗口会误标，
+     *  按实测批次间隔滑动平均学习，时效=实测周期+5分钟摇摆 */
+    private final ConcurrentMap<String, long[]> siteReportHeartbeat = new ConcurrentHashMap<>();
 
     /** 设备表全限定名 */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
@@ -621,6 +633,10 @@ public class MonitorDataService {
 
             jdbcTemplate.update(sql, values.toArray());
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
+            // 水位/雨量业务报文到达记心跳，供核心指标时效巡检学习实测上报周期
+            if ("riverInfo".equals(tag) || "rainInfo".equals(tag)) {
+                recordReportHeartbeat(stcd, tag);
+            }
             // 站点核心指标实时刷新：水位/雨量站最新有效数据入库后同步站点表 ccnhtm1/ijzsby1（大屏实时查看用）
             updateSiteCoreIndicator(tag, fieldMap, site, stcd);
 
@@ -1961,7 +1977,7 @@ public class MonitorDataService {
 
     /**
      * 站点核心指标实时刷新：仅写文本列 ccnhtm1(核心指标-水位)/ijzsby1(核心指标-雨量)——
-     * 展示值固定截断2位小数(如 42.47、0.00)，时效失效时由 expireStaleCoreIndicators 置 '--'。
+     * 展示值固定截断2位小数(如 42.47、0.00)，时效失效时由 expireStaleCoreIndicators 置 '0.00'。
      * riverInfo 入库成功 → ccnhtm1=最新水位(修正后海拔)；rainInfo 入库成功 → ijzsby1=最新降雨(DYP增量)。
      * 双上报站(如带雨量计的水位站)两字段各写各的互不覆盖；闸站水位走 gate 表提前返回不受影响。
      * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
@@ -1969,7 +1985,7 @@ public class MonitorDataService {
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
     private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
-        String column; // 文本列：展示值(截断2位小数)，时效失效时置 '--'
+        String column; // 文本列：展示值(截断2位小数)，时效失效时置 '0.00'
         Double value;
         if ("riverInfo".equals(tag)) {
             // 修正后入库水位(海拔)，与 river_info 表 z 列同值
@@ -2122,10 +2138,10 @@ public class MonitorDataService {
                     ")";
 
             // 1) 先标离线（UPDATE 后到达的报文会通过 markSiteOnline 把 zebpsu 标回 #1#）
-            // 同步将核心指标文本列置 '--'：客户要求掉线状态展示无数据而非陈旧值，
+            // 同步将核心指标文本列置0：客户要求无报文时展示0而非陈旧值，
             // 恢复在线后由下一份业务报文(riverInfo/rainInfo)重新刷新真实值
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
-                         "SET zebpsu = '#2#', ccnhtm1 = '--', ijzsby1 = '--', updated_at = ?, updated_by = 'SYSTEM' " +
+                         "SET zebpsu = '#2#', ccnhtm1 = '0.00', ijzsby1 = '0.00', updated_at = ?, updated_by = 'SYSTEM' " +
                          "WHERE zebpsu IS DISTINCT FROM '#2#' AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
                     cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
@@ -2167,32 +2183,126 @@ public class MonitorDataService {
         }
     }
 
+    /** 核心指标文本列是否无有效值：NULL(从未入库)或历史遗留的 '--'(旧版失效标记) */
+    private static boolean isBlankOrDash(String v) {
+        return v == null || v.trim().isEmpty() || "--".equals(v.trim());
+    }
+
     /**
-     * 核心指标时效巡检（每5分钟）：水位/雨量站按整点周期上报，最近业务报文(river_info/rain_info)
-     * 距今超过 65 分钟(1周期+5分钟摇摆) → 核心指标文本列置 '--'，表示值已失效。
+     * 核心指标时效巡检（每5分钟）：按各站实测上报周期判定——最近业务报文(riverInfo/rainInfo)
+     * 距今超过 实测周期 + 5分钟摇摆 → 对应核心指标文本列置 '0.00'，表示无新数据。
      * 业务报文到达后由 updateSiteCoreIndicator 自动写回真实值。
+     * 周期自学习：recordReportHeartbeat 按 stcd|tag 分开学习（重启后首条报文从DB回推），
+     * 水位/雨量两列独立判定——双上报站两要素错峰上报(水位1h/雨量5min)互不污染；
+     * 不同站周期差异大(灌区站20min/整点站1h/320640水文站4h)，统一窗口会误标。
+     * 置0带乐观锁(IS NOT DISTINCT FROM 旧值)，不覆盖巡检SELECT后新写入的真实值。
      * 不动 zebpsu 在线状态：通信在线与否仍由 24h 全类型报文判定(checkOfflineSites)，
      * 避免心跳标在线与业务断流判掉线的状态抖动，也不触发失联告警。
      */
     @Scheduled(cron = "0 0/5 * * * ?")
     public void expireStaleCoreIndicators() {
         try {
-            Timestamp now = new Timestamp(System.currentTimeMillis());
-            Timestamp cutoff = new Timestamp(now.getTime() - CORE_INDICATOR_STALE_MS);
-            String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
-                    "SET ccnhtm1 = '--', ijzsby1 = '--', updated_at = ?, updated_by = 'SYSTEM' " +
+            long now = System.currentTimeMillis();
+            // 仅水位/雨量站参与（主类型#1#/#2#）
+            String selSql = "SELECT s.id, s.iofhpi, s.ccnhtm1, s.ijzsby1 " +
+                    "FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                     "WHERE s.iofhpi IS NOT NULL " +
-                    "  AND (s.epjutj LIKE '#1#%' OR s.epjutj LIKE '#2#%') " +
-                    "  AND (s.ccnhtm1 IS DISTINCT FROM '--' OR s.ijzsby1 IS DISTINCT FROM '--') " +
-                    "  AND NOT EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_river_info r WHERE r.stcd = s.iofhpi AND r.tm >= ?) " +
-                    "  AND NOT EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_rain_info  r WHERE r.stcd = s.iofhpi AND r.tm >= ?)";
-            int rows = jdbcTemplate.update(sql, now, cutoff, cutoff);
-            if (rows > 0) {
-                log.info("核心指标时效失效置'--': {} 个水位/雨量站(超65分钟无业务报文)", rows);
+                    "  AND (s.epjutj LIKE '#1#%' OR s.epjutj LIKE '#2#%')";
+            List<Map<String, Object>> sites = jdbcTemplate.queryForList(selSql);
+            int expired = 0;
+            for (Map<String, Object> row : sites) {
+                String siteId = String.valueOf(row.get("id"));
+                String stcd = row.get("iofhpi") != null ? String.valueOf(row.get("iofhpi")) : null;
+                String ccnhtm1 = row.get("ccnhtm1") != null ? String.valueOf(row.get("ccnhtm1")) : null;
+                String ijzsby1 = row.get("ijzsby1") != null ? String.valueOf(row.get("ijzsby1")) : null;
+                if (stcd == null) {
+                    continue;
+                }
+                // 两列独立判定：水位看riverInfo心跳，雨量看rainInfo心跳
+                long[] hbRiver = siteReportHeartbeat.get(stcd + "|riverInfo");
+                long[] hbRain = siteReportHeartbeat.get(stcd + "|rainInfo");
+                if (isExpired(ccnhtm1, hbRiver, now)) {
+                    expired += expireColumn(siteId, "ccnhtm1", ccnhtm1);
+                }
+                if (isExpired(ijzsby1, hbRain, now)) {
+                    expired += expireColumn(siteId, "ijzsby1", ijzsby1);
+                }
+            }
+            if (expired > 0) {
+                log.info("核心指标时效巡检: {} 个水位/雨量指标置0", expired);
             }
         } catch (Exception e) {
             log.warn("核心指标时效巡检失败: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 单列是否时效失效：距该列对应tag最近心跳超过 实测周期 + 5分钟宽限 → 失效。
+     * 无心跳记录(服务重启后内存清空)时保守处理：仅无有效值(NULL/历史'--')的列置0，
+     * 有真实值的列不动，等下一批报文重新学习。
+     */
+    private static boolean isExpired(String colValue, long[] hb, long now) {
+        if (hb == null || hb[0] <= 0) {
+            return isBlankOrDash(colValue);
+        }
+        return now - hb[0] > hb[1] + CORE_INDICATOR_GRACE_MS;
+    }
+
+    /**
+     * 单列置 '0.00'（乐观锁）：WHERE 附带旧值 IS NOT DISTINCT FROM 条件，
+     * 仅当 SELECT 后该列未被业务报文刷新时才生效，防巡检覆盖窗口内新写入的真实值；
+     * 已为 '0.00' 的列跳过（幂等）。返回实际更新行数(0/1)。
+     */
+    private int expireColumn(String siteId, String column, String selectedValue) {
+        String updSql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef " +
+                "SET " + column + " = '0.00', updated_at = ?, updated_by = 'SYSTEM' " +
+                "WHERE id = ? AND " + column + " IS DISTINCT FROM '0.00' " +
+                "  AND " + column + " IS NOT DISTINCT FROM ?";
+        return jdbcTemplate.update(updSql, new Timestamp(System.currentTimeMillis()), siteId, selectedValue);
+    }
+
+    /**
+     * 水位/雨量业务报文(riverInfo/rainInfo)入库成功后按 stcd|tag 记录心跳并学习实测上报周期：
+     * 相邻批次间隔滑动平均(0.7旧+0.3新)；间隔<5min视为同批(双上报站river/rain同批毫秒差)忽略；
+     * 间隔>24h为长停报恢复，不计入周期；服务重启后首条报文从DB回推最近两条业务记录间隔初始化。
+     * 键=stcd|tag：双上报站两要素上报周期不同(水位1h/雨量5min)，共用心跳会互相污染周期学习，
+     * 导致错峰>5min时每周期误判置0约24分钟。
+     */
+    private void recordReportHeartbeat(String stcd, String tag) {
+        long now = System.currentTimeMillis();
+        siteReportHeartbeat.compute(stcd + "|" + tag, (k, hb) -> {
+            if (hb == null || hb[0] <= 0) {
+                long period = learnReportPeriodFromDb(stcd, tag);
+                return new long[]{now, period};
+            }
+            long gap = now - hb[0];
+            if (gap >= MIN_BATCH_GAP_MS && gap <= MAX_BATCH_GAP_MS) {
+                hb[1] = (long) (hb[1] * 0.7 + gap * 0.3); // 滑动平均平滑周期抖动
+            }
+            hb[0] = now;
+            return hb;
+        });
+    }
+
+    /** 从DB回推该站该tag最近两条业务记录的入库间隔作为实测周期（重启后学习用，无历史则默认1h） */
+    private long learnReportPeriodFromDb(String stcd, String tag) {
+        try {
+            String table = TAG_TABLE_MAP.get(tag);
+            if (table == null) {
+                return DEFAULT_REPORT_PERIOD_MS;
+            }
+            String sql = "SELECT tm FROM " + table + " WHERE stcd = ? ORDER BY tm DESC LIMIT 2";
+            List<Timestamp> rows = jdbcTemplate.queryForList(sql, Timestamp.class, stcd);
+            if (rows != null && rows.size() == 2 && rows.get(0) != null && rows.get(1) != null) {
+                long gap = rows.get(0).getTime() - rows.get(1).getTime();
+                if (gap >= MIN_BATCH_GAP_MS && gap <= MAX_BATCH_GAP_MS) {
+                    return gap;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("从DB学习上报周期失败, stcd={}, tag={}: {}", stcd, tag, e.getMessage());
+        }
+        return DEFAULT_REPORT_PERIOD_MS;
     }
 
     /**
