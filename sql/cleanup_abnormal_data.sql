@@ -142,3 +142,46 @@ DELETE FROM "qixiao-apaas".t_auto_hltgq_water_gate WHERE gate_no = '0';
 -- 附注: 水位缓存行 open_degree 为 NULL 属既定设计（10分钟补全窗口内
 --       无开度报文时的归档结果），不是异常数据，本脚本不处理。
 -- =====================================================================
+
+
+-- 报到、缺测
+-- ============ ① 必须建：全表扫描的缺口索引 ============
+DO $$
+BEGIN
+  -- nmisp_info：现有索引前缀是 site/stcd，纯 tm 范围查询用不上
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='qixiao-apaas' AND indexname='idx_hltgq_nmisp_tm') THEN
+CREATE INDEX idx_hltgq_nmisp_tm ON "qixiao-apaas".t_auto_hltgq_water_nmisp_info (tm);
+END IF;
+  -- pcp_info：代码用 spt 采样时间列统计
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='qixiao-apaas' AND indexname='idx_hltgq_pcp_spt') THEN
+CREATE INDEX idx_hltgq_pcp_spt ON "qixiao-apaas".t_auto_hltgq_water_pcp_info (spt);
+END IF;
+  -- device：querySites 的 EXISTS(SELECT 1 FROM device d WHERE d.site = s.id)
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='qixiao-apaas' AND indexname='idx_hltgq_device_site') THEN
+CREATE INDEX idx_hltgq_device_site ON "qixiao-apaas".t_auto_hltgq_water_device (site);
+END IF;
+END $$;
+
+-- ============ ② 建议建：有效窗扫描 GROUP BY site 的覆盖索引 ============
+-- 查询形态：SELECT site, MAX(tm) FROM 表 WHERE tm >= ? AND tm < ? AND <条件> GROUP BY site
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='qixiao-apaas' AND indexname='idx_hltgq_river_tm_site') THEN
+CREATE INDEX idx_hltgq_river_tm_site ON "qixiao-apaas".t_auto_hltgq_water_river_info (tm, site);
+END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='qixiao-apaas' AND indexname='idx_hltgq_rain_tm_site') THEN
+CREATE INDEX idx_hltgq_rain_tm_site ON "qixiao-apaas".t_auto_hltgq_water_rain_info (tm, site);
+END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='qixiao-apaas' AND indexname='idx_hltgq_soil_tm_site') THEN
+CREATE INDEX idx_hltgq_soil_tm_site ON "qixiao-apaas".t_auto_hltgq_water_soil_data (tm, site);
+END IF;
+END $$;
+
+-- ============ ③ 必须执行：更新统计信息 ============
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_nmisp_info;
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_pcp_info;
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_device;
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_river_info;
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_rain_info;
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_soil_data;
+ANALYZE "qixiao-apaas".t_auto_hltgq_water_msg_info;
