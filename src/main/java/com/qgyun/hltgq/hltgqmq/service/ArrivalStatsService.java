@@ -130,10 +130,12 @@ public class ArrivalStatsService {
     /** 固定桶锁替代按 key 无限增长的锁 map（1024 桶，哈希碰撞仅偶发串行一次构建） */
     private static final Object[] DAY_LOCKS = new Object[1024];
     private static final Object[] RANGE_LOCKS = new Object[1024];
+    private static final Object[] SITES_LOCKS = new Object[1024];
     static {
         for (int i = 0; i < DAY_LOCKS.length; i++) {
             DAY_LOCKS[i] = new Object();
             RANGE_LOCKS[i] = new Object();
+            SITES_LOCKS[i] = new Object();
         }
     }
 
@@ -141,6 +143,7 @@ public class ArrivalStatsService {
     private final AtomicBoolean ctxRebuilding = new AtomicBoolean(false);
     private final AtomicBoolean daySnapRebuilding = new AtomicBoolean(false);
     private final AtomicBoolean rangeRebuilding = new AtomicBoolean(false);
+    private final AtomicBoolean sitesRebuilding = new AtomicBoolean(false);
     /** 缓存后台重建线程池（2 线程 daemon；预热与 SWR 重建共用，重建不占调度线程） */
     private final ExecutorService rebuildPool = Executors.newFixedThreadPool(2, r -> {
         Thread t = new Thread(r, "stats-cache-rebuild");
@@ -928,8 +931,9 @@ public class ArrivalStatsService {
             }
         }
 
-        // === 今日入库行数（各业务表合计，逐表容错：单表失败不影响其他表） ===
-        long todayStored = countStoredRows(ctx.todayStartMs, ctx.todayStartMs + DAY_MS);
+        // === 今日入库行数（复用今日快照聚合结果，避免每次请求同步 8 表 COUNT 打库） ===
+        DaySnapshot snap = computeDaySnapshot(ctx.today);
+        long todayStored = snap.storedRows;
 
         // === 存储成功率：有报文且有效入库的窗 / 有报文的窗（交集口径，<=100%） ===
         long validSum = 0;
@@ -1581,9 +1585,9 @@ public class ArrivalStatsService {
     }
 
     /** 参与站点按月缓存（key=月起始时间戳）：miss-detail 逐日构建与回填任务共享，
-     *  避免同月 N 天重复执行站点全量查询（4 表 EXISTS 关联），60s TTL 与统计缓存对齐 */
-    private final Map<Long, List<SiteInfo>> monthSitesCache = new ConcurrentHashMap<>();
-    private final Map<Long, long[]> monthSitesTimes = new ConcurrentHashMap<>();
+     *  避免同月 N 天重复执行站点全量查询（4 表 EXISTS 关联），60s TTL 与统计缓存对齐；
+     *  过期后 SWR（返回旧值 + 后台异步重建），请求线程不等待慢查询 */
+    private final Map<Long, CacheEntry<List<SiteInfo>>> monthSitesCache = new ConcurrentHashMap<>();
     private static final long SITES_TTL_MS = 60_000L;
 
     /**
@@ -1591,11 +1595,48 @@ public class ArrivalStatsService {
      * 防止新建档从未接设备的渠道站(9000000xxx)计入应报拉低到报率；MQTT闸站有gate数据即参与；剔除测试站。
      */
     private List<SiteInfo> querySites(long monthStartTs) {
-        List<SiteInfo> cached = monthSitesCache.get(monthStartTs);
-        long[] t = monthSitesTimes.get(monthStartTs);
-        if (cached != null && t != null && System.currentTimeMillis() - t[0] < SITES_TTL_MS) {
-            return cached;
+        CacheEntry<List<SiteInfo>> e = monthSitesCache.get(monthStartTs);
+        if (e != null && System.currentTimeMillis() - e.timeMs < SITES_TTL_MS) {
+            return e.value;
         }
+        // 桶锁双检：并发 miss 同一月键时仅首个构建；过期走 SWR 返回旧值 + 后台异步重建。
+        // 该查询含 3 处 EXISTS 子查询（device/msg_info/gate），索引缺失或 DB 慢时同步执行
+        // 会直接放大为接口耗时（miss-detail 等直接依赖此方法），故请求线程内不等待重建
+        Object lock = SITES_LOCKS[(int) ((monthStartTs ^ (monthStartTs >>> 32)) & 0x7FFFFFFF) % SITES_LOCKS.length];
+        synchronized (lock) {
+            e = monthSitesCache.get(monthStartTs);
+            if (e != null && System.currentTimeMillis() - e.timeMs < SITES_TTL_MS) {
+                return e.value;
+            }
+            if (e != null) {
+                forceRebuildSites(monthStartTs);
+                return e.value;
+            }
+            List<SiteInfo> result = doQuerySites(monthStartTs);
+            monthSitesCache.put(monthStartTs, new CacheEntry<>(System.currentTimeMillis(), result));
+            return result;
+        }
+    }
+
+    /** 站点缓存后台重建（SWR 与请求兜底共用；已在重建则跳过） */
+    private void forceRebuildSites(long monthStartTs) {
+        if (!sitesRebuilding.compareAndSet(false, true)) {
+            return;
+        }
+        rebuildPool.execute(() -> {
+            try {
+                List<SiteInfo> result = doQuerySites(monthStartTs);
+                monthSitesCache.put(monthStartTs, new CacheEntry<>(System.currentTimeMillis(), result));
+            } catch (Exception ex) {
+                log.warn("站点缓存后台重建失败: {}", ex.getMessage());
+            } finally {
+                sitesRebuilding.set(false);
+            }
+        });
+    }
+
+    /** 实际查询站点全集（锁内单线程执行）：档案表 + 设备/流水/gate EXISTS 过滤 */
+    private List<SiteInfo> doQuerySites(long monthStartTs) {
         String sql = "SELECT s.id, s.zzkaec, s.iofhpi, s.epjutj FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                 "WHERE (s.iofhpi IS NOT NULL AND (" +
                 "   EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_device d WHERE d.site = s.id)" +
@@ -1628,8 +1669,6 @@ public class ArrivalStatsService {
             result.add(s);
         }
         log.info("统计参与站点 {} 个(已剔除测试站与无设备无流水站点)", result.size());
-        monthSitesCache.put(monthStartTs, result);
-        monthSitesTimes.put(monthStartTs, new long[]{System.currentTimeMillis()});
         return result;
     }
 
