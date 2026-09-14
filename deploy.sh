@@ -22,7 +22,7 @@ docker run -d \
     -e SPRING_RABBITMQ_USERNAME=sunny \
     -e "SPRING_RABBITMQ_PASSWORD=sunny@2025" \
     -e SPRING_RABBITMQ_VIRTUAL_HOST=/ \
-    --memory="512m" \
+    --memory="1g" \
     ${IMAGE_NAME}:latest
 
 echo "部署完成，查看日志："

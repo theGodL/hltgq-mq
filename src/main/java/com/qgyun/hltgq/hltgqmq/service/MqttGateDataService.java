@@ -8,12 +8,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -38,6 +41,10 @@ public class MqttGateDataService {
     /** 告警入库服务（设备异常/站点失联/阈值越界） */
     @Autowired
     private AlertService alertService;
+
+    /** MQTT 闸门数据 Redis 持久化缓冲（报文到达即写，定时落库） */
+    @Autowired
+    private MqttRedisBuffer redisBuffer;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -93,6 +100,14 @@ public class MqttGateDataService {
 
     /** 最新数据缓存: key = "siteId_deviceId_gateNo", value = fieldMap (会持续更新) */
     private final ConcurrentMap<String, Map<String, Object>> latestDataCache = new ConcurrentHashMap<>();
+
+    /** 落库互斥锁：定时任务与启动/停机补偿互斥，避免同一批被并发处理 */
+    private final Object flushLock = new Object();
+
+    /** 需要从 Redis JSON(epoch millis) 还原为 Timestamp 的时间字段 */
+    private static final String[] TIMESTAMP_FIELDS = {
+            "tm", "date", "ctime", "created_at", "updated_at"
+    };
 
     /** site 名称 → siteId 缓存 (静态映射, 首次查DB后缓存) */
     private final ConcurrentMap<String, String> siteCache = new ConcurrentHashMap<>();
@@ -219,9 +234,11 @@ public class MqttGateDataService {
                             siteId, deviceId, gateNo, fields, upZ, downZ, now);
                     // 设备异常/阈值告警（开度按闸孔分别检查，站级水位已在上方独立检查）
                     checkDeviceAlerts(siteId, deviceId, baseName, gateNo, fieldMap, now);
-                    // 缓存，key = siteId_deviceId_gateNo，每次覆盖最新值
-                    String cacheKey = siteId + "_" + deviceId + "_" + gateNo;
-                    latestDataCache.put(cacheKey, fieldMap);
+                    // 优先写 Redis 持久化缓冲（进程重启/DB 抖动不丢）；Redis 不可用时降级内存缓存
+                    if (!redisBuffer.save(siteId, fieldMap)) {
+                        String cacheKey = siteId + "_" + deviceId + "_" + gateNo;
+                        latestDataCache.put(cacheKey, fieldMap);
+                    }
                     updated++;
                 }
             }
@@ -281,26 +298,47 @@ public class MqttGateDataService {
     }
 
     /**
-     * 定时入库：服务器整点/半点(如16:00:00、16:30:00)将缓存中最新数据批量写入数据库
+     * 定时入库（近实时，每分钟一次）：优先从 Redis 持久化缓冲取出各站待落库数据，
+     * Redis 不可用时回退内存缓存。落库成功后按条数 LTRIM 删除 Redis 队列条目；
+     * 失败则不删、下轮重试，由 site+device+gate_no+tm 去重兜底重复。
      */
-    @Scheduled(cron = "0 0,30 * * * ?")  // 每小时 0 分和 30 分执行，墙钟对齐服务器时区
+    @Scheduled(cron = "0 * * * * ?")  // 每分钟执行，墙钟对齐服务器时区
     public void flushToDb() {
-        if (latestDataCache.isEmpty()) {
+        synchronized (flushLock) {
+            doFlushToDb();
+        }
+    }
+
+    private void doFlushToDb() {
+        // 1. 从 Redis 缓冲取出待落库数据（只取不删，落库成功后 ack）
+        List<Map<String, Object>> rows = new ArrayList<>();
+        List<MqttRedisBuffer.Batch> redisBatches = new ArrayList<>();
+        if (redisBuffer.isAvailable()) {
+            for (String siteId : redisBuffer.activeSites()) {
+                MqttRedisBuffer.Batch batch = redisBuffer.fetch(siteId);
+                if (!batch.isEmpty()) {
+                    rows.addAll(batch.rows);
+                    redisBatches.add(batch);
+                }
+            }
+        }
+
+        // 2. Redis 不可用时的内存兜底
+        List<Map<String, Object>> memRows = new ArrayList<>(latestDataCache.values());
+        latestDataCache.clear();
+        rows.addAll(memRows);
+
+        if (rows.isEmpty()) {
             log.debug("缓存为空，跳过入库");
             return;
         }
 
-        // 取出并清空缓存
-        List<Map<String, Object>> rows = new ArrayList<>(latestDataCache.values());
-        latestDataCache.clear();
-
-        // 更新每条记录的时间戳为当前时间
+        // 3. 统一系统字段：tm/date/ctime 保留报文接收时间（重试去重依赖 tm 稳定），
+        //    id/created_at/updated_at 以入库时间刷新
         Timestamp now = new Timestamp(System.currentTimeMillis());
         for (Map<String, Object> row : rows) {
+            normalizeTimestamps(row);
             row.put("id", IdGenerator.generate());
-            row.put("tm", now);
-            row.put("date", now);
-            row.put("ctime", now);
             row.put("created_at", now);
             row.put("updated_at", now);
         }
@@ -319,6 +357,10 @@ public class MqttGateDataService {
             }
         });
         if (rows.isEmpty()) {
+            // 全部已入库，Redis 队列条目可安全删除
+            for (MqttRedisBuffer.Batch batch : redisBatches) {
+                redisBuffer.ack(batch.siteId, batch.count);
+            }
             log.debug("缓存行均已入库, 跳过本批");
             return;
         }
@@ -367,13 +409,18 @@ public class MqttGateDataService {
             });
             log.info("定时入库完成: {} 条记录 → {}", rows.size(), GATE_TABLE);
         } catch (Exception e) {
-            log.error("定时入库失败, {} 条记录写回缓存待重试", rows.size(), e);
-            // 失败时写回缓存，下次再试
-            for (Map<String, Object> row : rows) {
+            log.error("定时入库失败, {} 条记录待重试(内存写回/Redis保留)", rows.size(), e);
+            // 内存兜底行写回缓存；Redis 行保留在队列中，下轮重试（去重兜底）
+            for (Map<String, Object> row : memRows) {
                 String cacheKey = row.get("site") + "_" + row.get("device") + "_" + row.get("gate_no");
                 latestDataCache.putIfAbsent(cacheKey, row);
             }
             return;
+        }
+
+        // 4. 落库成功，删除已消费的 Redis 队列条目
+        for (MqttRedisBuffer.Batch batch : redisBatches) {
+            redisBuffer.ack(batch.siteId, batch.count);
         }
 
         // 闸门数据入库成功后，计算各站实时流量并写入流量表（失败仅跳过本批流量，不影响闸门数据）
@@ -382,6 +429,45 @@ public class MqttGateDataService {
             insertWtRows(wtRows);
         } catch (Exception e) {
             log.warn("闸站流量计算/入库失败, 跳过本批流量写入", e);
+        }
+    }
+
+    /** 启动补偿：应用就绪后先把 Redis 残留缓冲（上次进程被杀遗留）落库一次 */
+    @EventListener(ApplicationReadyEvent.class)
+    public void flushOnStartup() {
+        try {
+            flushToDb();
+        } catch (Exception e) {
+            log.warn("启动补偿落库失败: {}", e.getMessage());
+        }
+    }
+
+    /** 停机补偿：优雅关闭时尽力落库（SIGKILL 不触发，由 Redis 缓冲兜底） */
+    @PreDestroy
+    public void flushOnShutdown() {
+        try {
+            flushToDb();
+        } catch (Exception e) {
+            log.warn("停机补偿落库失败: {}", e.getMessage());
+        }
+    }
+
+    /** Redis JSON 反序列化后时间字段为 epoch millis(数字)，统一还原为 Timestamp 供 JDBC 写入 */
+    private void normalizeTimestamps(Map<String, Object> row) {
+        for (String key : TIMESTAMP_FIELDS) {
+            Object v = row.get(key);
+            if (v instanceof Timestamp) {
+                continue;
+            }
+            if (v instanceof Number) {
+                row.put(key, new Timestamp(((Number) v).longValue()));
+            } else if (v instanceof String) {
+                try {
+                    row.put(key, Timestamp.valueOf(((String) v).trim().replace('T', ' ')));
+                } catch (Exception e) {
+                    row.remove(key);
+                }
+            }
         }
     }
 

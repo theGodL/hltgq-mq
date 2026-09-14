@@ -30,6 +30,18 @@
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
 
+        <!-- Redis（MQTT 闸门数据持久化缓冲） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- Lettuce 连接池（spring.redis.lettuce.pool.* 生效所需） -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-pool2</artifactId>
+        </dependency>
+
         <!-- PostgreSQL JDBC 驱动（人大金仓KingbaseES v8兼容） -->
         <dependency>
             <groupId>org.postgresql</groupId>

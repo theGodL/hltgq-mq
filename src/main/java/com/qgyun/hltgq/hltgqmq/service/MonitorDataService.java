@@ -76,6 +76,18 @@ public class MonitorDataService {
         TAG_TABLE_MAP.put("soilData",   SCHEMA + "t_auto_hltgq_water_soil_data");
     }
 
+    /**
+     * 需要加载列名元数据的业务表（不含 schema 前缀，去重）：
+     * 仅 TAG_TABLE_MAP 用到的表。避免把平台 200+ 张 _bak_v 备份表一并加载，
+     * 浪费内存与启动时间（启动时 information_schema 全表扫描 248 张）。
+     */
+    private static final Set<String> REQUIRED_TABLES = new LinkedHashSet<>();
+    static {
+        for (String full : TAG_TABLE_MAP.values()) {
+            REQUIRED_TABLES.add(full.substring(full.lastIndexOf('.') + 1));
+        }
+    }
+
     /** soilData 墒情报文字段名 → soil_data 表列名 映射（M10→mten等） */
     private static final Map<String, String> SOIL_FIELD_MAP = new LinkedHashMap<>();
     static {
@@ -184,21 +196,22 @@ public class MonitorDataService {
     private final AtomicLong droppedMessageCount = new AtomicLong(0);
 
     /**
-     * 启动时从 information_schema 加载所有目标表的列名
+     * 启动时从 information_schema 加载目标业务表的列名（仅 REQUIRED_TABLES 中的 9 张）
      */
     @PostConstruct
     public void initTableColumns() {
         try {
+            String inClause = String.join(",", Collections.nCopies(REQUIRED_TABLES.size(), "?"));
             String sql = "SELECT table_name, column_name FROM information_schema.columns " +
                     "WHERE table_schema = 'qixiao-apaas' " +
-                    "AND table_name LIKE 't_auto_hltgq_water_%'";
-            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql);
+                    "AND table_name IN (" + inClause + ")";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, REQUIRED_TABLES.toArray());
             for (Map<String, Object> row : rows) {
                 String tableName = ((String) row.get("table_name")).toLowerCase();
                 String columnName = ((String) row.get("column_name")).toLowerCase();
                 tableColumnsCache.computeIfAbsent(tableName, k -> new HashSet<>()).add(columnName);
             }
-            log.info("已加载 {} 张表的列名元数据: {}", tableColumnsCache.size(), tableColumnsCache.keySet());
+            log.info("已加载 {} 张业务表的列名元数据: {}", tableColumnsCache.size(), tableColumnsCache.keySet());
         } catch (Exception e) {
             log.error("加载表列名元数据失败，INSERT将跳过列名校验（可能引发入库错误）", e);
         }

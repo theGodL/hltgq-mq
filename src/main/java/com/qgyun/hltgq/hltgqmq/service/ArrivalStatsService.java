@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>报到（通信层）：雨量站按 4 小时窗（RTU 无雨 4h 一报、有雨加密）、RabbitMQ 站按 1 小时窗、
  *       MQTT 闸站按 10 分钟窗，窗内有任何报文(msg_info 流水)即到报。</li>
  *   <li>缺测（数据层）：窗内无有效数据入库即缺测；雨量站按 4 小时窗、RabbitMQ 站按 1 小时窗、
- *       MQTT 闸站按 30 分钟窗（对齐 gate 表 30 分钟批量入库节奏）。</li>
+ *       MQTT 闸站按 30 分钟窗（gate 数据每 10 分钟上报，30 分钟窗留冗余避免抖动误判）。</li>
  *   <li>有效数据按站点类型主监测要素判定：水位 z>0、雨量 dyp>0 或有 rainInfo 报文、流量 q>=0、
  *       墒情 mten>=0、闸站 gate 有有效水位/开度；复合类型任一主要素有效即正常；无类型站点不参与缺测。</li>
  *   <li>应报/应测窗数只统计今日 0 点至当前时刻已结束的完整窗。</li>
@@ -192,6 +192,8 @@ public class ArrivalStatsService {
         List<SiteInfo> sites;
         Map<String, SiteInfo> siteById;
         List<Map<String, Object>> msgRows;
+        /** 今日接收报文行数（loadContext 聚合后释放 msgRows，避免缓存上下文长期持有全月原始行） */
+        long todayMsgCount;
         Map<String, Map<String, Set<Long>>> validByTable;
         Map<String, Map<String, Timestamp>> lastValidByTable;
         Map<String, Set<Long>> arrivalWindows;      // siteId -> 到报窗桶
@@ -369,6 +371,10 @@ public class ArrivalStatsService {
         for (Map<String, Object> row : ctx.msgRows) {
             Timestamp tm = toTimestamp(row.get("tm"));
             String siteId = String.valueOf(row.get("site"));
+            // 今日报文行数（口径与 getServiceStatus 一致：只按 tm 判定，不限站点）
+            if (tm != null && tm.getTime() >= ctx.todayStartMs) {
+                ctx.todayMsgCount++;
+            }
             if (tm == null || siteId == null || "null".equals(siteId)) continue;
             LocalDate day = tm.toLocalDateTime().toLocalDate();
             if (day.isBefore(effStartDate)) continue;
@@ -390,6 +396,8 @@ public class ArrivalStatsService {
             ctx.dailyWindows.computeIfAbsent(day, k -> new HashMap<>())
                     .computeIfAbsent(siteId, k -> new HashSet<>()).add(bucket);
         }
+        // 全月原始报文行已聚合进 arrivalWindows/dailyWindows，释放引用降低缓存上下文内存占用
+        ctx.msgRows = null;
         return ctx;
     }
 
@@ -923,13 +931,8 @@ public class ArrivalStatsService {
         }
 
         // === 今日接收/解析报文数（msg_info 行数，含 MQTT 一条 payload 按 4 站拆 4 行） ===
-        long todayRequests = 0;
-        for (Map<String, Object> row : ctx.msgRows) {
-            Timestamp tm = toTimestamp(row.get("tm"));
-            if (tm != null && tm.getTime() >= ctx.todayStartMs) {
-                todayRequests++;
-            }
-        }
+        // loadContext 已聚合，避免每次请求遍历全月报文行
+        long todayRequests = ctx.todayMsgCount;
 
         // === 今日入库行数（复用今日快照聚合结果，避免每次请求同步 8 表 COUNT 打库） ===
         DaySnapshot snap = computeDaySnapshot(ctx.today);
@@ -1475,7 +1478,7 @@ public class ArrivalStatsService {
     }
 
     /**
-     * 站点采集周期（缺测窗）长：雨量站 4h；MQTT 闸站 30min（对齐 gate 批量入库）；其余 1h。
+     * 站点采集周期（缺测窗）长：雨量站 4h；MQTT 闸站 30min（gate 每 10 分钟上报，留冗余）；其余 1h。
      */
     private long measureWinMs(SiteInfo s) {
         if (s.rain) return WINDOW_4H_MS;

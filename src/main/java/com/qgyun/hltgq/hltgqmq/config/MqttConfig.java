@@ -18,6 +18,8 @@ import org.springframework.messaging.Message;
 import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.MessageHandler;
 
+import java.util.Arrays;
+
 /**
  * MQTT 客户端配置（与 RabbitMQ 并行运行）
  */
@@ -41,6 +43,10 @@ public class MqttConfig {
     @Value("${mqtt.topics}")
     private String topics;
 
+    /** 订阅 QoS：1=至少一次（配合 cleanSession=false 可实现 Broker 侧离线消息缓存） */
+    @Value("${mqtt.qos:1}")
+    private int qos;
+
     @Value("${mqtt.auto-startup:true}")
     private boolean autoStartup;
 
@@ -57,7 +63,9 @@ public class MqttConfig {
         options.setServerURIs(new String[]{mqttUrl});
         options.setUserName(username);
         options.setPassword(password.toCharArray());
-        options.setCleanSession(true);
+        // cleanSession=false：Broker 保留会话，进程重启窗口内 QoS>=1 的消息会被缓存并在重连后补投；
+        // 前提是 client-id 必须固定（见 application.properties mqtt.client-id），否则每次重启都会新建会话造成 Broker 会话泄漏
+        options.setCleanSession(false);
         options.setConnectionTimeout(5);
         options.setKeepAliveInterval(60);
         factory.setConnectionOptions(options);
@@ -77,8 +85,12 @@ public class MqttConfig {
      */
     @Bean
     public MqttPahoMessageDrivenChannelAdapter mqttInbound() {
+        String[] topicArr = topics.split(",");
         MqttPahoMessageDrivenChannelAdapter adapter =
-                new MqttPahoMessageDrivenChannelAdapter(clientId, mqttClientFactory(), topics.split(","));
+                new MqttPahoMessageDrivenChannelAdapter(clientId, mqttClientFactory(), topicArr);
+        int[] qosArr = new int[topicArr.length];
+        Arrays.fill(qosArr, qos);
+        adapter.setQos(qosArr);
         adapter.setCompletionTimeout(5000);
         adapter.setOutputChannel(mqttInputChannel());
         adapter.setAutoStartup(autoStartup);
@@ -98,7 +110,7 @@ public class MqttConfig {
                 Object payload = message.getPayload();
                 String payloadStr = payload != null ? payload.toString() : "";
                 log.info("收到 MQTT 消息: topic={}, payload长度={}", topic, payloadStr.length());
-                // MQTT 高频数据(约5s/条)，完整报文用 debug 级别避免日志刷屏
+                // MQTT 报文(约10分钟/条)，完整报文用 debug 级别避免日志刷屏
                 log.debug("MQTT 报文: topic={}, payload={}", topic, payloadStr);
                 if (!payloadStr.isEmpty()) {
                     mqttGateDataService.process(payloadStr);
