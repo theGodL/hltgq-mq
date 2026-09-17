@@ -122,6 +122,14 @@ public class MonitorDataService {
     private static final double MAX_DAILY_RAINFALL = 5000;
     /** 核心指标时效宽限(ms)：超实测周期后再多宽限 5 分钟摇摆才置 0 */
     private static final long CORE_INDICATOR_GRACE_MS = 5 * 60 * 1000L;
+    /** 水位列失效阈值下限(ms)：2h。部分站上报节奏抖动大(实测17~188分钟不等)，滑动平均学习值
+     *  被密集段拉小后，正常空档段会被误判失效置0(实测约30%时间显示0)；
+     *  水位列(ccnhtm1)判定取 max(实测周期, 2h)+宽限 兜底 */
+    private static final long MIN_WATER_LEVEL_PERIOD_MS = 2 * 60 * 60 * 1000L;
+    /** 雨量列失效阈值下限(ms)：1h。雨量站主模式为整点报(60min)，降雨期间加密报(5min级)会把学习
+     *  周期拉小，雨停恢复整点报后出现"每小时置0一次再恢复"的锯齿(恢复期约5小时累计假0约2小时)；
+     *  下限1h使阈值不低于65分钟恰好罩住整点间隔，对常规整点报站零行为变化；雨量时效敏感不宜放宽到2h */
+    private static final long MIN_RAIN_PERIOD_MS = 60 * 60 * 1000L;
     /** 默认上报周期(ms)：1h（客户例子整点上报），实测学习前使用 */
     private static final long DEFAULT_REPORT_PERIOD_MS = 60 * 60 * 1000L;
     /** 同批报文间隔阈值(ms)：小于此间隔视为同一批次(双上报站 river/rain 同批到达毫秒差)，不参与周期学习 */
@@ -2231,13 +2239,14 @@ public class MonitorDataService {
                 if (stcd == null) {
                     continue;
                 }
-                // 两列独立判定：水位看riverInfo心跳，雨量看rainInfo心跳
+                // 两列独立判定：水位看riverInfo心跳，雨量看rainInfo心跳；
+                // 阈值各取 max(实测周期, 下限)：水位2h(防空档段误置0)，雨量1h(防降雨加密段把周期拉小后恢复期锯齿)
                 long[] hbRiver = siteReportHeartbeat.get(stcd + "|riverInfo");
                 long[] hbRain = siteReportHeartbeat.get(stcd + "|rainInfo");
-                if (isExpired(ccnhtm1, hbRiver, now)) {
+                if (isExpired(ccnhtm1, hbRiver, now, MIN_WATER_LEVEL_PERIOD_MS)) {
                     expired += expireColumn(siteId, "ccnhtm1", ccnhtm1);
                 }
-                if (isExpired(ijzsby1, hbRain, now)) {
+                if (isExpired(ijzsby1, hbRain, now, MIN_RAIN_PERIOD_MS)) {
                     expired += expireColumn(siteId, "ijzsby1", ijzsby1);
                 }
             }
@@ -2251,14 +2260,16 @@ public class MonitorDataService {
 
     /**
      * 单列是否时效失效：距该列对应tag最近心跳超过 实测周期 + 5分钟宽限 → 失效。
+     * minPeriodMs 为失效阈值下限(水位=2h/雨量=1h)：上报节奏抖动大的站学习值会被密集段拉小，
+     * 之后的正常空档段(间隔大于学习值)被误判失效——判定取 max(实测周期, 下限) 兜底。
      * 无心跳记录(服务重启后内存清空)时保守处理：仅无有效值(NULL/历史'--')的列置0，
      * 有真实值的列不动，等下一批报文重新学习。
      */
-    private static boolean isExpired(String colValue, long[] hb, long now) {
+    private static boolean isExpired(String colValue, long[] hb, long now, long minPeriodMs) {
         if (hb == null || hb[0] <= 0) {
             return isBlankOrDash(colValue);
         }
-        return now - hb[0] > hb[1] + CORE_INDICATOR_GRACE_MS;
+        return now - hb[0] > Math.max(hb[1], minPeriodMs) + CORE_INDICATOR_GRACE_MS;
     }
 
     /**
