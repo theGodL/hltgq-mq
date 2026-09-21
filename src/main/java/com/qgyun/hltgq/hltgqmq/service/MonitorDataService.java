@@ -1467,7 +1467,9 @@ public class MonitorDataService {
     }
 
     /**
-     * 计算1h水位涨幅（cm）：当前Z - 1小时前Z，写入 water_level_rise1h 字段
+     * 计算1h水位涨幅（cm）：当前Z - 1小时前Z，写入 water_level_rise1h 字段。
+     * 减法按十进制精确计算(94.10−94.02=0.08)，不做截断/舍入——
+     * 两值均为十进制2位，差即数学真值；截断浮点近似差(0.0799…被截成0.07)会系统性丢失1cm
      */
     private void computeWaterLevelRise1h(Map<String, Object> fieldMap, String stcd, Set<String> validColumns) {
         if (!isValidColumn(validColumns, "water_level_rise1h")) return;
@@ -1505,13 +1507,13 @@ public class MonitorDataService {
                     log.warn("1h涨幅计算跳过, 历史水位异常: stcd={}, prevZ={}", stcd, prevZ);
                     return;
                 }
-                double rise = zVal - prevZ;
+                double rise = subtractDecimal(zVal, prevZ);
                 // 守卫：涨幅超物理上限视为水位跳变异常，不写入（z本身照常入库）
                 if (Math.abs(rise) > MAX_HOURLY_RISE) {
                     log.warn("1h水位涨幅超物理上限, 不写入: stcd={}, rise={}", stcd, rise);
                     return;
                 }
-                fieldMap.put("water_level_rise1h", trunc2(rise));
+                fieldMap.put("water_level_rise1h", rise);
             }
         } catch (Exception e) {
             log.debug("计算1h水位涨幅失败, stcd={}: {}", stcd, e.getMessage());
@@ -1522,6 +1524,7 @@ public class MonitorDataService {
      * 计算时段降雨量（mm）：rainfall1h/3h/6h = 当前DYP − N小时前DYP
      * <p>
      * DYP 是 RTU 安装以来的累计值，永不重置，差值即为时段降雨量。
+     * 减法按十进制精确计算，不做截断/舍入（截断浮点近似差会系统性丢失0.01mm）。
      * DRP 每日 8:00 重置，不用于计算。
      */
     private void computeRainfall(Map<String, Object> fieldMap, JsonNode entity, String stcd, Set<String> validColumns) {
@@ -1539,7 +1542,7 @@ public class MonitorDataService {
         if (isValidColumn(validColumns, "rainfall1h")) {
             Double prev = queryPreviousDyp(stcd, device, 3600000, baseTm);
             if (prev != null) {
-                double diff = trunc2(currentDyp - prev);
+                double diff = subtractDecimal(currentDyp, prev);
                 if (diff >= 0) {
                     // 守卫：时段降雨超物理上限视为DYP跳变异常，不写入（dyp本身照常入库）
                     if (diff > MAX_RAINFALL_1H) {
@@ -1555,7 +1558,7 @@ public class MonitorDataService {
         if (isValidColumn(validColumns, "rainfall3h")) {
             Double prev = queryPreviousDyp(stcd, device, 3 * 3600000, baseTm);
             if (prev != null) {
-                double diff = trunc2(currentDyp - prev);
+                double diff = subtractDecimal(currentDyp, prev);
                 if (diff >= 0) {
                     if (diff > MAX_RAINFALL_3H) {
                         log.warn("rainfall3h超物理上限, 不写入: stcd={}, diff={}", stcd, diff);
@@ -1570,7 +1573,7 @@ public class MonitorDataService {
         if (isValidColumn(validColumns, "rainfall6h")) {
             Double prev = queryPreviousDyp(stcd, device, 6 * 3600000, baseTm);
             if (prev != null) {
-                double diff = trunc2(currentDyp - prev);
+                double diff = subtractDecimal(currentDyp, prev);
                 if (diff >= 0) {
                     if (diff > MAX_RAINFALL_6H) {
                         log.warn("rainfall6h超物理上限, 不写入: stcd={}, diff={}", stcd, diff);
@@ -1698,13 +1701,15 @@ public class MonitorDataService {
         return BigDecimal.valueOf(a).add(BigDecimal.valueOf(b)).doubleValue();
     }
 
-    /** 截断保留2位小数（超出直接舍弃，非四舍五入）：仅用于涨幅/时段降雨等增量入库字段 */
-    private static double trunc2(double v) {
-        return (v >= 0 ? Math.floor(v * 100.0) : Math.ceil(v * 100.0)) / 100.0;
+    /** 十进制精确减法：两个十进制值精确相减(94.10−94.02=0.08)，结果仍是精确十进制，
+     *  不做任何截断/舍入；避免截断浮点近似差(0.07999…被截成0.07)系统性丢失1cm。
+     *  BigDecimal.valueOf 取 double 的最短十进制表示(94.1→"94.1")，差值无精度损失 */
+    private static double subtractDecimal(double a, double b) {
+        return BigDecimal.valueOf(a).subtract(BigDecimal.valueOf(b)).doubleValue();
     }
 
     /** 核心指标文本列展示值：按十进制值四舍五入固定2位小数（42.589999999999996 → "42.59"、0 → "0.00"），供 ccnhtm1/ijzsby1 使用。
-     *  不能先截断(trunc2)：42.589999999999996 只是 42.59 的浮点形态，截断会把浮点尾差放大成 1cm 级显示偏差(42.58) */
+     *  不能先截断：42.589999999999996 只是 42.59 的浮点形态，截断会把浮点尾差放大成 1cm 级显示偏差(42.58) */
     private static String format2(double v) {
         return String.format(Locale.US, "%.2f", v);
     }
