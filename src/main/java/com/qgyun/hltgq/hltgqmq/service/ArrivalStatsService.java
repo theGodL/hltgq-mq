@@ -1529,7 +1529,7 @@ public class ArrivalStatsService {
         return vr;
     }
 
-    /** 站点主监测要素类型名列表（缺测明细 dataTypes 用） */
+    /** 站点主监测要素类型名列表（缺测明细 dataTypes 用）；闸站（含#4#）不输出"水位"(与 primaryTables 同口径) */
     private List<String> typeNames(SiteInfo s) {
         List<String> names = new ArrayList<>();
         if (s.mqtt) {
@@ -1539,7 +1539,7 @@ public class ArrivalStatsService {
         if (s.epjutj == null || s.epjutj.isEmpty()) {
             return names;
         }
-        if (s.epjutj.contains("#1#")) names.add("水位");
+        if (s.epjutj.contains("#1#") && !s.epjutj.contains("#4#")) names.add("水位");
         if (s.epjutj.contains("#2#")) names.add("雨量");
         if (s.epjutj.contains("#3#")) names.add("流量");
         if (s.epjutj.contains("#4#")) names.add("闸门开度");
@@ -1730,7 +1730,8 @@ public class ArrivalStatsService {
         }
     }
 
-    /** 站点主监测要素表集合（按 epjutj 类型字典映射）；无类型返回空集(不参与缺测) */
+    /** 站点主监测要素表集合（按 epjutj 类型字典映射）；无类型返回空集(不参与缺测)；
+     *  闸站（含#4#）不因 #1# 参与水位维度：其水位数据入库 gate 表(由闸门开度维度涵盖)，river_info 表无其行 */
     private Set<String> primaryTables(SiteInfo s) {
         if (s.mqtt) {
             return Collections.singleton(GATE_TABLE);
@@ -1739,7 +1740,7 @@ public class ArrivalStatsService {
             return Collections.emptySet();
         }
         Set<String> tables = new LinkedHashSet<>();
-        if (s.epjutj.contains("#1#")) tables.add(RIVER_TABLE);
+        if (s.epjutj.contains("#1#") && !s.epjutj.contains("#4#")) tables.add(RIVER_TABLE);
         if (s.epjutj.contains("#2#")) tables.add(RAIN_TABLE);
         if (s.epjutj.contains("#3#")) tables.add(WT_TABLE);
         if (s.epjutj.contains("#4#")) tables.add(GATE_TABLE);

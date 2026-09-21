@@ -32,8 +32,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * - 新增默认 status=#1#(未确认)，同一未关闭告警(content相同)不重复新增；
  * - 数据恢复正常时自动置 status=#4#(已关闭)，平台侧也可手动维护状态（自动+手动结合）；
  * - 阈值判定"放权给客户"：threshold/guarantee/num 填了才判定（>0 视为启用，空/0 不判定）；
- * - 阈值表 type 字典：#1#水位 #2#雨量 #3#流量 #4#闸门 #7#墒情（#5#视频由大华项目维护、#8#水质已接入报文但暂无阈值告警）。
- *   注意：告警表 type 与阈值表 type 是同名列、两套字典，展示层/平台查询时勿混淆。
+ * - 阈值表 zvieyb（阈值类型）字典：#1#水位 #2#雨量 #3#流量 #4#开度 #7#墒情（#5#视频由大华项目维护、#8#水质已接入报文但暂无阈值告警）。
+ *   阈值按"站点 × 指标类型"唯一（每站每类型一条，与设备无关）；旧列 type/device 已废弃不再读取。
+ *   注意：告警表 type 与阈值表 zvieyb 是两套字典，展示层/平台查询时勿混淆。
  */
 @Service
 public class AlertService {
@@ -66,7 +67,7 @@ public class AlertService {
     public static final String ALERT_TYPE_THRESHOLD = "#1#";
     public static final String ALERT_TYPE_ABNORMAL  = "#2#";
 
-    /** 阈值类型字典（type 单选，一指标一条记录） */
+    /** 阈值类型字典（zvieyb 单选，一站点一指标一条记录） */
     public static final String TYPE_WATER_LEVEL = "#1#";
     public static final String TYPE_RAINFALL    = "#2#";
     public static final String TYPE_FLOW        = "#3#";
@@ -96,6 +97,9 @@ public class AlertService {
     /** 线程安全的告警编号时间格式（SimpleDateFormat 非线程安全，多消费线程并发会错乱） */
     private static final java.time.format.DateTimeFormatter CODE_TIME_FORMATTER =
             java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
+
+    /** 阈值查询失败哨兵（区别于 null=确无配置）：评估时跳过本次判定，不新增也不关闭告警 */
+    private static final Map<String, Object> QUERY_FAILED = Collections.emptyMap();
 
     /** 阈值缓存条目（row=null 表示无配置，也缓存避免反复查库） */
     private static final class ThresholdEntry {
@@ -189,8 +193,11 @@ public class AlertService {
     /**
      * 阈值判定（仅对正常数值调用，-9991/-999 等异常值由调用方排除）：
      * 低于保证值 → #3#；高于设计值 → #4#；高于警戒值 → #3#；
-     * 数值回到正常区间 → 关闭该设备该指标的阈值类告警；
-     * 无阈值配置 → 不新增（关闭该设备该指标遗留的阈值类告警，防止配置被删除后告警悬挂）。
+     * 分级收口：同一设备同一指标同一时刻只保留当前命中级别的阈值告警——
+     * 跨级自动收回低级别告警（升破设计值收回"高于警戒值"），回落按级收回（回落警戒区间收回"高于设计值"）；
+     * 数值回到正常区间 → 关闭该设备该指标全部阈值类告警；
+     * 无阈值配置 → 不新增（关闭该设备该指标遗留的阈值类告警，防止配置被删除后告警悬挂）；
+     * 阈值查询失败 → 跳过本次评估（不新增也不关闭，避免误关遗留告警），下次上报重试。
      *
      * 告警内容不含当前值（当前值每报变化会导致去重失效、异常期间反复新增），
      * 文案只体现阈值本身："{站点}{指标}低于保证值X！"等，同阈值下异常期间仅一条告警。
@@ -198,9 +205,12 @@ public class AlertService {
     public void evaluateThreshold(String siteId, String deviceId, String typeCode,
                                   String siteName, String metric, double value, Timestamp tm) {
         if (siteId == null || deviceId == null) return;
-        Map<String, Object> th = findThreshold(siteId, deviceId, typeCode);
+        Map<String, Object> th = findThreshold(siteId, typeCode);
+        if (th == QUERY_FAILED) {
+            return; // 查询失败不等同于无配置：跳过本次评估，防止误关遗留告警
+        }
         if (th == null) {
-            closeThresholdAlerts(siteId, deviceId, siteName, metric);
+            closeThresholdAlerts(siteId, deviceId, siteName, metric, null);
             return;
         }
         Double guarantee = toDbDouble(th.get("guarantee"));
@@ -210,20 +220,23 @@ public class AlertService {
         if (isPositive(guarantee) && value < guarantee) {
             reportThresholdAlert(siteId, deviceId, siteName, metric,
                     "低于保证值" + fmt(guarantee), unitFor(typeCode), LEVEL_SEVERE, tm);
+            closeThresholdAlerts(siteId, deviceId, siteName, metric, "保证值");
             return;
         }
         if (isPositive(num) && value > num) {
             reportThresholdAlert(siteId, deviceId, siteName, metric,
                     "高于设计值" + fmt(num), unitFor(typeCode), LEVEL_CRITICAL, tm);
+            closeThresholdAlerts(siteId, deviceId, siteName, metric, "设计值");
             return;
         }
         if (isPositive(threshold) && value > threshold) {
             reportThresholdAlert(siteId, deviceId, siteName, metric,
                     "高于警戒值" + fmt(threshold), unitFor(typeCode), LEVEL_SEVERE, tm);
+            closeThresholdAlerts(siteId, deviceId, siteName, metric, "警戒值");
             return;
         }
         // 正常区间：关闭该设备该指标全部阈值类告警
-        closeThresholdAlerts(siteId, deviceId, siteName, metric);
+        closeThresholdAlerts(siteId, deviceId, siteName, metric, null);
     }
 
     private void reportThresholdAlert(String siteId, String deviceId, String siteName,
@@ -250,33 +263,43 @@ public class AlertService {
      * 关闭该设备该指标的阈值类告警。按 content 前缀(站点名+指标)限定范围：
      * 同一 RTU 设备常上报多指标（水位+雨量+流量…），仅关闭本指标告警，
      * 否则任一指标正常会把该设备其他指标的阈值告警误关（告警闪断）。
+     *
+     * keepKeyword 分级收口：传 "保证值"/"警戒值"/"设计值" 时仅关闭 content 不含该关键词的
+     * 阈值告警（跨级收回低级别、回落按级收回，保留当前级别）；传 null 全关（数值正常/配置移除）。
      */
-    private void closeThresholdAlerts(String siteId, String deviceId, String siteName, String metric) {
+    private void closeThresholdAlerts(String siteId, String deviceId, String siteName, String metric, String keepKeyword) {
         try {
             String sql = "UPDATE " + ALERT_TABLE +
                     " SET status = ?, updated_at = ?, updated_by = 'SYSTEM' " +
                     " WHERE site = ? AND device = ? AND content LIKE ? AND status IS DISTINCT FROM ? " +
-                    " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')";
-            int rows = jdbcTemplate.update(sql, STATUS_CLOSED,
-                    new Timestamp(System.currentTimeMillis()), siteId, deviceId,
-                    siteName + metric + "%", STATUS_CLOSED);
+                    " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')" +
+                    (keepKeyword != null ? " AND content NOT LIKE ?" : "");
+            List<Object> args = new ArrayList<>();
+            Collections.addAll(args, STATUS_CLOSED, new Timestamp(System.currentTimeMillis()),
+                    siteId, deviceId, siteName + metric + "%", STATUS_CLOSED);
+            if (keepKeyword != null) {
+                args.add("%" + keepKeyword + "%");
+            }
+            int rows = jdbcTemplate.update(sql, args.toArray());
             if (rows > 0) {
-                log.info("指标恢复正常, 关闭阈值告警 {} 条: site={}, device={}, metric={}", rows, siteId, deviceId, metric);
+                log.info("阈值告警分级收口, 关闭 {} 条: site={}, device={}, metric={}, keep={}", rows, siteId, deviceId, metric, keepKeyword);
             }
         } catch (Exception e) {
             log.debug("关闭阈值告警失败, site={}, device={}, metric={}: {}", siteId, deviceId, metric, e.getMessage());
         }
-        // 告警恢复 → 同步自动关闭该站该设备该指标的阈值类工单
+        // 告警收口 → 同步关闭同条件的阈值类工单（keepKeyword 与告警侧一致）
         workOrderService.closeThreshold(siteId, deviceId, siteName + metric + "%",
-                " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')");
+                " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')"
+                        + (keepKeyword != null ? " AND content NOT LIKE '%" + keepKeyword + "%'" : ""));
     }
 
     /**
-     * 查站点-设备-类型匹配的阈值配置（type 单选、一指标一条记录）：
-     * device 精确匹配优先，站级（device 为空）记录其次；5 分钟缓存。
+     * 查站点-类型匹配的阈值配置（zvieyb 单选、一站点一指标一条记录）：
+     * 阈值按"站点 × 指标类型"唯一，与设备无关（同站同指标的全部设备/测点共用一条线）；
+     * 5 分钟缓存；查询失败返回 QUERY_FAILED 且不缓存（区别于 null=确无配置）。
      */
-    private Map<String, Object> findThreshold(String siteId, String deviceId, String typeCode) {
-        String key = siteId + "|" + deviceId + "|" + typeCode;
+    private Map<String, Object> findThreshold(String siteId, String typeCode) {
+        String key = siteId + "|" + typeCode;
         ThresholdEntry cached = thresholdCache.get(key);
         if (cached != null && cached.expireAt > System.currentTimeMillis()) {
             return cached.row;
@@ -284,14 +307,14 @@ public class AlertService {
         Map<String, Object> row = null;
         try {
             String sql = "SELECT threshold, guarantee, num FROM " + THRESHOLD_TABLE +
-                    " WHERE site = ? AND type = ? AND (device = ? OR device IS NULL OR device = '') " +
-                    " ORDER BY (device = ?) DESC LIMIT 1";
-            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId, typeCode, deviceId, deviceId);
+                    " WHERE site = ? AND zvieyb = ? LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId, typeCode);
             if (!rows.isEmpty()) {
                 row = rows.get(0);
             }
         } catch (Exception e) {
-            log.debug("查询阈值配置失败, site={}, device={}, type={}: {}", siteId, deviceId, typeCode, e.getMessage());
+            log.warn("查询阈值配置失败, site={}, type={}: {}", siteId, typeCode, e.getMessage());
+            return QUERY_FAILED; // 失败结果不缓存，下次上报重试
         }
         thresholdCache.put(key, new ThresholdEntry(row, System.currentTimeMillis() + THRESHOLD_CACHE_TTL_MS));
         return row;
