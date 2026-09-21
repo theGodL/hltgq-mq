@@ -13,6 +13,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
+import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.*;
@@ -1087,7 +1088,9 @@ public class MonitorDataService {
     }
 
     /**
-     * 通用水位站基准高程修正：fieldMap 中已通过守卫的 z/z1/z2 统一加基准高程(水深→海拔)。
+     * 通用水位站基准高程修正：fieldMap 中已通过守卫的 z/z1/z2 统一加基准高程(水深→海拔)，
+     * 加法按十进制精确计算(1.87+40.72=42.59，非二进制浮点加法)，不做任何舍入，
+     * 入库值十进制形态即数学真值(42.59)，任何"取两位"展示口径显示一致。
      * 仅对有效正值加高程，-9991(通讯异常)/-999(设备不存在)保持原值不加。
      */
     private void applyWaterLevelDatum(Map<String, Object> fieldMap, String stcd) {
@@ -1099,21 +1102,21 @@ public class MonitorDataService {
         if (fieldMap.containsKey("z")) {
             Double z = toDbDouble(fieldMap.get("z"));
             if (z != null && z > 0) {
-                fieldMap.put("z", z + datum);
+                fieldMap.put("z", addDecimal(z, datum));
                 applied = true;
             }
         }
         if (fieldMap.containsKey("z1")) {
             Double z1 = toDbDouble(fieldMap.get("z1"));
             if (z1 != null && z1 > 0) {
-                fieldMap.put("z1", z1 + datum);
+                fieldMap.put("z1", addDecimal(z1, datum));
                 applied = true;
             }
         }
         if (fieldMap.containsKey("z2")) {
             Double z2 = toDbDouble(fieldMap.get("z2"));
             if (z2 != null && z2 > 0) {
-                fieldMap.put("z2", z2 + datum);
+                fieldMap.put("z2", addDecimal(z2, datum));
                 applied = true;
             }
         }
@@ -1160,13 +1163,14 @@ public class MonitorDataService {
             log.debug("riverInfo 无有效闸站水位, 跳过入库, stcd={}", stcd);
             return;
         }
-        // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正。
+        // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正，
+        // 加法按十进制精确计算(与通用水位站一致，非二进制浮点加法，不做舍入)。
         // 仅对有效正值加高程，-9991(通讯异常)保持原值不加
         double datum = getWaterLevelDatum(stcd);
         if (datum > 0) {
             boolean adjusted = false;
-            if (z1 > 0) { z1 += datum; adjusted = true; }
-            if (z2 > 0) { z2 += datum; adjusted = true; }
+            if (z1 > 0) { z1 = addDecimal(z1, datum); adjusted = true; }
+            if (z2 > 0) { z2 = addDecimal(z2, datum); adjusted = true; }
             if (adjusted) {
                 log.info("闸站水位基准高程修正: stcd={}, 高程={}m", stcd, datum);
             }
@@ -1687,12 +1691,20 @@ public class MonitorDataService {
         return null;
     }
 
-    /** 截断保留2位小数（超出直接舍弃，非四舍五入） */
+    /** 十进制精确加法：报文水位 + 基准高程按十进制值精确相加(1.87+40.72=42.59)，
+     *  不做任何舍入；避免二进制浮点加法引入表示长尾(42.589999999999996)。
+     *  BigDecimal.valueOf 取 double 的最短十进制表示(1.87→"1.87")，求和结果为数学真值 */
+    private static double addDecimal(double a, double b) {
+        return BigDecimal.valueOf(a).add(BigDecimal.valueOf(b)).doubleValue();
+    }
+
+    /** 截断保留2位小数（超出直接舍弃，非四舍五入）：仅用于涨幅/时段降雨等增量入库字段 */
     private static double trunc2(double v) {
         return (v >= 0 ? Math.floor(v * 100.0) : Math.ceil(v * 100.0)) / 100.0;
     }
 
-    /** 核心指标文本列展示值：截断后固定2位小数（如 42.47、0.00），供 ccnhtm1/ijzsby1 使用 */
+    /** 核心指标文本列展示值：按十进制值四舍五入固定2位小数（42.589999999999996 → "42.59"、0 → "0.00"），供 ccnhtm1/ijzsby1 使用。
+     *  不能先截断(trunc2)：42.589999999999996 只是 42.59 的浮点形态，截断会把浮点尾差放大成 1cm 级显示偏差(42.58) */
     private static String format2(double v) {
         return String.format(Locale.US, "%.2f", v);
     }
@@ -1998,7 +2010,7 @@ public class MonitorDataService {
 
     /**
      * 站点核心指标实时刷新：仅写文本列 ccnhtm1(核心指标-水位)/ijzsby1(核心指标-雨量)——
-     * 展示值固定截断2位小数(如 42.47、0.00)，时效失效时由 expireStaleCoreIndicators 置 '0.00'。
+     * 展示值按十进制值四舍五入2位小数(如 42.59、0.00)，时效失效时由 expireStaleCoreIndicators 置 '0.00'。
      * riverInfo 入库成功 → ccnhtm1=最新水位(修正后海拔)；rainInfo 入库成功 → ijzsby1=最新降雨(DYP增量)。
      * 双上报站(如带雨量计的水位站)两字段各写各的互不覆盖；闸站水位走 gate 表提前返回不受影响。
      * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
@@ -2006,7 +2018,7 @@ public class MonitorDataService {
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
     private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
-        String column; // 文本列：展示值(截断2位小数)，时效失效时置 '0.00'
+        String column; // 文本列：展示值(四舍五入2位小数)，时效失效时置 '0.00'
         Double value;
         if ("riverInfo".equals(tag)) {
             // 修正后入库水位(海拔)，与 river_info 表 z 列同值
@@ -2015,7 +2027,8 @@ public class MonitorDataService {
                 return;
             }
             column = "ccnhtm1";
-            value = trunc2(z);
+            // 不做截断：42.589999999999996 只是 42.59 的浮点形态，交由 format2 四舍五入为 "42.59"
+            value = z;
         } else if ("rainInfo".equals(tag)) {
             Double dyp = toDbDouble(fieldMap.get("dyp"));
             if (dyp == null || dyp <= 0) {
@@ -2035,7 +2048,8 @@ public class MonitorDataService {
                 return;
             }
             column = "ijzsby1";
-            value = trunc2(cur);
+            // 同上：DYP差值带浮点长尾时按十进制四舍五入，避免截断少 0.01
+            value = cur;
         } else {
             return;
         }
