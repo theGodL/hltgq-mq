@@ -182,6 +182,21 @@ public class MonitorDataService {
     }
 
     /**
+     * 累计雨量入库补偿（临时·写死，详见 resources/雨量入库补偿方案.md）：
+     * 坝上站(3206400007)累计雨量 DYP 因站端 9/18 灌数 +34 且设备侧暂无法复位，
+     * 报文将持续携带 +34 偏移；入库时统一叠加补偿值后再落库，保证库内 dyp 与其派生的
+     * 时段降雨(rainfall1h/3h/6h)、站点核心指标(ijzsby1)全链路口径一致。
+     * 注意：补偿只作用于 rain_info 入库值与派生计算，msg_info 留痕仍保留原始报文——
+     * 今后对照 msg_info 与 rain_info 时，坝上站 dyp 相差 -34 属预期行为，勿判为人工改数。
+     * 升级方向：结合展示端做成可配置的动态调整值（替代本写死 Map）。
+     * 撤除条件：设备复位/偏移变化后必须同步更新或撤除本配置，否则会产生反向偏差。
+     */
+    private static final Map<String, Double> RAIN_DYP_COMPENSATION = new LinkedHashMap<>();
+    static {
+        RAIN_DYP_COMPENSATION.put("3206400007", -34.0);
+    }
+
+    /**
      * 表列名缓存：表名(不含schema) -> 该表所有列名的集合
      */
     private final Map<String, Set<String>> tableColumnsCache = new HashMap<>();
@@ -608,6 +623,8 @@ public class MonitorDataService {
             if ("riverInfo".equals(tag)) {
                 computeWaterLevelRise1h(fieldMap, stcd, validColumns);
             } else if ("rainInfo".equals(tag)) {
+                // 入库补偿（临时·写死）：坝上站 DYP 先叠加补偿值，再做派生计算/入库
+                applyRainDypCompensation(stcd, entity, fieldMap);
                 computeRainfall(fieldMap, entity, stcd, validColumns);
                 // 雨量阈值判定：日雨量DRP，仅正常值参与（DRP=0今日无雨属正常工况，正常值含0）
                 Double drp = toDbDouble(fieldMap.get("drp"));
@@ -1524,6 +1541,8 @@ public class MonitorDataService {
      * 计算时段降雨量（mm）：rainfall1h/3h/6h = 当前DYP − N小时前DYP
      * <p>
      * DYP 是 RTU 安装以来的累计值，永不重置，差值即为时段降雨量。
+     * 当前DYP 取入库值 fieldMap["dyp"]（含坝上站灌数入库补偿，见 applyRainDypCompensation），
+     * 保证时段降雨与库内 dyp 同口径；历史DYP仍读库内值（同样已是补偿后口径）。
      * 减法按十进制精确计算，不做截断/舍入（截断浮点近似差会系统性丢失0.01mm）。
      * DRP 每日 8:00 重置，不用于计算。
      */
@@ -1531,7 +1550,9 @@ public class MonitorDataService {
         if (!hasValue(entity, "DYP")) return;
         // 守卫：DYP为通讯异常哨兵值(入库-9991)时不计算时段降雨，避免离奇差值
         if (isCommErrorValue(entity, "DYP")) return;
-        double currentDyp = entity.get("DYP").asDouble();
+        Double currentDypValue = toDbDouble(fieldMap.get("dyp"));
+        if (currentDypValue == null) return;
+        double currentDyp = currentDypValue;
 
         String device = fieldMap.containsKey("device") ? (String) fieldMap.get("device") : null;
 
@@ -1585,6 +1606,30 @@ public class MonitorDataService {
                 }
             }
         }
+    }
+
+    /**
+     * 累计雨量入库补偿（临时·写死，见 RAIN_DYP_COMPENSATION 常量注释）：
+     * 对配置了补偿值的站点，入库前将 DYP 叠加补偿值（坝上站灌数 +34 → 偏移 -34）后写回
+     * fieldMap["dyp"]（入库值）；时段降雨与核心指标均从 fieldMap 取值，自动同口径。
+     * 保护：补偿后 ≤0 判定为设备已复位/偏移变化，跳过补偿保留原值并告警（需人工核查并撤除写死值）。
+     */
+    private void applyRainDypCompensation(String stcd, JsonNode entity, Map<String, Object> fieldMap) {
+        Double offset = RAIN_DYP_COMPENSATION.get(stcd);
+        if (offset == null) return;
+        // 哨兵值(FFFFFFFF→-9991)与缺失值不参与补偿
+        if (!hasValue(entity, "DYP") || isCommErrorValue(entity, "DYP")) return;
+        Double dyp = toDbDouble(fieldMap.get("dyp"));
+        if (dyp == null) return;
+        // 十进制精确叠加，避免二进制浮点引入表示长尾
+        double adjusted = addDecimal(dyp, offset);
+        if (adjusted <= 0) {
+            log.warn("雨量入库补偿未应用(补偿后≤0, 疑似设备已复位, 请核查并撤除写死补偿): stcd={}, dyp={}, offset={}",
+                    stcd, dyp, offset);
+            return;
+        }
+        fieldMap.put("dyp", adjusted);
+        log.info("雨量入库补偿已应用: stcd={}, dyp {} -> {} (offset={})", stcd, dyp, adjusted, offset);
     }
 
     /**
