@@ -2195,6 +2195,8 @@ public class MonitorDataService {
      * 每天0点检查离线：直接查所有入库表，判断站点 24h 内是否有数据到达。
      * 不依赖 updated_at 代理字段，以实际入库记录为准。
      * 在线由报文驱动：任何来源收到该站报文即通过 markSiteOnline 标回在线，巡检不负责标在线。
+     * 测试站（站名含"测试"或 RTU 站号 9999 开头，与统计口径一致）不参与巡检与失联告警；
+     * 已删除站点、测试站的未关闭失联告警在巡检末尾自动清理，防止永久悬挂。
      * <p>
      * 数据源覆盖：
      * <pre>
@@ -2231,6 +2233,10 @@ public class MonitorDataService {
             String offlineBody =
                     "(s.iofhpi IS NOT NULL " +
                     "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
+                    // 测试站不参与巡检（与统计口径一致）：站名含"测试"或 RTU 站号 9999 开头，
+                    // 防止测试站产生失联告警、被删除后告警悬挂
+                    "AND (s.zzkaec IS NULL OR s.zzkaec NOT LIKE '%测试%') " +
+                    "AND (s.iofhpi IS NULL OR s.iofhpi NOT LIKE '9999%') " +
                     "AND NOT EXISTS (" +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE stcd = s.iofhpi AND tm >= ?" +
                     "  UNION ALL " +
@@ -2293,6 +2299,21 @@ public class MonitorDataService {
                     log.debug("失联告警前复核站点状态失败, 放行: {}", e.getMessage());
                 }
                 alertService.reportOffline(siteId, siteDevice, siteName, now);
+            }
+
+            // 4) 清理悬挂失联告警：未关闭失联告警的站点"已从站点表删除"或"是测试站"（不再巡检）时自动关闭。
+            // 场景：测试站清退、站点删除后无级联清理，告警永久悬挂在未关闭列表；
+            // 正常渠道站在站点表且非测试站，其未关闭告警不受影响。
+            String orphanSql = "SELECT DISTINCT a.site FROM " + SCHEMA + "t_auto_hltgq_water_alert a " +
+                    "WHERE a.content LIKE '%失联%' AND a.status IS DISTINCT FROM '#4#' AND a.site IS NOT NULL " +
+                    "AND NOT EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
+                    "  WHERE s.id = a.site " +
+                    "  AND (s.zzkaec IS NULL OR s.zzkaec NOT LIKE '%测试%') " +
+                    "  AND (s.iofhpi IS NULL OR s.iofhpi NOT LIKE '9999%'))";
+            List<String> orphanSites = jdbcTemplate.queryForList(orphanSql, String.class);
+            for (String orphanSiteId : orphanSites) {
+                log.info("清理悬挂失联告警（站点已删除或为测试站）: site={}", orphanSiteId);
+                alertService.closeOfflineAlerts(orphanSiteId);
             }
         } catch (Exception e) {
             log.error("离线站点检查失败", e);
