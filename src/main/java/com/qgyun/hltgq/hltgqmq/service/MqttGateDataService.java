@@ -192,6 +192,10 @@ public class MqttGateDataService {
                 // MQTT报文也标记站点在线
                 markSiteOnline(siteId);
 
+                // 站级挂靠1#设备随任意MQTT报文标在线（纯心跳类无标签报文亦覆盖；
+                // 1#为msg_info留痕与站级水位告警的共同挂靠设备，含首次报文创建的新设备）
+                markDeviceOnline(lookupOrCreateDevice(baseName + "1#", siteId));
+
                 // 报文监测流水：MQTT原始报文留痕(站级无stcd，msg=前缀标识，旁路写入失败不影响主流程)
                 insertMsgLog(baseName, prefix, siteId, payload, now);
 
@@ -229,6 +233,8 @@ public class MqttGateDataService {
                     if (deviceId == null) {
                         continue;
                     }
+                    // 收到报文即标记设备在线（含首次报文创建的新设备）
+                    markDeviceOnline(deviceId);
 
                     Map<String, Object> fieldMap = buildFieldMap(
                             siteId, deviceId, gateNo, fields, upZ, downZ, now);
@@ -1073,6 +1079,27 @@ public class MqttGateDataService {
             }
         } catch (Exception e) {
             log.debug("MQTT标记站点在线失败, site={}: {}", siteId, e.getMessage());
+        }
+    }
+
+    /**
+     * 收到MQTT报文即标记设备在线（条件式更新，与 MonitorDataService 同款：
+     * status 非 '#1#' 或跨天首条才写，同天重复报文 0 行，无需去重集合与每日重置；
+     * 离线巡检误标后下一条报文自动纠正）。含首次报文创建的新设备。
+     */
+    private void markDeviceOnline(String deviceId) {
+        if (deviceId == null) return;
+        try {
+            Timestamp now = new Timestamp(System.currentTimeMillis());
+            String sql = "UPDATE " + DEVICE_TABLE +
+                         " SET status = '#1#', updated_at = ?, updated_by = 'SYSTEM' " +
+                         "WHERE id = ? AND (status IS DISTINCT FROM '#1#' OR updated_at < date_trunc('day', now()))";
+            int rows = jdbcTemplate.update(sql, now, deviceId);
+            if (rows > 0) {
+                log.debug("MQTT设备标记在线: device={}", deviceId);
+            }
+        } catch (Exception e) {
+            log.debug("MQTT标记设备在线失败, device={}: {}", deviceId, e.getMessage());
         }
     }
 

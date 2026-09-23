@@ -318,6 +318,8 @@ public class MonitorDataService {
                     return;
                 }
                 fieldMap.put("device", device);
+                // 收到报文即标记设备在线：报文入库/设备创建两场景均经此维护设备 status
+                markDeviceOnline(device);
             }
             if (isValidColumn(validColumns, "stcd"))   fieldMap.put("stcd", stcd);
 
@@ -1200,6 +1202,8 @@ public class MonitorDataService {
             log.error("riverInfo→gate 设备缺失, 跳过: stcd={}", stcd);
             return;
         }
+        // 收到报文即标记设备在线（epjutj未及时更新时主缓存可能指向"待接入"，此处首闸孔设备补标）
+        markDeviceOnline(device);
         // 设备异常/恢复告警 + 水位阈值判定（闸前/闸后水位属 #1# 水位类，行业上同样有保证/警戒/设计值；
         // 判定值用基准高程修正后的入库值，与通用水位站口径一致）
         if (z1 == COMM_ERROR_INSERT_VALUE) {
@@ -1404,6 +1408,8 @@ public class MonitorDataService {
                 log.error("gatesInfo 设备缺失, 跳过闸孔{}: stcd={}, deviceName={}", i, stcd, deviceName);
                 continue;
             }
+            // 各闸孔设备(2#~N#)仅在开度路由出现，收到报文即标记在线
+            markDeviceOnline(deviceId);
             // 开度告警：哨兵值-9991→设备异常；正常值→关闭设备异常告警并做#4#闸门阈值判定；
             // -999(设备不存在)保持原值入库，不告警不判定
             String gateMetric = "闸孔" + i;
@@ -2161,6 +2167,31 @@ public class MonitorDataService {
     }
 
     /**
+     * 收到报文即标记设备在线。与站点 markSiteOnline 的内存去重集合不同，此处用条件式
+     * UPDATE 实现等效去重且天然并发安全：
+     *  - status 非 '#1#' 才写 → 首条报文标在线；离线巡检误标后下一条报文自动纠正；
+     *  - 跨天首条(updated_at < 当天0点)也刷新 updated_at，与站点"跨天刷新"语义对齐；
+     *    同天重复报文命中 0 行（主键点查，开销极小），故无需内存集合与每日重置。
+     * 设备首次报文入库时先创建再标记，即"设备创建/数据入库"两场景均维护 status。
+     * 视频设备(#5#)由大华对接项目单独维护，本项目入库链路不会触达。
+     */
+    private void markDeviceOnline(String deviceId) {
+        if (deviceId == null) return;
+        try {
+            Timestamp now = new Timestamp(System.currentTimeMillis());
+            String sql = "UPDATE " + DEVICE_TABLE +
+                         " SET status = '#1#', updated_at = ?, updated_by = 'SYSTEM' " +
+                         "WHERE id = ? AND (status IS DISTINCT FROM '#1#' OR updated_at < date_trunc('day', now()))";
+            int rows = jdbcTemplate.update(sql, now, deviceId);
+            if (rows > 0) {
+                log.debug("设备标记在线: device={}", deviceId);
+            }
+        } catch (Exception e) {
+            log.debug("标记设备在线失败, device={}: {}", deviceId, e.getMessage());
+        }
+    }
+
+    /**
      * 每天0点检查离线：直接查所有入库表，判断站点 24h 内是否有数据到达。
      * 不依赖 updated_at 代理字段，以实际入库记录为准。
      * 在线由报文驱动：任何来源收到该站报文即通过 markSiteOnline 标回在线，巡检不负责标在线。
@@ -2265,6 +2296,56 @@ public class MonitorDataService {
             }
         } catch (Exception e) {
             log.error("离线站点检查失败", e);
+        }
+    }
+
+    /**
+     * 每天0点5分检查设备离线（与站点巡检同口径、同时刻调度）：设备 24h 内无任何数据到达 → status='#2#'。
+     * 不依赖 updated_at 代理字段，以实际入库记录为准（9 张业务表按 device 列 UNION ALL，
+     * 任一表有 24h 内数据 → 在线）；pcp_info 表无 tm 列(历史结构)，以 spt 采样时间列判定。
+     * 仅遥测设备参与判定：type 不含 '#5#'（视频设备由大华对接项目单独维护，本项目不参与），
+     * type 为 null 的设备(如"待接入#"历史兜底)同样参与。
+     * 在线由报文驱动：报文入库/创建设备时即通过 markDeviceOnline 标回 '#1#'，巡检不负责标在线。
+     */
+    @Scheduled(cron = "0 5 0 * * ?")
+    public void checkOfflineDevices() {
+        try {
+            Timestamp now = new Timestamp(System.currentTimeMillis());
+            Timestamp cutoff = new Timestamp(now.getTime() - 86400000L); // 24h前
+            Set<String> pcpCols = tableColumnsCache.getOrDefault(
+                    "t_auto_hltgq_water_pcp_info", Collections.emptySet());
+            String pcpTimeCol = pcpCols.contains("tm") ? "tm" : "spt";
+            String offlineBody =
+                    "NOT EXISTS (" +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_vol_info   WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_wt_nfo     WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_river_info WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_rain_info  WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate       WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_soil_data WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_nmisp_info WHERE device = d.id AND tm >= ?" +
+                    "  UNION ALL " +
+                    "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_pcp_info   WHERE device = d.id AND " + pcpTimeCol + " >= ?" +
+                    ")";
+            String sql = "UPDATE " + DEVICE_TABLE + " d " +
+                         "SET status = '#2#', updated_at = ?, updated_by = 'SYSTEM' " +
+                         "WHERE status IS DISTINCT FROM '#2#' " +
+                         "AND (type IS NULL OR type NOT LIKE '%#5#%') AND " + offlineBody;
+            int rows = jdbcTemplate.update(sql, now,
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+            if (rows > 0) {
+                log.info("标记离线设备: {} 个", rows);
+            }
+        } catch (Exception e) {
+            log.error("离线设备检查失败", e);
         }
     }
 
