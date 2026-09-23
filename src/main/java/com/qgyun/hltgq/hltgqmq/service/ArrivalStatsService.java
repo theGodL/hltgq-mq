@@ -44,6 +44,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>有效数据按站点类型主监测要素判定：水位 z>0、雨量 dyp>0 或有 rainInfo 报文、流量 q>=0、
  *       墒情 mten>=0、闸站 gate 有有效水位/开度；复合类型任一主要素有效即正常；无类型站点不参与缺测。</li>
  *   <li>应报/应测窗数只统计今日 0 点至当前时刻已结束的完整窗。</li>
+ *   <li>无采集数据站（口径外但有设备档案的站，如视频站）：不参与窗级判定，每自然日记 1 个"判定单位"——
+ *       任一设备在线=已报到/不缺测，全部设备离线=未报到+缺测（设备状态取 COALESCE(device.status, 站点zebpsu)）；
+ *       历史日判定由日汇总表逐日（与站点行同结构，expected=1）承载，上线前无快照日按 0 单位不推算。</li>
  *   <li>本月平均到报率：从报文流水上线日（msg_info 本月最早有数据的日期）起逐日平均。</li>
  *   <li>采集状态统计按采集周期（=缺测窗）计窗；成功=有报文且有有效数据的窗（交集），
  *       保证 collected=success+failed 恒成立。</li>
@@ -172,6 +175,11 @@ public class ArrivalStatsService {
         String epjutj;
         boolean mqtt;
         boolean rain;   // 雨量站：RTU 无雨 4h 一报（有雨加密），报到/缺测窗按 4h
+        /** 是否在采集统计口径内（有stcd且有设备/本月流水，或MQTT闸站）；
+         *  false=无采集数据站（口径外但有设备档案，如视频站）：按设备在线状态记 1 个判定单位 */
+        boolean inCollect = true;
+        /** 无采集站：任一设备在线（COALESCE(NULLIF(device.status,''), 站点zebpsu) 属在线值 #1#/#1/1） */
+        boolean deviceOnline;
     }
 
     /** 单站有效窗判定结果 */
@@ -183,6 +191,8 @@ public class ArrivalStatsService {
 
     /** 统计共享上下文：一次加载供全部统计接口使用 */
     private static class StatsContext {
+        /** 本月历史日无采集站判定合计：date -> [在线站数, 站数]（读取日汇总表站点行，月均到报率叠加用） */
+        Map<LocalDate, long[]> noCollectDaily;
         LocalDate today;
         long todayStartMs;
         long monthStartMs;
@@ -212,6 +222,8 @@ public class ArrivalStatsService {
         Map<String, long[]> collectByDim = new LinkedHashMap<>();
         /** siteId -> 有效窗桶集合(按该站缺测窗长对齐)，miss-detail 区间跨日合并用 */
         Map<String, Set<Long>> validBucketsBySite = new HashMap<>();
+        /** 无采集站当日判定：siteId -> 任一设备在线（arrival/collect 单位行承载汇总落库；miss-detail 区间合并用） */
+        Map<String, Boolean> noCollectOnlineBySite = new HashMap<>();
         /** 当日接收报文行数(msg_info) */
         long msgRows;
         /** 当日入库行数(各业务表合计) */
@@ -341,12 +353,14 @@ public class ArrivalStatsService {
         ctx.effStartDate = effStartDate;
         long effStartMs = Timestamp.valueOf(effStartDate.atStartOfDay()).getTime();
 
-        // === 参与站点（离线判定同口径：有stcd且有设备或本月流水的遥测站 + 有MQTT gate数据的闸站，剔除测试站） ===
+        // === 参与站点（有设备档案的站 ∪ 原采集口径站（有stcd且有设备/本月流水，或MQTT闸站）；剔除测试站） ===
         ctx.sites = querySites(ctx.monthStartMs);
         ctx.siteById = new HashMap<>();
         for (SiteInfo s : ctx.sites) {
             ctx.siteById.put(s.id, s);
         }
+        // === 无采集站本月历史日判定（月均到报率叠加用） ===
+        ctx.noCollectDaily = loadNoCollectDaily(ctx);
 
         // === 报文流水（有效起始日至今一次查出：今日到报 + 本月逐日到报共用） ===
         ctx.msgRows = jdbcTemplate.queryForList(
@@ -527,6 +541,17 @@ public class ArrivalStatsService {
 
         // === 站点级：到报口径 + 采集口径 ===
         for (SiteInfo s : ctx.sites) {
+            if (!s.inCollect) {
+                // 无采集数据站（口径外有设备）：每站 1 个判定单位——任一设备在线=已报到/不缺测；
+                // 全部设备离线=未报到+缺测（判定值读设备表当前状态，快照落库即“当时最近已知状态”）
+                long ncArrived = s.deviceOnline ? 1 : 0;
+                snap.arrivalBySite.put(s.id, new long[]{1, ncArrived, 1 - ncArrived});
+                // 站点级采集口径四元组[应测,实采,成功,缺测]：在线视为采集成功，离线计缺测
+                snap.collectBySite.put(s.id, new long[]{1, ncArrived, ncArrived, 1 - ncArrived});
+                snap.noCollectOnlineBySite.put(s.id, s.deviceOnline);
+                snap.validBucketsBySite.put(s.id, Collections.emptySet());
+                continue;
+            }
             long win = arrivalWinMs(s);
             long expected = (ctx.nowMs - ctx.todayStartMs) / win;
             long arrived = ctx.arrivalWindows.getOrDefault(s.id, Collections.emptySet()).size();
@@ -667,6 +692,31 @@ public class ArrivalStatsService {
         List<Map<String, Object>> missedSites = new ArrayList<>();
 
         for (SiteInfo s : ctx.sites) {
+            if (!s.inCollect) {
+                // 无采集数据站：每站 1 个判定单位（任一设备在线=已报到/不缺测；全离线=未报到+缺测）
+                totalExpected += 1;
+                long ncArrived = s.deviceOnline ? 1 : 0;
+                totalArrival += ncArrived;
+                totalMeasured += 1;
+                totalMiss += 1 - ncArrived;
+                if (ncArrived == 0) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("siteId", s.id);
+                    item.put("siteName", s.name);
+                    item.put("stcd", s.stcd);
+                    noReportSites.add(item);
+
+                    Map<String, Object> missItem = new LinkedHashMap<>();
+                    missItem.put("siteId", s.id);
+                    missItem.put("siteName", s.name);
+                    missItem.put("stcd", s.stcd);
+                    missItem.put("lastValidTm", null);
+                    missItem.put("missedWindows", 1);
+                    missItem.put("missRate", 100.0);
+                    missedSites.add(missItem);
+                }
+                continue;
+            }
             long win = arrivalWinMs(s);
             int expected = (int) ((ctx.nowMs - ctx.todayStartMs) / win); // 已结束的完整窗
             totalExpected += expected;
@@ -705,7 +755,15 @@ public class ArrivalStatsService {
             }
         }
 
-        // === 本月平均到报率：从流水上线日起逐日平均 ===
+        // === 本月平均到报率：从流水上线日起逐日平均（无采集站叠加日汇总单位；上线前历史日按 0 单位不推算） ===
+        long ncTodayExpected = 0;
+        long ncTodayArrived = 0;
+        for (SiteInfo s : ctx.sites) {
+            if (!s.inCollect) {
+                ncTodayExpected++;
+                if (s.deviceOnline) ncTodayArrived++;
+            }
+        }
         double monthAvg = 0;
         if (!ctx.dailyWindows.isEmpty()) {
             double sum = 0;
@@ -717,10 +775,23 @@ public class ArrivalStatsService {
                 long arrival = 0;
                 long expected = 0;
                 for (SiteInfo s : ctx.sites) {
+                    if (!s.inCollect) continue; // 无采集站按判定单位另计（防窗长公式污染）
                     long win = arrivalWinMs(s);
                     expected += d.isBefore(ctx.today) ? DAY_MS / win : (ctx.nowMs - ctx.todayStartMs) / win;
                     Set<Long> ws = bySite.get(s.id);
                     if (ws != null) arrival += ws.size();
+                }
+                if (d.isBefore(ctx.today)) {
+                    // 历史日：取日汇总表逐日单位（无行=上线前，按 0 单位不加不减）
+                    long[] nu = ctx.noCollectDaily != null ? ctx.noCollectDaily.get(d) : null;
+                    if (nu != null) {
+                        arrival += nu[0];
+                        expected += nu[1];
+                    }
+                } else {
+                    // 今日：实时判定（设备当前状态）
+                    arrival += ncTodayArrived;
+                    expected += ncTodayExpected;
                 }
                 if (expected > 0) {
                     sum += arrival * 100.0 / expected;
@@ -738,6 +809,10 @@ public class ArrivalStatsService {
         data.put("statStartDate", ctx.effStartDate != null ? ctx.effStartDate.toString() : ctx.today.toString());
         data.put("noReportSites", noReportSites);
         data.put("missedSites", missedSites);
+        // 无采集站口径单列（便于业主分别核对“采集到报”与“设备在线”，并做回归对比）
+        data.put("videoSiteTotal", ncTodayExpected);
+        data.put("videoSiteOnline", ncTodayArrived);
+        data.put("videoSiteOffline", ncTodayExpected - ncTodayArrived);
         return data;
     }
 
@@ -752,6 +827,21 @@ public class ArrivalStatsService {
         StatsContext ctx = getContext();
         List<Map<String, Object>> list = new ArrayList<>();
         for (SiteInfo s : ctx.sites) {
+            if (!s.inCollect) {
+                // 无采集数据站：每站 1 行（设备任一在线=已报到；全离线=未报到）
+                int ncArrived = s.deviceOnline ? 1 : 0;
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("siteId", s.id);
+                item.put("siteName", s.name);
+                item.put("stcd", s.stcd);
+                item.put("msgType", "设备状态");
+                item.put("expected", 1);
+                item.put("arrived", ncArrived);
+                item.put("missed", 1 - ncArrived);
+                item.put("arrivalRate", ncArrived > 0 ? 100.0 : 0);
+                list.add(item);
+                continue;
+            }
             long win = arrivalWinMs(s);
             int expected = (int) ((ctx.nowMs - ctx.todayStartMs) / win);
             int arrived = ctx.arrivalWindows.getOrDefault(s.id, Collections.emptySet()).size();
@@ -781,8 +871,24 @@ public class ArrivalStatsService {
         StatsContext ctx = getContext();
         List<Map<String, Object>> list = new ArrayList<>();
 
-        // 最后一个已结束完整窗的起点：缺测段覆盖它即为"缺测中"，否则"已恢复"
+        // 最后一个已结束完整窗的起点：缺测段覆盖它即为“缺测中”，否则“已恢复”
         for (SiteInfo s : ctx.sites) {
+            if (!s.inCollect) {
+                // 无采集数据站：全离线=缺测（当日 1 行，缺测中）；任一在线=不产生缺测（无行）
+                if (!s.deviceOnline) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("siteId", s.id);
+                    item.put("siteName", s.name);
+                    item.put("stcd", s.stcd);
+                    item.put("startTm", new Timestamp(ctx.todayStartMs).toString());
+                    item.put("endTm", new Timestamp(ctx.nowMs).toString());
+                    item.put("missMinutes", (ctx.nowMs - ctx.todayStartMs) / 60000L);
+                    item.put("dataTypes", Collections.singletonList("设备状态"));
+                    item.put("status", "缺测中");
+                    list.add(item);
+                }
+                continue;
+            }
             ValidResult vr = computeValid(ctx, s);
             if (vr == null) continue;
             long mwin = vr.mwin;
@@ -1242,13 +1348,20 @@ public class ArrivalStatsService {
         List<Map<String, Object>> missedSites = new ArrayList<>();
 
         for (SiteInfo s : rc.sites) {
-            long expected = expectedWindows(s, rc);
-            totalExpected += expected;
             long[] arr = rc.arrivalBySite.get(s.id);
+            long expected;
+            if (s.inCollect) {
+                expected = expectedWindows(s, rc);
+            } else {
+                // 无采集站：应报单位=区间内已汇总天数(ae SUM，含今日实时叠加)；上线前无快照日按 0 单位不推算
+                expected = arr != null ? arr[0] : 0;
+            }
+            totalExpected += expected;
             long arrived = arr != null ? arr[1] : 0;
             totalArrival += arrived;
 
-            if (arrived == 0) {
+            boolean notReport = s.inCollect ? arrived == 0 : (expected > 0 && arrived == 0);
+            if (notReport) {
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("siteId", s.id);
                 item.put("siteName", s.name);
@@ -1285,6 +1398,15 @@ public class ArrivalStatsService {
         }
         rangeAvg = days > 0 ? rangeAvg / days : 0;
 
+        // 无采集站口径单列（响应构建时刻的实时设备状态；便于业主分别核对“采集到报”与“设备在线”）
+        long ncTotal = 0, ncOnline = 0;
+        for (SiteInfo s : rc.sites) {
+            if (!s.inCollect) {
+                ncTotal++;
+                if (s.deviceOnline) ncOnline++;
+            }
+        }
+
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("stationTotal", rc.sites.size());
         data.put("todayArrivalRate", round2(totalExpected > 0 ? totalArrival * 100.0 / totalExpected : 0));
@@ -1293,6 +1415,9 @@ public class ArrivalStatsService {
         data.put("statStartDate", rc.start.toString());
         data.put("noReportSites", noReportSites);
         data.put("missedSites", missedSites);
+        data.put("videoSiteTotal", ncTotal);
+        data.put("videoSiteOnline", ncOnline);
+        data.put("videoSiteOffline", ncTotal - ncOnline);
         return data;
     }
 
@@ -1301,6 +1426,23 @@ public class ArrivalStatsService {
         RangeContext rc = loadRangeContext(start, end);
         List<Map<String, Object>> list = new ArrayList<>();
         for (SiteInfo s : rc.sites) {
+            if (!s.inCollect) {
+                // 无采集数据站：expected/arrived 为区间判定单位（日汇总+今日实时），msgType=设备状态
+                long[] arr = rc.arrivalBySite.get(s.id);
+                long expected = arr != null ? arr[0] : 0;
+                long arrived = arr != null ? arr[1] : 0;
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("siteId", s.id);
+                item.put("siteName", s.name);
+                item.put("stcd", s.stcd);
+                item.put("msgType", "设备状态");
+                item.put("expected", expected);
+                item.put("arrived", arrived);
+                item.put("missed", expected - arrived);
+                item.put("arrivalRate", round2(expected > 0 ? arrived * 100.0 / expected : 0));
+                list.add(item);
+                continue;
+            }
             long expected = expectedWindows(s, rc);
             long[] arr = rc.arrivalBySite.get(s.id);
             long arrived = arr != null ? arr[1] : 0;
@@ -1340,8 +1482,34 @@ public class ArrivalStatsService {
             days.put(d, computeDaySnapshot(d));
         }
 
+        // 无采集站历史缺测日（日汇总表离线行；上线前无行=不推算）；今日实时判定另并
+        Map<String, List<LocalDate>> ncMissDays = loadNoCollectMissDays(sites, start, end, today);
+        boolean includesToday = !start.isAfter(today) && !end.isBefore(today);
+
         List<Map<String, Object>> list = new ArrayList<>();
         for (SiteInfo s : sites) {
+            if (!s.inCollect) {
+                // 无采集站：日粒度判定（每站每天 1 单位），连续离线日合并为一段（与采集站跨日合并口径一致）
+                List<LocalDate> missDays = new ArrayList<>();
+                List<LocalDate> hist = ncMissDays.get(s.id);
+                if (hist != null) missDays.addAll(hist);
+                if (includesToday && !s.deviceOnline) missDays.add(today);
+                if (missDays.isEmpty()) continue;
+                LocalDate segFirst = missDays.get(0);
+                LocalDate segLast = segFirst;
+                for (int i = 1; i < missDays.size(); i++) {
+                    LocalDate d = missDays.get(i);
+                    if (d.toEpochDay() == segLast.toEpochDay() + 1) {
+                        segLast = d;
+                    } else {
+                        addNoCollectMissRow(list, s, segFirst, segLast, rangeNowMs, today);
+                        segFirst = d;
+                        segLast = d;
+                    }
+                }
+                addNoCollectMissRow(list, s, segFirst, segLast, rangeNowMs, today);
+                continue;
+            }
             long mwin = measureWinMs(s);
             // 收集区间缺测桶（按该站缺测窗长对齐；桶起点=0点整，步进天然跨日连续）
             List<Long> missBuckets = new ArrayList<>();
@@ -1594,8 +1762,9 @@ public class ArrivalStatsService {
     private static final long SITES_TTL_MS = 60_000L;
 
     /**
-     * 查询参与统计的站点：有stcd的遥测站须"有设备档案 或 本月有报文流水"，
-     * 防止新建档从未接设备的渠道站(9000000xxx)计入应报拉低到报率；MQTT闸站有gate数据即参与；剔除测试站。
+     * 查询参与统计的站点：有设备档案的站（含无stcd的视频站等，本次改造纳入，按设备在线状态记判定单位）
+     * ∪ 原采集口径站（有stcd且有设备/本月流水，或MQTT闸站 gate 数据）；剔除测试站。
+     * 原口径标志 inCollect=false 的站不参与窗级到报/缺测窗计算。
      */
     private List<SiteInfo> querySites(long monthStartTs) {
         CacheEntry<List<SiteInfo>> e = monthSitesCache.get(monthStartTs);
@@ -1638,16 +1807,29 @@ public class ArrivalStatsService {
         });
     }
 
-    /** 实际查询站点全集（锁内单线程执行）：档案表 + 设备/流水/gate EXISTS 过滤 */
+    /** 实际查询站点全集（锁内单线程执行）：有设备档案的站 ∪ 原采集口径站（有stcd且有设备/本月流水，或 gate 数据）；
+     *  原口径条件同步输出 in_collect 标志（false=无采集数据站），设备在线按 COALESCE(NULLIF(status,''), 站点zebpsu) 判定 */
     private List<SiteInfo> doQuerySites(long monthStartTs) {
-        String sql = "SELECT s.id, s.zzkaec, s.iofhpi, s.epjutj FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
-                "WHERE (s.iofhpi IS NOT NULL AND (" +
-                "   EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_device d WHERE d.site = s.id)" +
-                "   OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info m " +
-                "        WHERE m.site = s.id AND m.tm >= ?))) " +
-                "   OR EXISTS (SELECT 1 FROM " + GATE_TABLE + " g WHERE g.site = s.id)";
+        String deviceTable = SCHEMA + "t_auto_hltgq_water_device";
+        String msgTable = SCHEMA + "t_auto_hltgq_water_msg_info";
+        // 原采集口径表达式（有stcd且(有设备或本月流水)，或 gate 有数据）：作为 in_collect 标志输出
+        String inCollect = "(s.iofhpi IS NOT NULL AND ("
+                + "   EXISTS (SELECT 1 FROM " + deviceTable + " d WHERE d.site = s.id)"
+                + "   OR EXISTS (SELECT 1 FROM " + msgTable + " m "
+                + "        WHERE m.site = s.id AND m.tm >= ?))) "
+                + "   OR EXISTS (SELECT 1 FROM " + GATE_TABLE + " g WHERE g.site = s.id)";
+        // 任一设备在线（站点 zebpsu 回退）：与 /dashboard/overview、/network-device/summary 在线判定同源
+        String deviceOnline = "EXISTS (SELECT 1 FROM " + deviceTable + " d2 WHERE d2.site = s.id "
+                + "AND COALESCE(NULLIF(d2.status, ''), s.zebpsu) IN ('#1#', '#1', '1'))";
+        String sql = "SELECT s.id, s.zzkaec, s.iofhpi, s.epjutj, (" + inCollect + ") AS in_collect,"
+                + " (" + deviceOnline + ") AS device_online FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s "
+                + "WHERE EXISTS (SELECT 1 FROM " + deviceTable + " d WHERE d.site = s.id)"
+                + "   OR (s.iofhpi IS NOT NULL AND EXISTS (SELECT 1 FROM " + msgTable + " m "
+                + "        WHERE m.site = s.id AND m.tm >= ?))"
+                + "   OR EXISTS (SELECT 1 FROM " + GATE_TABLE + " g WHERE g.site = s.id)";
+        Timestamp monthTs = new Timestamp(monthStartTs);
         List<SiteInfo> result = new ArrayList<>();
-        for (Map<String, Object> row : jdbcTemplate.queryForList(sql, new Timestamp(monthStartTs))) {
+        for (Map<String, Object> row : jdbcTemplate.queryForList(sql, monthTs, monthTs)) {
             SiteInfo s = new SiteInfo();
             s.id = String.valueOf(row.get("id"));
             s.name = row.get("zzkaec") != null ? String.valueOf(row.get("zzkaec")) : s.id;
@@ -1655,6 +1837,9 @@ public class ArrivalStatsService {
             s.epjutj = row.get("epjutj") != null ? String.valueOf(row.get("epjutj")) : null;
             s.mqtt = MQTT_SITE_NAMES.contains(s.name);
             s.rain = s.epjutj != null && s.epjutj.contains("#2#");
+            Object inc = row.get("in_collect");
+            s.inCollect = inc == null || toBool(inc); // 列缺失（旧库）时按原口径处理
+            s.deviceOnline = toBool(row.get("device_online"));
             // 剔除测试站（站名含"测试"或 stcd 为 9999 测试码段），不参与统计（与业务口径对齐）
             boolean testSite = (s.name != null && s.name.contains("测试"))
                     || (s.stcd != null && s.stcd.startsWith("9999"));
@@ -1731,8 +1916,12 @@ public class ArrivalStatsService {
     }
 
     /** 站点主监测要素表集合（按 epjutj 类型字典映射）；无类型返回空集(不参与缺测)；
-     *  闸站（含#4#）不因 #1# 参与水位维度：其水位数据入库 gate 表(由闸门开度维度涵盖)，river_info 表无其行 */
+     *  闸站（含#4#）不因 #1# 参与水位维度：其水位数据入库 gate 表(由闸门开度维度涵盖)，river_info 表无其行；
+     *  无采集站（口径外有设备，如视频站）不参与窗级采集/缺测判定，由设备在线状态记判定单位 */
     private Set<String> primaryTables(SiteInfo s) {
+        if (!s.inCollect) {
+            return Collections.emptySet();
+        }
         if (s.mqtt) {
             return Collections.singleton(GATE_TABLE);
         }
@@ -1757,6 +1946,101 @@ public class ArrivalStatsService {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** 本月历史日无采集站判定合计（date -> [在线站数, 站数]，读日汇总表站点行）；表未建/缺列时返回空（按 0 单位） */
+    private Map<LocalDate, long[]> loadNoCollectDaily(StatsContext ctx) {
+        Map<LocalDate, long[]> map = new HashMap<>();
+        List<String> ids = new ArrayList<>();
+        for (SiteInfo s : ctx.sites) {
+            if (!s.inCollect) ids.add(s.id);
+        }
+        if (ids.isEmpty()) return map;
+        try {
+            String sql = "SELECT stats_date, SUM(arrival_arrived) aa, SUM(arrival_expected) ae "
+                    + "FROM " + STATS_DAILY_TABLE
+                    + " WHERE stats_date >= ? AND stats_date < ? AND stcd IN (" + placeholders(ids.size()) + ")"
+                    + " GROUP BY stats_date";
+            List<Object> args = new ArrayList<>();
+            args.add(Timestamp.valueOf(ctx.today.withDayOfMonth(1).atStartOfDay()));
+            args.add(Timestamp.valueOf(ctx.today.atStartOfDay()));
+            args.addAll(ids);
+            for (Map<String, Object> row : jdbcTemplate.queryForList(sql, args.toArray())) {
+                LocalDate day = toLocalDate(row.get("stats_date"));
+                if (day != null) {
+                    map.put(day, new long[]{num(row.get("aa")), num(row.get("ae"))});
+                }
+            }
+        } catch (Exception e) {
+            log.warn("无采集站逐日判定查询失败(表未建或缺列), 月均按不含无采集站处理: {}", e.getMessage());
+        }
+        return map;
+    }
+
+    /** 无采集站历史缺测日批量加载（区间 miss-detail 用）：日汇总表 arrival_missed>0 行，表未建/缺列时返回空 */
+    private Map<String, List<LocalDate>> loadNoCollectMissDays(List<SiteInfo> sites, LocalDate start, LocalDate end, LocalDate today) {
+        Map<String, List<LocalDate>> map = new HashMap<>();
+        List<String> ids = new ArrayList<>();
+        for (SiteInfo s : sites) {
+            if (!s.inCollect) ids.add(s.id);
+        }
+        if (ids.isEmpty()) return map;
+        LocalDate histEnd = end.isBefore(today) ? end : today.minusDays(1);
+        if (histEnd.isBefore(start)) return map;
+        try {
+            String sql = "SELECT stcd, stats_date FROM " + STATS_DAILY_TABLE
+                    + " WHERE stats_date >= ? AND stats_date < ? AND arrival_missed > 0"
+                    + " AND stcd IN (" + placeholders(ids.size()) + ") ORDER BY stats_date";
+            List<Object> args = new ArrayList<>();
+            args.add(Timestamp.valueOf(start.atStartOfDay()));
+            args.add(Timestamp.valueOf(histEnd.plusDays(1).atStartOfDay()));
+            args.addAll(ids);
+            for (Map<String, Object> row : jdbcTemplate.queryForList(sql, args.toArray())) {
+                String sid = row.get("stcd") != null ? String.valueOf(row.get("stcd")) : null;
+                LocalDate day = toLocalDate(row.get("stats_date"));
+                if (sid != null && day != null) {
+                    map.computeIfAbsent(sid, k -> new ArrayList<>()).add(day);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("无采集站缺测日查询失败(表未建或缺列), 区间缺测明细按今日实时处理: {}", e.getMessage());
+        }
+        return map;
+    }
+
+    /** 无采集站缺测段行：段末为今日（仍离线）=缺测中且止于当前时刻；历史段止于次日0点=已恢复 */
+    private void addNoCollectMissRow(List<Map<String, Object>> list, SiteInfo s,
+                                     LocalDate segFirst, LocalDate segLast, long rangeNowMs, LocalDate today) {
+        long startMs = Timestamp.valueOf(segFirst.atStartOfDay()).getTime();
+        boolean onAir = segLast.equals(today);
+        long endMs = onAir ? rangeNowMs : Timestamp.valueOf(segLast.plusDays(1).atStartOfDay()).getTime();
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("siteId", s.id);
+        item.put("siteName", s.name);
+        item.put("stcd", s.stcd);
+        item.put("startTm", new Timestamp(startMs).toString());
+        item.put("endTm", new Timestamp(endMs).toString());
+        item.put("missMinutes", (endMs - startMs) / 60000L);
+        item.put("dataTypes", Collections.singletonList("设备状态"));
+        item.put("status", onAir ? "缺测中" : "已恢复");
+        list.add(item);
+    }
+
+    /** 生成 n 个 ? 占位符（IN 列表参数化用） */
+    private String placeholders(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(',');
+            sb.append('?');
+        }
+        return sb.toString();
+    }
+
+    /** 布尔列读取兼容（Boolean 对象或文本两态） */
+    private boolean toBool(Object v) {
+        if (v instanceof Boolean) return (Boolean) v;
+        String t = String.valueOf(v);
+        return "true".equalsIgnoreCase(t) || "t".equalsIgnoreCase(t) || "1".equals(t);
     }
 
     private double round2(double v) {
