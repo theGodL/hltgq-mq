@@ -353,6 +353,11 @@ public class MonitorDataService {
                 if ("wtInfo".equals(tag) && "tf".equals(lowerKey)) {
                     continue;
                 }
+                // nmIspInfo 的 CODCR(化学需氧量)设备方已确认不存在该指标(2026-09-24)，
+                // 不再入库；存量 codcr 历史数据保留不动
+                if ("nmIspInfo".equals(tag) && "codcr".equals(lowerKey)) {
+                    continue;
+                }
                 // spt 列是 TIMESTAMP 类型：报文 SPT 文本 "yyyy-MM-ddTHH:mm:ss" 需转 Timestamp 才能写入，
                 // 否则 JdbcTemplate 传入字符串隐式转换可能失败；转换失败跳过该列
                 if ("spt".equals(lowerKey)) {
