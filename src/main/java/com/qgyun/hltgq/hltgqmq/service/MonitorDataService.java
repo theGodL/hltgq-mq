@@ -2272,10 +2272,12 @@ public class MonitorDataService {
             }
 
             // 2) 确认仍离线的站点（UPDATE 后恢复通信的站点 zebpsu 已标回 #1#，不在此列）
-            // 含站点名与该站任一设备，供失联告警生成；无设备的站跳过告警（无设备即无数据源，仅标离线）
+            // 含站点名与该站任一遥测设备（排除视频设备 #5#：站点-设备 1:N 改造后业务站可挂视频设备，
+            // 失联语义应挂遥测设备），供失联告警生成；无设备的站跳过告警（无设备即无数据源，仅标离线）
             String confirmCond = "s.zebpsu = '#2#' AND " + offlineBody;
             String selectSql = "SELECT s.id, s.zzkaec, " +
-                    "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id LIMIT 1) AS device_id " +
+                    "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id " +
+                    "  AND (d.type IS NULL OR d.type NOT LIKE '%#5#%') LIMIT 1) AS device_id " +
                     "FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s WHERE " + confirmCond;
             List<Map<String, Object>> offlineSites = jdbcTemplate.queryForList(selectSql,
                     cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);

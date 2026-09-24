@@ -1807,14 +1807,17 @@ public class ArrivalStatsService {
         });
     }
 
-    /** 实际查询站点全集（锁内单线程执行）：有设备档案的站 ∪ 原采集口径站（有stcd且有设备/本月流水，或 gate 数据）；
+    /** 实际查询站点全集（锁内单线程执行）：有设备档案的站（含视频设备） ∪ 原采集口径站（有stcd且有遥测设备/本月流水，或 gate 数据）；
      *  原口径条件同步输出 in_collect 标志（false=无采集数据站），设备在线按 COALESCE(NULLIF(status,''), 站点zebpsu) 判定 */
     private List<SiteInfo> doQuerySites(long monthStartTs) {
         String deviceTable = SCHEMA + "t_auto_hltgq_water_device";
         String msgTable = SCHEMA + "t_auto_hltgq_water_msg_info";
-        // 原采集口径表达式（有stcd且(有设备或本月流水)，或 gate 有数据）：作为 in_collect 标志输出
+        // 原采集口径表达式（有stcd且(有遥测设备或本月流水)，或 gate 有数据）：作为 in_collect 标志输出；
+        // "有设备"排除视频设备(#5#)：站点-设备 1:N 改造后业务站可挂视频设备，视频设备不产生站码采集数据，
+        // 仅视频设备的站应按"无采集站"记设备状态判定单位（与 checkOfflineDevices 的 #5# 排除同口径）
         String inCollect = "(s.iofhpi IS NOT NULL AND ("
-                + "   EXISTS (SELECT 1 FROM " + deviceTable + " d WHERE d.site = s.id)"
+                + "   EXISTS (SELECT 1 FROM " + deviceTable + " d WHERE d.site = s.id"
+                + "           AND (d.type IS NULL OR d.type NOT LIKE '%#5#%'))"
                 + "   OR EXISTS (SELECT 1 FROM " + msgTable + " m "
                 + "        WHERE m.site = s.id AND m.tm >= ?))) "
                 + "   OR EXISTS (SELECT 1 FROM " + GATE_TABLE + " g WHERE g.site = s.id)";
