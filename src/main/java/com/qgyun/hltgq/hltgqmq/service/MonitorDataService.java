@@ -102,6 +102,28 @@ public class MonitorDataService {
         SOIL_FIELD_MAP.put("m100",  "mhundred");
     }
 
+    /** 墒情阈值判定层清单（列名 → 告警指标名）：2026-09-26 阈值细化设计按平台开放的 10/20/30cm 三层，
+     *  40~100cm 页面不展示暂不开放；指标名含层深，保证各层告警文案与去重互不干扰 */
+    private static final String[][] SOIL_THRESHOLD_LAYERS = {
+            {"mten",    "墒情10cm"},
+            {"mtwenty", "墒情20cm"},
+            {"mthirty", "墒情30cm"},
+    };
+
+    /** 水质阈值判定指标清单（列名 → 告警指标名）：2026-09-26 阈值细化设计 #8# 七项，
+     *  nmIspInfo 六项取自 nmisp_info 表同名列，水温(wt)取自 pcp_info；codcr 不在开放字典内不比对 */
+    private static final String[][] WQ_NMISP_THRESHOLD_METRICS = {
+            {"nh3n",  "氨氮"},
+            {"codmn", "高锰酸盐指数"},
+            {"bod5",  "BOD5"},
+            {"tp",    "总磷"},
+            {"tn",    "总氮"},
+            {"dox",   "溶解氧"},
+    };
+    private static final String[][] WQ_PCP_THRESHOLD_METRICS = {
+            {"wt", "水温"},
+    };
+
     /** 动态入库的系统字段（不含业务字段），用于水质类报文列名匹配自检日志 */
     private static final Set<String> SYSTEM_FIELDS = new HashSet<>(Arrays.asList(
             "id", "corp_code", "created_at", "created_by", "updated_at", "updated_by",
@@ -437,11 +459,19 @@ public class MonitorDataService {
                 } else {
                     alertService.closeDeviceError(site, deviceId, siteName, "墒情");
                 }
-                // 墒情阈值判定：表层10cm(mten)，仅正常值参与
-                Double m10 = toDbDouble(fieldMap.get("mten"));
-                if (m10 != null && m10 >= 0 && m10 <= MAX_SOIL_MOISTURE) {
-                    alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_SOIL,
-                            siteName, "墒情", m10, bizTm);
+                // 墒情阈值判定（2026-09-26 细化设计）：按平台开放的 10/20/30cm 三层逐层比对
+                // （zb=数据列名，配置了几层比几层），仅正常值参与（-999/-9991/越界已在上方剔除）；
+                // 三层合并为一次阈值查询、内存按 zb 匹配（展示层评审 #10），实时性不变
+                List<AlertService.ThresholdMetric> soilMetrics = new ArrayList<>();
+                for (String[] layer : SOIL_THRESHOLD_LAYERS) {
+                    Double mv = toDbDouble(fieldMap.get(layer[0]));
+                    if (mv != null && mv >= 0 && mv <= MAX_SOIL_MOISTURE) {
+                        soilMetrics.add(new AlertService.ThresholdMetric(layer[0], layer[1], mv));
+                    }
+                }
+                if (!soilMetrics.isEmpty()) {
+                    alertService.evaluateThresholdBatch(site, deviceId, AlertService.TYPE_SOIL,
+                            siteName, bizTm, soilMetrics);
                 }
             }
 
@@ -633,11 +663,14 @@ public class MonitorDataService {
                 // 入库补偿（临时·写死）：坝上站 DYP 先叠加补偿值，再做派生计算/入库
                 applyRainDypCompensation(stcd, entity, fieldMap);
                 computeRainfall(fieldMap, entity, stcd, validColumns);
-                // 雨量阈值判定：日雨量DRP，仅正常值参与（DRP=0今日无雨属正常工况，正常值含0）
-                Double drp = toDbDouble(fieldMap.get("drp"));
-                if (drp != null && drp >= 0) {
+                // 雨量阈值判定（2026-09-26 定稿口径）：与平台同口径（参照 StPptnRServiceImpl#calcCurrentHydroDayRain，
+                // 对外 currentHydroDayRainfall()，被 /station-metrics、/gq-daily-rainfall 等共用）；
+                // 当前降雨量 = 最新DYP − 当前水文日(08:00切分)基线DYP（基线取不晚于08:00的最后一条，含08:00整点行），
+                // 基线缺失/哨兵值不比对、负差归0、仅物理不可能跳变(>5000mm)不参与
+                Double currentRain = computeCurrentRainfall(stcd, toDbDouble(fieldMap.get("dyp")));
+                if (currentRain != null) {
                     alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_RAINFALL,
-                            siteName, "雨量", drp, bizTm);
+                            siteName, "雨量", currentRain, bizTm);
                 }
             } else if ("wtInfo".equals(tag)) {
                 computeWtAccumulations(fieldMap, stcd, validColumns);
@@ -679,6 +712,10 @@ public class MonitorDataService {
 
             jdbcTemplate.update(sql, values.toArray());
             log.info("数据入库成功: tag={}, stcd={}, table={}", tag, stcd, tableName);
+            // 水质阈值判定（2026-09-26 细化设计）：nmIspInfo 六项 + pcpInfo 水温，按 zb 逐项比对
+            if ("nmIspInfo".equals(tag) || "pcpInfo".equals(tag)) {
+                evaluateWaterQualityThresholds(tag, fieldMap, site, deviceId, siteName, bizTm);
+            }
             // 水位/雨量业务报文到达记心跳，供核心指标时效巡检学习实测上报周期
             if ("riverInfo".equals(tag) || "rainInfo".equals(tag)) {
                 recordReportHeartbeat(stcd, tag);
@@ -699,6 +736,30 @@ public class MonitorDataService {
     private boolean isWaterQualitySite(String siteId) {
         String epjutj = getSiteType(siteId);
         return epjutj != null && epjutj.contains("#8#");
+    }
+
+    /**
+     * 水质阈值判定（#8#，2026-09-26 细化设计）：按七项开放指标逐项比对
+     * （zb=数据列名，配置了几项比几项；未配置的指标不命中阈值行、静默跳过），
+     * 无效值 -999(设备不存在)/-9991(通讯异常)不参与比对；仅业务表入库成功后调用。
+     * 水温(wt)在 pcp_info，其余六项在 nmisp_info。
+     */
+    private void evaluateWaterQualityThresholds(String tag, Map<String, Object> fieldMap, String site,
+                                                String deviceId, String siteName, Timestamp bizTm) {
+        String[][] metrics = "pcpInfo".equals(tag) ? WQ_PCP_THRESHOLD_METRICS : WQ_NMISP_THRESHOLD_METRICS;
+        // 六/七项合并为一次阈值查询、内存按 zb 匹配（展示层评审 #10），实时性不变
+        List<AlertService.ThresholdMetric> batch = new ArrayList<>();
+        for (String[] metric : metrics) {
+            Object raw = fieldMap.get(metric[0]);
+            if (raw == null) continue;
+            Double v = toDbDouble(raw);
+            if (v == null || v == -999 || v == COMM_ERROR_INSERT_VALUE) continue;
+            batch.add(new AlertService.ThresholdMetric(metric[0], metric[1], v));
+        }
+        if (!batch.isEmpty()) {
+            alertService.evaluateThresholdBatch(site, deviceId, AlertService.TYPE_WATER_QUALITY,
+                    siteName, bizTm, batch);
+        }
     }
 
     /**
@@ -2075,7 +2136,7 @@ public class MonitorDataService {
      * riverInfo 入库成功 → ccnhtm1=最新水位(修正后海拔)；rainInfo 入库成功 → ijzsby1=最新降雨(DYP增量)。
      * 双上报站(如带雨量计的水位站)两字段各写各的互不覆盖；闸站水位走 gate 表提前返回不受影响。
      * 雨量口径与 site 雨量检测"当前降雨量(mm)"一致：最新DYP - 当前水文日(8:00切分)起点前基线DYP
-     * （不用报文DRP：花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
+     * （见 computeCurrentRainfall，与雨量阈值判定共用同一口径；不用报文DRP：花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
      * 仅有效值更新：哨兵值(-9991)/被剔除字段不覆盖，保留上次有效值；失败仅告警不影响入库主流程。
      */
     private void updateSiteCoreIndicator(String tag, Map<String, Object> fieldMap, String siteId, String stcd) {
@@ -2091,22 +2152,9 @@ public class MonitorDataService {
             // 不做截断：42.589999999999996 只是 42.59 的浮点形态，交由 format2 四舍五入为 "42.59"
             value = z;
         } else if ("rainInfo".equals(tag)) {
-            Double dyp = toDbDouble(fieldMap.get("dyp"));
-            if (dyp == null || dyp <= 0) {
-                return;
-            }
-            Double base = queryHydroDayBaseDyp(stcd);
-            if (base == null) {
-                return;
-            }
-            double cur = dyp - base;
-            if (cur < 0) {
-                return; // DYP回退，保留旧值
-            }
-            // 超日雨量上限视为DYP跳变异常，不覆盖保留旧值
-            if (cur > MAX_DAILY_RAINFALL) {
-                log.warn("核心指标降雨量超上限(DYP跳变), 不更新ijzsby1: stcd={}, dyp={}, base={}", stcd, dyp, base);
-                return;
+            Double cur = computeCurrentRainfall(stcd, toDbDouble(fieldMap.get("dyp")));
+            if (cur == null) {
+                return; // 无效值/哨兵基线/跳变：不覆盖，保留上次有效值（负差归0会刷新为 0.00）
             }
             column = "ijzsby1";
             // 同上：DYP差值带浮点长尾时按十进制四舍五入，避免截断少 0.01
@@ -2127,8 +2175,12 @@ public class MonitorDataService {
     }
 
     /**
-     * 当前水文日(8:00切分，8点整归当日)起点前基线DYP：rain_info 该站基线时刻前最近一条有效累计雨量。
-     * 与 site 雨量检测"当前降雨量"基线口径一致（基线随服务器当前时刻滑动）。
+     * 当前水文日(08:00切分，08:00整点归当日)基线DYP：rain_info 该站"不晚于水文日起点的最后一条"记录。
+     * 定稿口径（与平台同口径，参照 StPptnRServiceImpl#calcCurrentHydroDayRain）：
+     * 基线含 08:00 整点行（tm <= 起点）——若写成 tm < 起点，每个水文日会多算一次报文增量；
+     * 不跳过哨兵值（取值后由 computeCurrentRainfall 按"基线缺失/哨兵"统一不比对，
+     * 不再以 dyp>0 过滤导致基线跳行取更早值）；水文日起点在应用层计算传参，
+     * 避开 KingbaseES 下 CURRENT_DATE + TIME '08:00' 恒返回 0 的坑（实测不报错但比较必然失效）。
      */
     private Double queryHydroDayBaseDyp(String stcd) {
         LocalDateTime now = LocalDateTime.now();
@@ -2136,7 +2188,7 @@ public class MonitorDataService {
         LocalDateTime hydroBase = now.isBefore(today8) ? today8.minusDays(1) : today8;
         try {
             String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
-                    "WHERE stcd = ? AND dyp IS NOT NULL AND dyp > 0 AND tm < ? " +
+                    "WHERE stcd = ? AND tm <= ? " +
                     "ORDER BY tm DESC LIMIT 1";
             List<Double> rows = jdbcTemplate.queryForList(sql, Double.class, stcd, Timestamp.valueOf(hydroBase));
             if (rows != null && !rows.isEmpty() && rows.get(0) != null) {
@@ -2146,6 +2198,30 @@ public class MonitorDataService {
             log.warn("查询水文日基线DYP失败, stcd={}: {}", stcd, e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * 当前降雨量(mm，DYP增量)：最新DYP − 当前水文日(08:00切分)基线DYP。
+     * 定稿口径（与平台同口径，参照 StPptnRServiceImpl#calcCurrentHydroDayRain，
+     * 对外 currentHydroDayRainfall()，被 /station-metrics、/gq-daily-rainfall、
+     * /reservoir-rainfall、/reservoir-period-rainfall 共用）；核心指标列刷新与雨量阈值判定共用本方法。
+     * 定稿规则：DYP缺失/≤0 或基线缺失/哨兵值(base<=0) → 返回 null 不比对；
+     * 负差归 0（对齐平台，不是负值、不跳过）；仅物理不可能跳变（单次增量>5000mm）返回 null，
+     * 该跳变过滤属 mq 新增护栏（平台无此规则，单独记录依据）；
+     * 不用报文DRP（花凉亭DRP恒0、灌区站DRP每日8:00归零不可靠）。
+     */
+    private Double computeCurrentRainfall(String stcd, Double dyp) {
+        if (dyp == null || dyp <= 0) return null; // 本报文DYP无效
+        Double base = queryHydroDayBaseDyp(stcd);
+        if (base == null) return null; // 基线缺失
+        if (base <= 0) return null;    // 基线为哨兵值：定稿口径两侧哨兵均不比对
+        double cur = dyp - base;
+        if (cur < 0) cur = 0; // 负差归0：对齐平台口径（DYP回退不是负值，展示与判定同为0）
+        if (cur > MAX_DAILY_RAINFALL) {
+            log.warn("当前降雨量超上限(DYP跳变), 忽略: stcd={}, dyp={}, base={}", stcd, dyp, base);
+            return null;
+        }
+        return cur;
     }
 
     /**

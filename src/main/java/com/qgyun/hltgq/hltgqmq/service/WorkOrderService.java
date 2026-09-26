@@ -30,6 +30,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * - 三类告警（设备异常/站点失联/阈值越界）新增时同步生成工单，status=#1# 待处理；
  * - 同一 site+device+title 的未关闭工单（status 非 #3#/#4#）不重复生成，与告警去重同构；
  * - alert 字段存告警ID，形成工单↔告警精确关联（平台可按告警 type 区分工单类别，工单表无需 type）；
+ * - qjulvf 落工单类型字典（9 档，2026-09-26 展示层评审要求）：
+ *   阈值超限 → #uvxb# 应急处置；设备异常/站点失联 → #hxqm# 设备故障抢修；
  * - 告警恢复自动关闭时同步关闭对应工单（status=#3# 已关闭），形成自动闭环；
  * - org 固定存部门 ID：库上站点 → 库上防汛办，其余站点 → 库下防汛办
  *   （org 表按 code 00000003/00000004 解析 ID，启动时加载）；
@@ -51,10 +53,15 @@ public class WorkOrderService {
     private static final String ORG_UP_CODE   = "00000003";
     private static final String ORG_DOWN_CODE = "00000004";
 
-    /** 工单状态字典：#1#待处理 #2#处理中 #3#已关闭 #4#已取消；自动生成默认 #1#，自动闭环置 #3# */
-    private static final String STATUS_PENDING = "#1#";
-    private static final String STATUS_CLOSED  = "#3#";
-    private static final String STATUS_CANCELED = "#4#";
+    /** 工单状态字典：#1#待处理 #2#处理中 #3#已关闭 #4#已取消 #iizl#已逾期；自动生成默认 #1#，自动闭环置 #3# */
+    private static final String STATUS_PENDING    = "#1#";
+    private static final String STATUS_PROCESSING = "#2#";
+    private static final String STATUS_CLOSED     = "#3#";
+    private static final String STATUS_CANCELED   = "#4#";
+
+    /** 工单类型字典（qjulvf，9 档；自动生成映射见类注释），供告警侧引用 */
+    public static final String WORK_TYPE_EMERGENCY = "#uvxb#"; // 应急处置
+    public static final String WORK_TYPE_REPAIR    = "#hxqm#"; // 设备故障抢修
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -145,9 +152,11 @@ public class WorkOrderService {
     /**
      * 告警新增成功后同步生成工单（告警去重已通过，此处再做工单侧去重双保险）。
      * alert 字段存告警ID精确关联；title 由告警 content 派生（去结尾"！"），
-     * content 与告警 content 一致，关闭时按 content 匹配（与告警关闭条件同构）。
+     * content 与告警 content 一致，关闭时按 content 匹配（与告警关闭条件同构）；
+     * qjulvf 由告警侧按告警类别落字典值（阈值超限 #uvxb# / 设备异常·站点失联 #hxqm#）。
      */
-    public void createIfAbsent(String alertId, String siteId, String deviceId, String title, String content) {
+    public void createIfAbsent(String alertId, String siteId, String deviceId, String title,
+                               String content, String qjulvf) {
         if (siteId == null || title == null) return;
         if (existsUnclosed(siteId, deviceId, title)) {
             return;
@@ -156,7 +165,7 @@ public class WorkOrderService {
         if (orgId == null) {
             log.warn("工单负责部门未解析, org留空: site={}, title={}", siteId, title);
         }
-        insertWorkOrder(alertId, siteId, deviceId, title, content, orgId);
+        insertWorkOrder(alertId, siteId, deviceId, title, content, qjulvf, orgId);
     }
 
     /** 同一 site+device+title 的未关闭工单（非 #3#已关闭/#4#已取消）是否存在 */
@@ -192,8 +201,9 @@ public class WorkOrderService {
         return downOrgId;
     }
 
-    /** 工单入库：alert 存告警ID，status=#1# 待处理，user/time/result/file 留空 */
-    private void insertWorkOrder(String alertId, String siteId, String deviceId, String title, String content, String orgId) {
+    /** 工单入库：alert 存告警ID，qjulvf=类型字典值，status=#1# 待处理，user/time/result/file 留空 */
+    private void insertWorkOrder(String alertId, String siteId, String deviceId, String title,
+                                 String content, String qjulvf, String orgId) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Map<String, Object> fm = new LinkedHashMap<>();
@@ -209,6 +219,7 @@ public class WorkOrderService {
             fm.put("site",       siteId);
             if (deviceId != null) fm.put("device", deviceId);
             if (alertId != null)  fm.put("alert", alertId);
+            if (qjulvf != null)   fm.put("qjulvf", qjulvf);
             if (orgId != null)    fm.put("org", orgId);
             fm.put("status",     STATUS_PENDING);
 
@@ -228,8 +239,8 @@ public class WorkOrderService {
             }
             String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", WORK_ORDER_TABLE, cols, phs);
             jdbcTemplate.update(sql, vals.toArray());
-            log.info("告警触发自动生成工单: code={}, site={}, device={}, title={}, org={}",
-                    fm.get("code"), siteId, deviceId, title, orgId);
+            log.info("告警触发自动生成工单: code={}, site={}, device={}, title={}, qjulvf={}, org={}",
+                    fm.get("code"), siteId, deviceId, title, qjulvf, orgId);
         } catch (Exception e) {
             log.error("工单入库失败, site={}, title={}: {}", siteId, title, e.getMessage());
         }
@@ -271,7 +282,11 @@ public class WorkOrderService {
                 siteId, deviceId, prefix);
     }
 
-    /** 工单自动闭环：置 status=#3# 已关闭（告警恢复时由 AlertService 调用） */
+    /**
+     * 工单自动闭环：置 status=#3# 已关闭（告警恢复时由 AlertService 调用）。
+     * 白名单（2026-09-26 展示层评审）：仅关闭 #1#待处理/#2#处理中；
+     * #3#已关闭/#4#已取消/#iizl#已逾期一律不动，防止越权覆盖人工结果。
+     */
     private void updateClose(String whereSql, Object... params) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
@@ -279,10 +294,11 @@ public class WorkOrderService {
             vals.add(STATUS_CLOSED);
             vals.add(now);
             vals.addAll(Arrays.asList(params));
-            vals.add(STATUS_CLOSED);
+            vals.add(STATUS_PENDING);
+            vals.add(STATUS_PROCESSING);
             String sql = "UPDATE " + WORK_ORDER_TABLE +
                     " SET status = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    whereSql + " AND status IS DISTINCT FROM ?";
+                    whereSql + " AND status IN (?, ?)";
             int rows = jdbcTemplate.update(sql, vals.toArray());
             if (rows > 0) {
                 log.info("告警恢复, 自动关闭工单 {} 条", rows);
