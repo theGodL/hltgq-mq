@@ -204,19 +204,33 @@ public class MonitorDataService {
     }
 
     /**
-     * 累计雨量入库补偿（临时·写死，详见 resources/雨量入库补偿方案.md）：
-     * 坝上站(3206400007)累计雨量 DYP 因站端 9/18 灌数 +34 且设备侧暂无法复位，
-     * 报文将持续携带 +34 偏移；入库时统一叠加补偿值后再落库，保证库内 dyp 与其派生的
-     * 时段降雨(rainfall1h/3h/6h)、站点核心指标(ijzsby1)全链路口径一致。
-     * 注意：补偿只作用于 rain_info 入库值与派生计算，msg_info 留痕仍保留原始报文——
+     * 出厂兜底补偿（配置表优先，详见 监测数据删除.md §4.1 / resources/雨量入库补偿方案.md）：
+     * 坝上站(3206400007)累计雨量 DYP 因站端 9/18 灌数 +34 且设备侧暂无法复位，报文将持续携带 +34 偏移；
+     * 正常路径下补偿值来自配置表 t_auto_hltgq_water_rain_adjust（device 匹配、业主表单可维护、≤5min 生效），
+     * 本 Map 仅在"配置表从未成功读取过且本次读取失败"（如平台侧建表前的冷启动期）时兜底启用，
+     * 按 stcd 匹配（坝上站为 RabbitMQ 站，必有 stcd）。
+     * 补偿只作用于 rain_info 入库值与派生计算，msg_info 留痕仍保留原始报文——
      * 今后对照 msg_info 与 rain_info 时，坝上站 dyp 相差 -34 属预期行为，勿判为人工改数。
-     * 升级方向：结合展示端做成可配置的动态调整值（替代本写死 Map）。
-     * 撤除条件：设备复位/偏移变化后必须同步更新或撤除本配置，否则会产生反向偏差。
+     * 撤除条件：设备复位/偏移变化后必须同步更新或停用配置表对应行，否则会产生反向偏差。
      */
-    private static final Map<String, Double> RAIN_DYP_COMPENSATION = new LinkedHashMap<>();
+    private static final Map<String, Double> DEFAULT_RAIN_DYP_COMPENSATION = new LinkedHashMap<>();
     static {
-        RAIN_DYP_COMPENSATION.put("3206400007", -34.0);
+        DEFAULT_RAIN_DYP_COMPENSATION.put("3206400007", -34.0);
     }
+
+    /** 雨量补偿配置缓存：device(设备ID) → offset_value（仅 enabled=true 行）。
+     *  null=从未成功读取过；非 null（含空集）=最近一次成功读取结果（空集=无补偿，属正常业务态）。
+     *  三层 fail-safe（详见 监测数据删除.md §4.1）：①本缓存(5min TTL 刷新) ②最近成功值 ③出厂兜底 */
+    private volatile Map<String, Double> rainAdjustCache = null;
+
+    /** 补偿配置最近一次尝试读取时刻(ms)：成功/失败均刷新——失败同样退避5分钟，避免每条报文重试打日志 */
+    private volatile long rainAdjustLoadedAt = 0L;
+
+    /** 补偿配置刷新周期（表单修改≤5min自动生效，沿用 sluiceConfigCache 先例模式） */
+    private static final long RAIN_ADJUST_TTL_MS = 5 * 60 * 1000L;
+
+    /** 补偿配置刷新互斥锁 */
+    private final Object rainAdjustLock = new Object();
 
     /**
      * 表列名缓存：表名(不含schema) -> 该表所有列名的集合
@@ -258,6 +272,13 @@ public class MonitorDataService {
                 tableColumnsCache.computeIfAbsent(tableName, k -> new HashSet<>()).add(columnName);
             }
             log.info("已加载 {} 张业务表的列名元数据: {}", tableColumnsCache.size(), tableColumnsCache.keySet());
+            // 软删过滤探测（监测数据删除.md §4.2）：rain_info 存在 deleted 列时，入库前值/基线查询拼接
+            // "deleted IS NOT TRUE" 过滤软删行；缺失=平台侧尚未执行 DDL（预期），自动降级为不过滤并启动日志标注
+            if (isSoftDeleteFilterEnabled()) {
+                log.info("rain_info 软删过滤已启用(deleted 列存在): 入库前值/基线查询将跳过软删行");
+            } else {
+                log.warn("rain_info 无 deleted 列, 软删过滤降级禁用(平台侧尚未执行DDL前属预期, 软删行将参与前值/基线计算)");
+            }
         } catch (Exception e) {
             log.error("加载表列名元数据失败，INSERT将跳过列名校验（可能引发入库错误）", e);
         }
@@ -660,7 +681,7 @@ public class MonitorDataService {
             if ("riverInfo".equals(tag)) {
                 computeWaterLevelRise1h(fieldMap, stcd, validColumns);
             } else if ("rainInfo".equals(tag)) {
-                // 入库补偿（临时·写死）：坝上站 DYP 先叠加补偿值，再做派生计算/入库
+                // 入库补偿（配置表优先·三层fail-safe）：坝上站 DYP 先叠加补偿值，再做派生计算/入库
                 applyRainDypCompensation(stcd, entity, fieldMap);
                 computeRainfall(fieldMap, entity, stcd, validColumns);
                 // 雨量阈值判定（2026-09-26 定稿口径）：与平台同口径（参照 StPptnRServiceImpl#calcCurrentHydroDayRain，
@@ -771,6 +792,15 @@ public class MonitorDataService {
             return true;
         }
         return validColumns.contains(columnName);
+    }
+
+    /**
+     * rain_info 软删过滤是否启用：表存在 deleted 列（启动时由 initTableColumns 探测，见 §4.2）。
+     * 缺失=平台侧尚未执行 DDL（预期），自动降级为不过滤——软删行参与前值/基线计算（=改造前行为）。
+     */
+    private boolean isSoftDeleteFilterEnabled() {
+        Set<String> cols = tableColumnsCache.get("t_auto_hltgq_water_rain_info");
+        return cols != null && cols.contains("deleted");
     }
 
     /**
@@ -1681,13 +1711,102 @@ public class MonitorDataService {
     }
 
     /**
-     * 累计雨量入库补偿（临时·写死，见 RAIN_DYP_COMPENSATION 常量注释）：
-     * 对配置了补偿值的站点，入库前将 DYP 叠加补偿值（坝上站灌数 +34 → 偏移 -34）后写回
+     * 启动预热补偿配置缓存（三层 fail-safe 与预置自检同步执行）。
+     * 平台侧建表前的冷启动失败属预期（WARN 日志 + 出厂兜底生效），不阻塞应用启动。
+     */
+    @PostConstruct
+    public void initRainAdjustCache() {
+        loadRainAdjustCache();
+    }
+
+    /**
+     * 读取雨量补偿配置缓存（5 分钟 TTL，三层 fail-safe，详见 监测数据删除.md §4.1）：
+     * ①配置表缓存：成功读到空集=无补偿（正常业务结果，如业主已停用/删除全部配置），按空集缓存；
+     * ②最近成功值：仅当本次读取抛异常且曾成功读过时，沿用内存中上次成功结果 + WARN；
+     * ③返回 null：仅当"从未成功读过且本次失败"（冷启动+配置表不可用），由调用方回退出厂兜底，
+     *   防止配置表不可用期间坝上站裸奔入库 +34 脏数据；已成功读过空集的进程绝不回退③。
+     * 失败同样刷新读取时刻（5 分钟退避），避免每条报文都重试查库+打日志。
+     */
+    private Map<String, Double> loadRainAdjustCache() {
+        if (System.currentTimeMillis() - rainAdjustLoadedAt < RAIN_ADJUST_TTL_MS) {
+            return rainAdjustCache;
+        }
+        synchronized (rainAdjustLock) {
+            long now = System.currentTimeMillis();
+            if (now - rainAdjustLoadedAt < RAIN_ADJUST_TTL_MS) {
+                return rainAdjustCache;
+            }
+            try {
+                String sql = "SELECT device, offset_value FROM " + SCHEMA + "t_auto_hltgq_water_rain_adjust " +
+                        "WHERE enabled = true";
+                List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql);
+                Map<String, Double> loaded = new HashMap<>();
+                for (Map<String, Object> row : rows) {
+                    Object device = row.get("device");
+                    Double offset = toDbDouble(row.get("offset_value"));
+                    if (device != null && offset != null) {
+                        loaded.put(device.toString(), offset);
+                    }
+                }
+                rainAdjustCache = Collections.unmodifiableMap(loaded);
+                rainAdjustLoadedAt = now;
+                log.info("雨量补偿配置已加载: {} 条(enabled=true)", loaded.size());
+                // 预置自检（R16/R27）：防"成功读空=无补偿"把预置 INSERT 遗漏静默成坝上站裸奔
+                selfCheckDefaultRainStations();
+                return rainAdjustCache;
+            } catch (Exception e) {
+                rainAdjustLoadedAt = now; // 失败退避：5 分钟内不再重试
+                if (rainAdjustCache != null) {
+                    log.warn("雨量补偿配置读取失败, 沿用最近成功值({}条): {}", rainAdjustCache.size(), e.getMessage());
+                    return rainAdjustCache;
+                }
+                log.warn("雨量补偿配置读取失败且从未成功加载, 启用出厂兜底(坝上站-34): {}", e.getMessage());
+                return null;
+            }
+        }
+    }
+
+    /**
+     * 预置自检：对出厂兜底默认站逐一检查补偿配置表中是否存在记录（不看 enabled——
+     * 有记录但停用属正常业务态不告警），无任何记录说明预置 INSERT 可能遗漏/被误删，WARN 提醒核查。
+     */
+    private void selfCheckDefaultRainStations() {
+        try {
+            List<String> existing = jdbcTemplate.queryForList(
+                    "SELECT stcd FROM " + SCHEMA + "t_auto_hltgq_water_rain_adjust", String.class);
+            for (String stcd : DEFAULT_RAIN_DYP_COMPENSATION.keySet()) {
+                if (!existing.contains(stcd)) {
+                    log.warn("预置自检: 出厂默认站点在补偿配置表中无任何记录(疑似预置INSERT遗漏, 该站将无补偿入库): stcd={}", stcd);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("补偿配置预置自检失败(不影响主流程): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 解析本次入库应使用的雨量补偿值（三层 fail-safe，详见 监测数据删除.md §4.1）：
+     * 正常路径按 device 匹配补偿缓存（site/device 为两条链路共有锚点，MQTT 链路无 stcd 也能命中）；
+     * 仅"从未成功读取过且本次读取失败"时按 stcd 回退出厂兜底。
+     */
+    private Double resolveRainCompensationOffset(String stcd, Map<String, Object> fieldMap) {
+        Map<String, Double> cache = loadRainAdjustCache();
+        if (cache == null) {
+            return DEFAULT_RAIN_DYP_COMPENSATION.get(stcd);
+        }
+        Object device = fieldMap.get("device");
+        return device != null ? cache.get(device.toString()) : null;
+    }
+
+    /**
+     * 累计雨量入库补偿（配置表优先·三层 fail-safe，见 监测数据删除.md §4.1）：
+     * 对配置了补偿值的设备，入库前将 DYP 叠加补偿值（坝上站灌数 +34 → 偏移 -34）后写回
      * fieldMap["dyp"]（入库值）；时段降雨与核心指标均从 fieldMap 取值，自动同口径。
-     * 保护：补偿后 ≤0 判定为设备已复位/偏移变化，跳过补偿保留原值并告警（需人工核查并撤除写死值）。
+     * 补偿来源：配置表缓存(device 匹配) → 最近成功值 → 出厂兜底(stcd 匹配)。
+     * 保护：补偿后 ≤0 判定为设备已复位/偏移变化，跳过补偿保留原值并告警（需人工核查并调整配置）。
      */
     private void applyRainDypCompensation(String stcd, JsonNode entity, Map<String, Object> fieldMap) {
-        Double offset = RAIN_DYP_COMPENSATION.get(stcd);
+        Double offset = resolveRainCompensationOffset(stcd, fieldMap);
         if (offset == null) return;
         // 哨兵值(FFFFFFFF→-9991)与缺失值不参与补偿
         if (!hasValue(entity, "DYP") || isCommErrorValue(entity, "DYP")) return;
@@ -1696,7 +1815,7 @@ public class MonitorDataService {
         // 十进制精确叠加，避免二进制浮点引入表示长尾
         double adjusted = addDecimal(dyp, offset);
         if (adjusted <= 0) {
-            log.warn("雨量入库补偿未应用(补偿后≤0, 疑似设备已复位, 请核查并撤除写死补偿): stcd={}, dyp={}, offset={}",
+            log.warn("雨量入库补偿未应用(补偿后≤0, 疑似设备已复位, 请核查并调整配置表补偿值): stcd={}, dyp={}, offset={}",
                     stcd, dyp, offset);
             return;
         }
@@ -1784,16 +1903,20 @@ public class MonitorDataService {
         long lowerBoundMs = intervalMs * 2;
         Timestamp from = new Timestamp(baseTm.getTime() - lowerBoundMs);
         Timestamp to   = new Timestamp(baseTm.getTime() - intervalMs);
+        // 软删过滤（§4.2）：deleted 列存在才拼接（软删行不参与前值窗口），缺失自动降级不过滤
+        String softDel = isSoftDeleteFilterEnabled() ? " AND deleted IS NOT TRUE" : "";
         try {
             List<Double> results;
             if (device != null) {
                 String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
-                             "WHERE stcd = ? AND device = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ? " +
+                             "WHERE stcd = ? AND device = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ?" +
+                             softDel + " " +
                              "ORDER BY tm DESC LIMIT 1";
                 results = jdbcTemplate.queryForList(sql, Double.class, stcd, device, from, to);
             } else {
                 String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
-                             "WHERE stcd = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ? " +
+                             "WHERE stcd = ? AND dyp IS NOT NULL AND tm >= ? AND tm <= ?" +
+                             softDel + " " +
                              "ORDER BY tm DESC LIMIT 1";
                 results = jdbcTemplate.queryForList(sql, Double.class, stcd, from, to);
             }
@@ -2187,8 +2310,10 @@ public class MonitorDataService {
         LocalDateTime today8 = now.toLocalDate().atTime(8, 0);
         LocalDateTime hydroBase = now.isBefore(today8) ? today8.minusDays(1) : today8;
         try {
+            // 软删过滤（§4.2）：deleted 列存在才拼接（基线被软删则自动前移），缺失自动降级不过滤
+            String softDel = isSoftDeleteFilterEnabled() ? " AND deleted IS NOT TRUE" : "";
             String sql = "SELECT dyp FROM " + SCHEMA + "t_auto_hltgq_water_rain_info " +
-                    "WHERE stcd = ? AND tm <= ? " +
+                    "WHERE stcd = ? AND tm <= ?" + softDel + " " +
                     "ORDER BY tm DESC LIMIT 1";
             List<Double> rows = jdbcTemplate.queryForList(sql, Double.class, stcd, Timestamp.valueOf(hydroBase));
             if (rows != null && !rows.isEmpty() && rows.get(0) != null) {
