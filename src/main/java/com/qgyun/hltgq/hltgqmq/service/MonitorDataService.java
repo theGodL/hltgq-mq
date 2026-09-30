@@ -2421,9 +2421,11 @@ public class MonitorDataService {
      *   gate       — 闸门监测（无 stcd，仅 site 字段）
      * </pre>
      */
-    // 每天0点5分执行：等0点整的 flushToDb 先完成入库，
-    // 避免MQTT缓存(23:30~23:59收到的报文)尚未落库被误判"24h无数据"而误标离线
-    @Scheduled(cron = "0 5 0 * * ?")
+    // 每小时第5分执行：客户要求每小时执行离线检查（非仅每日0点），验收口径
+    // "不出现 24h 无数据却显示在线"。与整点错峰：MQTT flushToDb 每分钟落库一次，
+    // :05 时上一批已入库，避免最新报文尚未落库被误判"24h无数据"而误标离线
+    // （下一批落库后由 markSiteOnline 标回）
+    @Scheduled(cron = "0 5 * * * ?")
     public void checkOfflineSites() {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
@@ -2529,14 +2531,15 @@ public class MonitorDataService {
     }
 
     /**
-     * 每天0点5分检查设备离线（与站点巡检同口径、同时刻调度）：设备 24h 内无任何数据到达 → status='#2#'。
+     * 每小时第5分检查设备离线（与站点巡检同口径、同时刻调度）：非视频类设备 24h 内无任何数据到达 → status='#2#'。
      * 不依赖 updated_at 代理字段，以实际入库记录为准（9 张业务表按 device 列 UNION ALL，
      * 任一表有 24h 内数据 → 在线）；pcp_info 表无 tm 列(历史结构)，以 spt 采样时间列判定。
      * 仅遥测设备参与判定：type 不含 '#5#'（视频设备由大华对接项目单独维护，本项目不参与），
      * type 为 null 的设备(如"待接入#"历史兜底)同样参与。
      * 在线由报文驱动：报文入库/创建设备时即通过 markDeviceOnline 标回 '#1#'，巡检不负责标在线。
+     * 每小时执行：设备停报满 24h 后最迟 1 小时内标离线，满足"一天内无数据即离线"验收口径。
      */
-    @Scheduled(cron = "0 5 0 * * ?")
+    @Scheduled(cron = "0 5 * * * ?")
     public void checkOfflineDevices() {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
