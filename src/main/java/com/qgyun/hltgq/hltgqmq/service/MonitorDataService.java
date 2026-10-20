@@ -2420,11 +2420,19 @@ public class MonitorDataService {
      * MQTT (site 直接匹配 id):
      *   gate       — 闸门监测（无 stcd，仅 site 字段）
      * </pre>
+     * <p>
+     * 纯视频站点（严格口径：有 #5# 视频设备 且 不存在任何非视频设备，空类型算非视频）：
+     * zebpsu 归 hltgq-device（StationStatusSyncService 整点按视频设备 status 写入），
+     * 本项目完全跳过不写；失联告警不适用（不发、历史悬挂每小时关闭）；
+     * 跳过的站若 24h 有遥测数据在流则打 WARN 提示补设备档案。
+     * 2026-10-20 与 hltgq-device 联调定稿（device 写纯视频站，mq 写其余，写入范围互斥）。
      */
     // 每小时第5分执行：客户要求每小时执行离线检查（非仅每日0点），验收口径
     // "不出现 24h 无数据却显示在线"。与整点错峰：MQTT flushToDb 每分钟落库一次，
     // :05 时上一批已入库，避免最新报文尚未落库被误判"24h无数据"而误标离线
     // （下一批落库后由 markSiteOnline 标回）
+    // 纯视频站点（严格口径）zebpsu 归 hltgq-device 维护，本项目完全跳过不写（见 1.5）；
+    // 失联告警不适用于纯视频站（2026-10-20 与 hltgq-device 联调定稿）
     @Scheduled(cron = "0 5 * * * ?")
     public void checkOfflineSites() {
         try {
@@ -2432,20 +2440,21 @@ public class MonitorDataService {
             Timestamp cutoff = new Timestamp(now.getTime() - 86400000L); // 24h前
             // 对所有入库表做 UNION ALL：任一表有 24h 内数据 → 在线，全部无数据 → 离线
             // 仅遥测设备参与判定：有RTU站号(水位/雨量/墒情/闸站/流量/水质经RabbitMQ stcd=iofhpi入库)
-            // 或存在MQTT闸站gate数据(site=id)；视频设备由大华对接项目单独维护，
-            // 本项目不参与其在线状态管理；点位等其他无遥测数据源的设备同样不参与
+            // 或存在MQTT闸站gate数据(site=id)；点位等其他无遥测数据源的设备不参与；
+            // 视频设备(#5#)状态由大华对接项目(hltgq-device)维护，纯视频站点 zebpsu 归 device 维护，
+            // 本项目完全跳过不写（见 1.5）
             // pcp_info 表无 tm 列(历史结构)，以 spt 采样时间列作为时间判定列
             Set<String> pcpCols = tableColumnsCache.getOrDefault(
                     "t_auto_hltgq_water_pcp_info", Collections.emptySet());
             String pcpTimeCol = pcpCols.contains("tm") ? "tm" : "spt";
-            String offlineBody =
-                    "(s.iofhpi IS NOT NULL " +
-                    "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
-                    // 测试站不参与巡检（与统计口径一致）：站名含"测试"或 RTU 站号 9999 开头，
-                    // 防止测试站产生失联告警、被删除后告警悬挂
-                    "AND (s.zzkaec IS NULL OR s.zzkaec NOT LIKE '%测试%') " +
-                    "AND (s.iofhpi IS NULL OR s.iofhpi NOT LIKE '9999%') " +
-                    "AND NOT EXISTS (" +
+            // 测试站不参与巡检（与统计口径一致）：站名含"测试"或 RTU 站号 9999 开头，
+            // 防止测试站产生失联告警、被删除后告警悬挂
+            String notTestBody =
+                    "(s.zzkaec IS NULL OR s.zzkaec NOT LIKE '%测试%') " +
+                    "AND (s.iofhpi IS NULL OR s.iofhpi NOT LIKE '9999%')";
+            // 24h 数据判定：10 个数据源任一有数据 → 有数据在途
+            String noDataBody =
+                    "NOT EXISTS (" +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_msg_info   WHERE stcd = s.iofhpi AND tm >= ?" +
                     "  UNION ALL " +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_vol_info   WHERE stcd = s.iofhpi AND tm >= ?" +
@@ -2466,23 +2475,59 @@ public class MonitorDataService {
                     "  UNION ALL " +
                     "  SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_pcp_info   WHERE stcd = s.iofhpi AND " + pcpTimeCol + " >= ?" +
                     ")";
+            String offlineBody =
+                    "(s.iofhpi IS NOT NULL " +
+                    "     OR EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_gate g WHERE g.site = s.id)) " +
+                    "AND " + notTestBody +
+                    " AND " + noDataBody;
+            // 纯视频站点条件（严格口径，与 hltgq-device 查询逐字一致）：有视频设备(#5#)
+            // 且 不存在任何非视频设备——空类型/空串设备（"待接入"历史兜底）算非视频，
+            // 此类站归 mq 遥测口径（如汪元节制闸 3 视频 + 3 空类型设备）。
+            // 满足条件的站 zebpsu 由 device 维护，mq 所有流程跳过不写
+            String pureVideoCond =
+                    "EXISTS (SELECT 1 FROM " + DEVICE_TABLE + " v WHERE v.site = s.id AND v.type LIKE '%#5#%') " +
+                    "AND NOT EXISTS (SELECT 1 FROM " + DEVICE_TABLE + " d WHERE d.site = s.id " +
+                    "  AND (d.type IS NULL OR d.type NOT LIKE '%#5#%'))";
 
-            // 1) 先标离线（UPDATE 后到达的报文会通过 markSiteOnline 把 zebpsu 标回 #1#）
+            // 1) 遥测站先标离线（纯视频站跳过不写，归 device；UPDATE 后到达的报文会通过 markSiteOnline 标回 #1#）
             // 同步将核心指标文本列置0：客户要求无报文时展示0而非陈旧值，
             // 恢复在线后由下一份业务报文(riverInfo/rainInfo)重新刷新真实值
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                          "SET zebpsu = '#2#', ccnhtm1 = '0.00', ijzsby1 = '0.00', updated_at = ?, updated_by = 'SYSTEM' " +
-                         "WHERE zebpsu IS DISTINCT FROM '#2#' AND " + offlineBody;
+                         "WHERE zebpsu IS DISTINCT FROM '#2#' AND NOT (" + pureVideoCond + ") AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
                     cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
                 log.info("标记离线站点: {} 个", rows);
             }
 
-            // 2) 确认仍离线的站点（UPDATE 后恢复通信的站点 zebpsu 已标回 #1#，不在此列）
+            // 1.5) 纯视频站点（严格口径）：zebpsu 归 hltgq-device 的 StationStatusSyncService 维护
+            // （整点按视频设备 status 写入），mq 完全不写——双方写入范围互斥，避免双写振荡。
+            // mq 职责仅剩两项：
+            //  a) 失联告警不适用：不发、关闭其历史悬挂失联告警，下方告警确认流程将其排除；
+            //  b) 档案一致性看守：跳过的纯视频站若 24h 有遥测数据在流，说明设备档案缺非视频设备
+            //     （device 会按视频判离线误标有数据的站），打 WARN 并列出站点清单提示补档案
+            List<String> pureVideoIds = jdbcTemplate.queryForList(
+                    "SELECT s.id FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
+                    "WHERE " + pureVideoCond + " AND " + notTestBody, String.class);
+            for (String siteId : pureVideoIds) {
+                alertService.closeOfflineAlerts(siteId);
+            }
+            List<Map<String, Object>> pureVideoWithData = jdbcTemplate.queryForList(
+                    "SELECT s.id, s.zzkaec FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
+                    "WHERE " + pureVideoCond + " AND " + notTestBody + " AND NOT (" + noDataBody + ")",
+                    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
+            if (!pureVideoWithData.isEmpty()) {
+                log.warn("纯视频站点有遥测数据在流, 设备档案可能缺非视频设备(需补档案, 否则 device 按视频误判离线): {}",
+                        pureVideoWithData);
+            }
+            log.info("跳过纯视频站点(归 hltgq-device 维护): {} 个", pureVideoIds.size());
+
+            // 2) 确认仍离线的站点（UPDATE 后恢复通信的站点 zebpsu 已标回 #1#，不在此列；
+            // 纯视频站不参与失联告警，排除）
             // 含站点名与该站任一遥测设备（排除视频设备 #5#：站点-设备 1:N 改造后业务站可挂视频设备，
             // 失联语义应挂遥测设备），供失联告警生成；无设备的站跳过告警（无设备即无数据源，仅标离线）
-            String confirmCond = "s.zebpsu = '#2#' AND " + offlineBody;
+            String confirmCond = "s.zebpsu = '#2#' AND NOT (" + pureVideoCond + ") AND " + offlineBody;
             String selectSql = "SELECT s.id, s.zzkaec, " +
                     "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id " +
                     "  AND (d.type IS NULL OR d.type NOT LIKE '%#5#%') LIMIT 1) AS device_id " +
