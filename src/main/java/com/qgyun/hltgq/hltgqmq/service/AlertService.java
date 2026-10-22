@@ -31,7 +31,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 告警语义（审计定版；2026-09-26 按《阈值告警比对-给hltgq-mq》细化，并按展示层评审修订）：
  * - 新增默认 status=#1#(未确认)；阈值类告警按抑制窗防重复（alarm.suppress-minutes，默认 30 分钟），
  *   抑制键为「站点+类型(+指标zb)」语义（以 content 前缀=站点名+指标名 实现，与阈值数值/方向无关）；
- * - 数据恢复正常时自动置 status=#4#(已关闭)并重新计数（再超限立即告警），平台侧也可手动维护状态；
+ * - 一日内容去重（2026-10-22 客户要求）：同站点且内容完全相同的告警 24h 内只入库一次——
+ *   平台按新增告警行播报，不新增行即不重复播报。对阈值/设备异常/站点失联全部系统告警生效
+ *   （insertAlert 统一拦截）；阈值被修改导致文案变化视为新告警，正常播报；
+ * - 数据恢复正常时自动置 status=#4#(已关闭)，同日同文案再触发因一日去重不再重复播报，
+ *   平台侧也可手动维护状态；
  *   自动关闭仅限系统产生且未人工介入的行（created_by='SYSTEM' 且 status ∈ #1#/#2#，防覆盖人工态）；
  * - 阈值判定：警戒值 threshold 由设置页保证必填>0；guarantee/num/device 本期预留不启用；
  * - 阈值表读取：类型统一 COALESCE(NULLIF(zvieyb,''),type,'') 子串匹配（CONCAT 模糊，见 findThreshold）；
@@ -132,7 +136,8 @@ public class AlertService {
 
     /**
      * 设备通讯异常（哨兵值 FFFFFFFF）：新增告警，内容"{站点名}-{指标} 设备异常！"，级别 #3#。
-     * 同一未关闭告警（site+device+content）不重复新增。
+     * 同一未关闭告警（site+device+content）不重复新增；
+     * 同内容告警 24h 内只播报一次（insertAlert 统一去重，含恢复后同日再触发）。
      */
     public void reportDeviceError(String siteId, String deviceId, String siteName,
                                   String metric, Timestamp tm) {
@@ -141,9 +146,10 @@ public class AlertService {
         if (existsUnclosed(siteId, deviceId, content)) {
             return;
         }
-        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm,
-                WorkOrderService.WORK_TYPE_REPAIR);
-        log.warn("新增设备异常告警: site={}, device={}, content={}", siteId, deviceId, content);
+        if (insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm,
+                WorkOrderService.WORK_TYPE_REPAIR)) {
+            log.warn("新增设备异常告警: site={}, device={}, content={}", siteId, deviceId, content);
+        }
     }
 
     /** 设备数据恢复正常：关闭该站点-设备-指标的设备异常告警（content 精确匹配） */
@@ -160,16 +166,20 @@ public class AlertService {
 
     // ======================== 站点失联告警 ========================
 
-    /** 站点失联（24h 无入库数据）：新增告警，级别 #3#；该站已有未关闭失联告警则不重复新增 */
+    /**
+     * 站点失联（24h 无入库数据）：新增告警，级别 #3#；该站已有未关闭失联告警则不重复新增；
+     * 同内容告警 24h 内只播报一次（insertAlert 统一去重，含恢复后同日再次失联）。
+     */
     public void reportOffline(String siteId, String deviceId, String siteName, Timestamp tm) {
         if (siteId == null || deviceId == null || siteName == null) return;
         if (existsUnclosedLike(siteId, "%失联%")) {
             return;
         }
         String content = siteName + " 连续24小时未收到任何报文，疑似站点失联！";
-        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm,
-                WorkOrderService.WORK_TYPE_REPAIR);
-        log.warn("新增站点失联告警: site={}, content={}", siteId, content);
+        if (insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm,
+                WorkOrderService.WORK_TYPE_REPAIR)) {
+            log.warn("新增站点失联告警: site={}, content={}", siteId, content);
+        }
     }
 
     /** 站点恢复通信（收到报文标在线时）：关闭该站全部失联告警 */
@@ -290,9 +300,10 @@ public class AlertService {
         }
         // 无论落库成败均记录进程内时间：存储抖动导致库内不可检时由内存兜底限流（fail-closed 防风暴）
         recentThresholdAlertMemMs.put(siteId + "|" + deviceId + "|" + prefix, System.currentTimeMillis());
-        insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_THRESHOLD, tm,
-                WorkOrderService.WORK_TYPE_EMERGENCY);
-        log.warn("新增阈值告警: site={}, device={}, content={}", siteId, deviceId, content);
+        if (insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_THRESHOLD, tm,
+                WorkOrderService.WORK_TYPE_EMERGENCY)) {
+            log.warn("新增阈值告警: site={}, device={}, content={}", siteId, deviceId, content);
+        }
     }
 
     /**
@@ -300,9 +311,10 @@ public class AlertService {
      * 抑制键为「站点 + 类型(+指标 zb)」语义——以 content 前缀（站点名+指标名）实现，与阈值数值/方向无关，
      * 页面改阈值不影响持续超限的抑制连续性（文案本身含指标名、不含实时读数，各指标天然隔离）。
      * 取同站点-设备-前缀的最近一条告警：
-     * - 已由系统自动恢复关闭(updated_by=SYSTEM) → 计数已重置，再超限立即告警（放行）；
+     * - 已由系统自动恢复关闭(updated_by=SYSTEM) → 计数已重置，再超限放行
+     *   （同日同文案仍受 insertAlert 的一日内容去重约束，即恢复后同日不再重复播报，跨日恢复后立即告警）；
      * - 其余（仍告警中 / 人为处置关闭）→ 创建时间在抑制窗（alarm.suppress-minutes 分钟，≤0 按 1 兜底）
-     *   内则抑制；持续超限超过抑制窗后再次告警（提醒），人为处置后的告警窗内不重复打扰。
+     *   内则抑制；超过抑制窗后放行进 insertAlert，由 24h 同内容去重保证同文案一天最多播报一条。
      * 查询失败 → 退化为进程内最小间隔限流（展示层评审 #9：原 fail-open 在存储抖动时会告警风暴，
      * 改为按内存记录的最近告警时间在窗内抑制、超窗放行）。
      */
@@ -447,51 +459,90 @@ public class AlertService {
 
     // ======================== 基础方法 ========================
 
-    /** 新增告警行（动态列适配，status 默认 #1# 未确认，type 区分阈值超限/异常告警，time=报文测量时间；
-     *  workOrderType 落随生工单的 qjulvf 类型字典值） */
-    private void insertAlert(String siteId, String deviceId, String content, String level,
-                             String alertType, Timestamp tm, String workOrderType) {
-        try {
-            Timestamp now = new Timestamp(System.currentTimeMillis());
-            Map<String, Object> fm = new LinkedHashMap<>();
-            String alertId = IdGenerator.generate();
-            fm.put("id",         alertId);
-            fm.put("corp_code",  corpCode);
-            fm.put("created_at", now);
-            fm.put("created_by", "SYSTEM");
-            fm.put("updated_at", now);
-            fm.put("updated_by", "SYSTEM");
-            fm.put("code",       genAlertCode(now));
-            fm.put("site",       siteId);
-            fm.put("device",     deviceId);
-            fm.put("content",    content);
-            fm.put("type",       alertType);
-            fm.put("level",      level);
-            fm.put("status",     STATUS_UNCONFIRMED);
-            fm.put("time",       tm != null ? tm : now);
+    /** 插入互斥分段锁（64 段，按「站点|内容」哈希分段）：栅栏"查重→插入"两步，防双通道并发
+     * （RabbitMQ riverInfo 闸站水位与 MQTT 闸站检查对同一站产生逐字相同告警）同时通过查重后
+     * 各插一行导致重复播报（2026-10-22 评审 #1；单实例内互斥，多实例部署仍需库侧约束兜底） */
+    private static final Object[] INSERT_LOCKS = new Object[64];
+    static {
+        for (int i = 0; i < INSERT_LOCKS.length; i++) {
+            INSERT_LOCKS[i] = new Object();
+        }
+    }
 
-            StringBuilder cols = new StringBuilder();
-            StringBuilder phs = new StringBuilder();
-            List<Object> vals = new ArrayList<>();
-            for (Map.Entry<String, Object> e : fm.entrySet()) {
-                if (!alertColumns.isEmpty() && !alertColumns.contains(e.getKey().toLowerCase())) {
-                    continue; // 列不存在则跳过（动态列适配）
+    /**
+     * 新增告警行（动态列适配，status 默认 #1# 未确认，type 区分阈值超限/异常告警，time=报文测量时间；
+     * workOrderType 落随生工单的 qjulvf 类型字典值）。
+     * 一日内容去重（2026-10-22 客户要求，全部系统告警统一在此拦截）：
+     * 同站点且内容完全相同的告警最近 24h 内已入库 → 本次不新增（平台按新增告警行播报，
+     * 不新增行即不重复播报），也不生成工单；对已存在告警行/工单的恢复联动关闭不受影响。
+     * 阈值文案不含实时值：同阈值持续超限一天只播报一次；阈值修改导致文案变化视为新告警。
+     * 查重-插入经分段锁互斥防双通道并发竞态；去重查询失败放行并打 warn（fail-open，
+     * 阈值链路另有进程内限流兜底防风暴）。
+     *
+     * @return true=已新增并生成工单；false=被一日去重拦截或入库失败
+     */
+    private boolean insertAlert(String siteId, String deviceId, String content, String level,
+                                String alertType, Timestamp tm, String workOrderType) {
+        Object lock = INSERT_LOCKS[Math.floorMod((siteId + "|" + content).hashCode(), INSERT_LOCKS.length)];
+        synchronized (lock) {
+            // 一日内容去重：同站点 + 同内容 24h 内只播报一次（status 不限：恢复后同日再触发同样抑制）；
+            // 存在性判断用 LIMIT 1 不必计数（(site, content, created_at) 索引由 DBA 侧确认）
+            try {
+                List<Map<String, Object>> dup = jdbcTemplate.queryForList(
+                        "SELECT 1 FROM " + ALERT_TABLE +
+                        " WHERE site = ? AND content = ? AND created_at >= ? LIMIT 1",
+                        siteId, content, new Timestamp(System.currentTimeMillis() - 86400000L));
+                if (!dup.isEmpty()) {
+                    log.debug("告警内容一日内重复, 不再重复播报: site={}, content={}", siteId, content);
+                    return false;
                 }
-                if (cols.length() > 0) { cols.append(", "); phs.append(", "); }
-                // level/type 为 SQL 保留字或方言关键字，需加双引号（其余列名与库内小写列名一致，无需引号）
-                String col = ("level".equalsIgnoreCase(e.getKey()) || "type".equalsIgnoreCase(e.getKey()))
-                        ? "\"" + e.getKey() + "\"" : e.getKey();
-                cols.append(col);
-                phs.append("?");
-                vals.add(e.getValue());
+            } catch (Exception e) {
+                log.warn("告警一日去重检查失败, 放行: {}", e.getMessage());
             }
-            String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", ALERT_TABLE, cols, phs);
-            jdbcTemplate.update(sql, vals.toArray());
-            // 告警新增成功 → 自动生成工单（alert 字段存告警ID形成精确关联，qjulvf 落工单类型字典）
-            workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveWorkOrderTitle(content),
-                    content, workOrderType);
-        } catch (Exception e) {
-            log.error("告警入库失败, site={}, device={}, content={}: {}", siteId, deviceId, content, e.getMessage());
+            try {
+                Timestamp now = new Timestamp(System.currentTimeMillis());
+                Map<String, Object> fm = new LinkedHashMap<>();
+                String alertId = IdGenerator.generate();
+                fm.put("id",         alertId);
+                fm.put("corp_code",  corpCode);
+                fm.put("created_at", now);
+                fm.put("created_by", "SYSTEM");
+                fm.put("updated_at", now);
+                fm.put("updated_by", "SYSTEM");
+                fm.put("code",       genAlertCode(now));
+                fm.put("site",       siteId);
+                fm.put("device",     deviceId);
+                fm.put("content",    content);
+                fm.put("type",       alertType);
+                fm.put("level",      level);
+                fm.put("status",     STATUS_UNCONFIRMED);
+                fm.put("time",       tm != null ? tm : now);
+
+                StringBuilder cols = new StringBuilder();
+                StringBuilder phs = new StringBuilder();
+                List<Object> vals = new ArrayList<>();
+                for (Map.Entry<String, Object> e : fm.entrySet()) {
+                    if (!alertColumns.isEmpty() && !alertColumns.contains(e.getKey().toLowerCase())) {
+                        continue; // 列不存在则跳过（动态列适配）
+                    }
+                    if (cols.length() > 0) { cols.append(", "); phs.append(", "); }
+                    // level/type 为 SQL 保留字或方言关键字，需加双引号（其余列名与库内小写列名一致，无需引号）
+                    String col = ("level".equalsIgnoreCase(e.getKey()) || "type".equalsIgnoreCase(e.getKey()))
+                            ? "\"" + e.getKey() + "\"" : e.getKey();
+                    cols.append(col);
+                    phs.append("?");
+                    vals.add(e.getValue());
+                }
+                String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", ALERT_TABLE, cols, phs);
+                jdbcTemplate.update(sql, vals.toArray());
+                // 告警新增成功 → 自动生成工单（alert 字段存告警ID形成精确关联，qjulvf 落工单类型字典）
+                workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveWorkOrderTitle(content),
+                        content, workOrderType);
+                return true;
+            } catch (Exception e) {
+                log.error("告警入库失败, site={}, device={}, content={}: {}", siteId, deviceId, content, e.getMessage());
+                return false;
+            }
         }
     }
 
