@@ -1028,8 +1028,9 @@ public class MqttGateDataService {
             alertService.reportDeviceError(siteId, deviceId, siteName, metric, tm);
         } else if (open != null && open >= 0) {
             alertService.closeDeviceError(siteId, deviceId, siteName, metric);
+            // zb 传空串=通用指标行
             alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_GATE,
-                    siteName, metric, open, tm);
+                    siteName, metric, "", open, tm);
         }
     }
 
@@ -1037,6 +1038,8 @@ public class MqttGateDataService {
      * MQTT 站级水位(闸前/闸后)告警挂接：独立于闸孔循环执行一次（不依赖 1 号孔开度数据是否存在），
      * 挂靠 1 号孔设备。哨兵值-9991→设备异常告警；正常值→关闭设备异常告警并做 #1# 水位阈值判定
      * （按入库值判定，MQTT 无基准高程修正，口径为原始值）。
+     * 2026-10-26 改造：显式传 zb=up_z/down_z，阈值表闸站按闸前/闸后分行配置，
+     * 不传指标会匹配不到各自的行导致告警失效。
      */
     private void checkStationWaterLevelAlerts(String siteId, String deviceId, String siteName,
                                               Map<String, Object> fieldMap, Timestamp tm) {
@@ -1046,7 +1049,7 @@ public class MqttGateDataService {
         } else if (upZ != null && upZ > 0) {
             alertService.closeDeviceError(siteId, deviceId, siteName, "闸前水位");
             alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_WATER_LEVEL,
-                    siteName, "闸前水位", upZ, tm);
+                    siteName, "闸前水位", "up_z", upZ, tm);
         }
         Double downZ = toDouble(fieldMap.get("down_z"));
         if (downZ != null && downZ == COMM_ERROR_INSERT_VALUE) {
@@ -1054,7 +1057,7 @@ public class MqttGateDataService {
         } else if (downZ != null && downZ > 0) {
             alertService.closeDeviceError(siteId, deviceId, siteName, "闸后水位");
             alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_WATER_LEVEL,
-                    siteName, "闸后水位", downZ, tm);
+                    siteName, "闸后水位", "down_z", downZ, tm);
         }
     }
 

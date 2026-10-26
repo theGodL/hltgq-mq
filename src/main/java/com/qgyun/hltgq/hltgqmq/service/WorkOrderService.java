@@ -265,10 +265,9 @@ public class WorkOrderService {
 
     // ======================== 告警恢复联动关闭 ========================
 
-    /** 设备异常恢复：按 content 精确匹配关闭工单（与告警 closeByContent 同条件） */
-    public void closeByContent(String siteId, String deviceId, String content) {
-        updateClose(" WHERE site = ? AND device IS NOT DISTINCT FROM ? AND content = ?",
-                siteId, deviceId, content);
+    /** 设备异常恢复：按 content 精确匹配关闭工单（与告警 closeByContent 同条件，不限定 device，2026-10-26 #B4） */
+    public void closeByContent(String siteId, String content) {
+        updateClose(" WHERE site = ? AND content = ?", siteId, content);
     }
 
     /** 站点恢复通信：关闭该站失联类工单（content LIKE pattern） */
@@ -276,10 +275,9 @@ public class WorkOrderService {
         updateClose(" WHERE site = ? AND content LIKE ?", siteId, pattern);
     }
 
-    /** 指标恢复正常：关闭该站该设备该指标的阈值类工单（与告警 closeThresholdAlerts 同条件） */
-    public void closeThreshold(String siteId, String deviceId, String prefix, String extraCond) {
-        updateClose(" WHERE site = ? AND device IS NOT DISTINCT FROM ? AND content LIKE ? " + extraCond,
-                siteId, deviceId, prefix);
+    /** 指标恢复正常：关闭该站该指标的阈值类工单（与告警 closeThresholdAlerts 同条件，不限定 device，2026-10-26 #B4） */
+    public void closeThreshold(String siteId, String prefix, String extraCond) {
+        updateClose(" WHERE site = ? AND content LIKE ? " + extraCond, siteId, prefix);
     }
 
     /**

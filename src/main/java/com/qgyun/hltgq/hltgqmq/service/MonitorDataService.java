@@ -60,6 +60,12 @@ public class MonitorDataService {
     @Value("${app.corp-code:hltgq}")
     private String corpCode;
 
+    /** 设备按传感器拆分开关（app.device-split-enabled，默认 false=旧逻辑按 stcd 单设备；
+     *  true=按报文 tag 写对应传感器设备。2026-10-26 设备拆分改造（设备拆分与闸门水位阈值改造.md），
+     *  回滚置回 false 即可，已写入的新设备数据不回退） */
+    @Value("${app.device-split-enabled:false}")
+    private boolean deviceSplitEnabled;
+
     /**
      * tag -> 数据库全限定表名 映射
      */
@@ -203,6 +209,31 @@ public class MonitorDataService {
         SITE_TYPE_DEVICE_MAP.put("8", "水质监测仪"); // 水质
     }
 
+    /** 设备按传感器拆分（2026-10-26）：报文 tag → 传感器设备名称后缀。
+     *  只覆盖传感器类 tag；闸门（gatesInfo/gateInfo）走既有闸孔路由、
+     *  volInfo/msgInfo 终端级报文不建传感器设备——均不在本映射内，解析时返回 null 留空。 */
+    private static final Map<String, String> TAG_DEVICE_SUFFIX = new LinkedHashMap<>();
+    static {
+        TAG_DEVICE_SUFFIX.put("riverInfo", "水位计");
+        TAG_DEVICE_SUFFIX.put("wtInfo",    "流量计");
+        TAG_DEVICE_SUFFIX.put("rainInfo",  "雨量计");
+        TAG_DEVICE_SUFFIX.put("soilData",  "墒情探测");
+        TAG_DEVICE_SUFFIX.put("pcpInfo",   "水质监测仪");
+        TAG_DEVICE_SUFFIX.put("nmIspInfo", "水质监测仪");
+    }
+
+    /** 报文 tag → 传感器设备 type（单一值，禁止多值：功能页面按单值语义使用，
+     *  数据库列保持 #ENUM_MULTI# 模型配置不动，只是写入单值） */
+    private static final Map<String, String> TAG_DEVICE_TYPE = new LinkedHashMap<>();
+    static {
+        TAG_DEVICE_TYPE.put("riverInfo", "#1#");
+        TAG_DEVICE_TYPE.put("wtInfo",    "#3#");
+        TAG_DEVICE_TYPE.put("rainInfo",  "#2#");
+        TAG_DEVICE_TYPE.put("soilData",  "#7#");
+        TAG_DEVICE_TYPE.put("pcpInfo",   "#8#");
+        TAG_DEVICE_TYPE.put("nmIspInfo", "#8#");
+    }
+
     /**
      * 出厂兜底补偿（配置表优先，详见 监测数据删除.md §4.1 / resources/雨量入库补偿方案.md）：
      * 坝上站(3206400007)累计雨量 DYP 因站端 9/18 灌数 +34 且设备侧暂无法复位，报文将持续携带 +34 偏移；
@@ -240,8 +271,11 @@ public class MonitorDataService {
     /** 设备名 → device_id 缓存（首次查/建后缓存） */
     private final ConcurrentMap<String, String> deviceCache = new ConcurrentHashMap<>();
 
-    /** stcd → 主设备 device_id 缓存（闸站=闸孔1，非闸站=RTU设备） */
+    /** stcd → 主设备 device_id 缓存（闸站=闸孔1，非闸站=RTU设备；设备拆分开启时仅余闸门路由使用） */
     private final ConcurrentMap<String, String> stcdDeviceCache = new ConcurrentHashMap<>();
+
+    /** stcd|tag → 该传感器设备 id（设备拆分开启时主链路使用；闸门类 tag/终端级报文不经过此缓存） */
+    private final ConcurrentMap<String, String> stcdTagDeviceCache = new ConcurrentHashMap<>();
 
     /** site_id → 站点名称 缓存 */
     private final ConcurrentMap<String, String> siteNameCache = new ConcurrentHashMap<>();
@@ -355,14 +389,28 @@ public class MonitorDataService {
             // === 业务字段（仅当列存在时才添加） ===
             if (isValidColumn(validColumns, "site"))   fieldMap.put("site", site);
             if (isValidColumn(validColumns, "device")) {
-                String device = lookupOrCreateRtuDevice(stcd, site);
-                if (device == null) {
+                // 设备按传感器拆分（2026-10-26）：开启时按报文 tag 写对应传感器设备；
+                // 关闭时保持旧逻辑（stcd 单设备），回滚置回开关即可。
+                // site 联调修复（2026-10-26 #A，晚间扩充至流量/水位）：必定被下方业务守卫拦截的报文
+                // （非水质站的 pcpInfo/nmIspInfo、无雨量传感器的 rainInfo、Q 缺失/异常的 wtInfo、
+                // Z 有值但无效的 riverInfo）此前也在此创建并 markDeviceOnline——不写业务表却每轮
+                // msg_info 留痕续命，形成"零数据设备永远在线"。拆分模式下此类报文跳过设备解析
+                // （device 留空，留痕/守卫顺序不变）；开关关闭的回滚路径保持改造前行为不变。
+                boolean deviceGuardedOut = deviceSplitEnabled && willBeGuardedOut(tag, site, entity);
+                String device = deviceGuardedOut ? null
+                        : deviceSplitEnabled
+                        ? resolveDeviceByTag(stcd, site, tag, entity)
+                        : lookupOrCreateRtuDevice(stcd, site);
+                if (device == null && !deviceSplitEnabled) {
                     log.error("设备创建失败, 丢弃报文: stcd={}, tag={}", stcd, tag);
                     return;
                 }
-                fieldMap.put("device", device);
-                // 收到报文即标记设备在线：报文入库/设备创建两场景均经此维护设备 status
-                markDeviceOnline(device);
+                if (device != null) {
+                    fieldMap.put("device", device);
+                    // 收到报文即标记设备在线：按本次命中的传感器设备标记（不按 stcd 回退，
+                    // 防拆分后“水位计没上报却因流量计在报而显示在线”）
+                    markDeviceOnline(device);
+                }
             }
             if (isValidColumn(validColumns, "stcd"))   fieldMap.put("stcd", stcd);
 
@@ -538,11 +586,11 @@ public class MonitorDataService {
                     }
                     // 基准高程修正：入库水位 = 报文水位 + 站点基准高程(水深→海拔)，先守卫后修正
                     applyWaterLevelDatum(fieldMap, stcd);
-                    // 水位阈值判定：修正后入库值(海拔)，仅正常值参与
+                    // 水位阈值判定：修正后入库值(海拔)，仅正常值参与；zb 传空串=通用指标行
                     Double z = toDbDouble(fieldMap.get("z"));
                     if (z != null && z > 0) {
                         alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_WATER_LEVEL,
-                                siteName, "水位", z, bizTm);
+                                siteName, "水位", "", z, bizTm);
                     }
                     // 继续走下方 river_info 表入库
                 } else {
@@ -572,16 +620,20 @@ public class MonitorDataService {
                     log.debug("volInfo 无有效电压数据, 跳过入库, stcd={}", stcd);
                     return;
                 }
+                // 电压为终端级指标：设备拆分后 vol_info.device 留空，但告警仍要挂设备
+                // （AlertService 对 deviceId=null 静默跳过）——兜底挂站内首个遥测设备，保持告警可用；
+                // 开关关闭时 deviceId 即有值，不受影响
+                String voltDevice = deviceId != null ? deviceId : findSiteTelemetryDevice(site);
                 if (isCommErrorValue(entity, "VOL")) {
                     log.warn("volInfo 电压设备异常(FFFFFFFF), 以-9991入库: stcd={}", stcd);
-                    alertService.reportDeviceError(site, deviceId, siteName, "电压", bizTm);
+                    alertService.reportDeviceError(site, voltDevice, siteName, "电压", bizTm);
                 } else {
                     double vol = parseDoubleSafe(entity.get("VOL"));
                     if (Double.isNaN(vol) || vol <= 0 || vol > MAX_VOLTAGE) {
                         log.warn("volInfo 电压异常, 不入库: stcd={}, VOL={}", stcd, entity.get("VOL").asText());
                         return;
                     }
-                    alertService.closeDeviceError(site, deviceId, siteName, "电压");
+                    alertService.closeDeviceError(site, voltDevice, siteName, "电压");
                 }
             }
             // === wtInfo 条件入库 ===
@@ -604,9 +656,9 @@ public class MonitorDataService {
                         return;
                     }
                     alertService.closeDeviceError(site, deviceId, siteName, "流量");
-                    // 流量阈值判定：瞬时流量Q，仅正常值参与（Q=0无流量属正常工况，正常值含0）
+                    // 流量阈值判定：瞬时流量Q，仅正常值参与（Q=0无流量属正常工况，正常值含0）；zb 传空串=通用指标行
                     alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_FLOW,
-                            siteName, "流量", q, bizTm);
+                            siteName, "流量", "", q, bizTm);
                 }
             }
             // === rainInfo 条件入库：DYP≤0说明设备无雨量监测能力或报文异常，跳过入库 ===
@@ -690,8 +742,9 @@ public class MonitorDataService {
                 // 基线缺失/哨兵值不比对、负差归0、仅物理不可能跳变(>5000mm)不参与
                 Double currentRain = computeCurrentRainfall(stcd, toDbDouble(fieldMap.get("dyp")));
                 if (currentRain != null) {
+                    // zb 传空串=通用指标行
                     alertService.evaluateThreshold(site, deviceId, AlertService.TYPE_RAINFALL,
-                            siteName, "雨量", currentRain, bizTm);
+                            siteName, "雨量", "", currentRain, bizTm);
                 }
             } else if ("wtInfo".equals(tag)) {
                 computeWtAccumulations(fieldMap, stcd, validColumns);
@@ -760,6 +813,51 @@ public class MonitorDataService {
     }
 
     /**
+     * 报文是否必定被下方业务守卫拦截（2026-10-26 site 联调修复 #A，2026-10-26 晚扩充流量/水位收口）：
+     * - pcpInfo/nmIspInfo 且站点非水质站（epjutj 不含 #8#）——水质类报文站点类型守卫会拦截；
+     * - rainInfo 且雨量传感器缺失（DYP 非通讯异常哨兵值 且 缺失/NaN/≤0）——rainInfo 条件入库守卫会拦截；
+     * - wtInfo 且流量缺失/异常（Q 非哨兵 且 null/NaN/负值/超上限）——wtInfo 条件入库守卫会拦截
+     *   （上线后实测：Q=null 的 wtInfo 曾产出零数据"流量计#"设备，与本类缺陷同源）；
+     * - riverInfo 且 Z 有值但无效（非哨兵 且 ≤0/越界/非数值）——Z 数值守卫会拦截。
+     * 此类报文不写业务表，设备解析阶段不得创建/标在线设备（device 留空，msg_info 照常留痕）。
+     * 哨兵值(FFFFFFFF)一律不命中——那是真实设备异常，需建设备参与异常告警（-9991 入库有数据）。
+     * 判定口径须与下方四处守卫（水质站点类型守卫、rainInfo/wtInfo 条件入库守卫、
+     * riverInfo Z 数值守卫）保持同步，修改任一守卫的拦截条件时联动自查本方法。
+     */
+    private boolean willBeGuardedOut(String tag, String site, JsonNode entity) {
+        if ("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) {
+            return !isWaterQualitySite(site);
+        }
+        if ("rainInfo".equals(tag)) {
+            if (isCommErrorValue(entity, "DYP")) {
+                return false; // 哨兵=真实设备异常，需建设备参与"雨量"异常告警
+            }
+            double dyp = hasValue(entity, "DYP") ? parseDoubleSafe(entity.get("DYP")) : Double.NaN;
+            return Double.isNaN(dyp) || dyp <= 0;
+        }
+        if ("wtInfo".equals(tag)) {
+            if (isCommErrorValue(entity, "Q")) {
+                return false; // 哨兵=-9991 入库并报告警
+            }
+            if (!hasValue(entity, "Q")) {
+                return true; // Q 缺失 → wtInfo 守卫 return
+            }
+            double q = parseDoubleSafe(entity.get("Q"));
+            return Double.isNaN(q) || q < 0 || q > MAX_FLOW;
+        }
+        if ("riverInfo".equals(tag)) {
+            if (!hasValue(entity, "Z")) {
+                return false; // 无 Z 走闸站水位分支，主链路 resolveDeviceByTag 本就不建水位计设备
+            }
+            if (isCommErrorValue(entity, "Z")) {
+                return false; // 哨兵=-9991 入库并报告警
+            }
+            return !isPositiveNumber(entity, "Z"); // Z 无效（≤0/越界/非数值）→ 守卫 return
+        }
+        return false;
+    }
+
+    /**
      * 水质阈值判定（#8#，2026-09-26 细化设计）：按七项开放指标逐项比对
      * （zb=数据列名，配置了几项比几项；未配置的指标不命中阈值行、静默跳过），
      * 无效值 -999(设备不存在)/-9991(通讯异常)不参与比对；仅业务表入库成功后调用。
@@ -823,7 +921,55 @@ public class MonitorDataService {
     }
 
     /**
-     * 按站点类型查找或创建设备，返回 device_id (带缓存)
+     * 设备按传感器拆分：按报文 tag 解析对应传感器设备（缓存键 stcd|tag）。
+     * 返回 null = 该报文不挂设备或设备创建失败（留空入库，不丢报文）：
+     *  - volInfo/msgInfo：终端级报文（电压/报文流水）不属于任何传感器，device 留空（已定口径）；
+     *  - gatesInfo/gateInfo：闸门开度由 insertGateFromGatesInfo 内部按闸孔查找设备并标在线；
+     *  - riverInfo 无 Z 值（闸站闸前/闸后水位 Z1/Z2）：由 insertGateWaterLevelFromRiverInfo
+     *    内部挂闸孔1#设备并标在线（该分支设备逻辑保持不动）；Z 有值（通用水位）才挂水位计。
+     * 设备 type 只写单一类型码；名称 = {站名}{后缀}#，与既有传感器设备命名一致。
+     */
+    private String resolveDeviceByTag(String stcd, String siteId, String tag, JsonNode entity) {
+        // 闸站水位（riverInfo 无 Z）走 gate 表，设备由闸孔路由内部处理，主链路留空
+        if ("riverInfo".equals(tag) && !hasValue(entity, "Z")) {
+            return null;
+        }
+        String suffix = TAG_DEVICE_SUFFIX.get(tag);
+        if (suffix == null) {
+            return null; // volInfo/msgInfo（终端级）、gatesInfo/gateInfo（闸门路由内部处理）
+        }
+        final String deviceType = TAG_DEVICE_TYPE.get(tag);
+        final String deviceName = getSiteName(siteId) + suffix + "#";
+        return stcdTagDeviceCache.computeIfAbsent(stcd + "|" + tag, k -> {
+            String device = lookupOrCreateDeviceByName(deviceName, siteId, deviceType);
+            if (device == null) {
+                log.warn("传感器设备创建失败, 本次 device 留空入库: stcd={}, tag={}, name={}", stcd, tag, deviceName);
+            }
+            return device;
+        });
+    }
+
+    /**
+     * 站点首个遥测设备 id（排除视频 #5#；按 id 排序保证多次查询结果稳定）。
+     * 用于终端级指标告警挂接：设备拆分后 vol_info.device 留空，但电压异常/恢复告警
+     * 仍需设备 id（AlertService 对 deviceId=null 静默跳过）。
+     */
+    private String findSiteTelemetryDevice(String siteId) {
+        try {
+            String sql = "SELECT id FROM " + DEVICE_TABLE + " WHERE site = ? " +
+                    "AND (type IS NULL OR type NOT LIKE '%#5#%') ORDER BY id LIMIT 1";
+            List<String> ids = jdbcTemplate.queryForList(sql, String.class, siteId);
+            if (ids != null && !ids.isEmpty()) {
+                return ids.get(0);
+            }
+        } catch (Exception e) {
+            log.debug("查找站点遥测设备失败, site={}: {}", siteId, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * 按站点类型查找或创建设备，返回 device_id (带缓存)。仅设备拆分开关关闭时使用（行为与改造前一致）。
      * <p>
      * 闸站(#4#): 生成闸孔1设备 "{siteName}1#"，所有站级数据指向它
      * 非闸站已知类型: 生成RTU设备 "{siteName}{类型后缀}#"
@@ -842,16 +988,20 @@ public class MonitorDataService {
                 deviceName = siteName + "1#";
                 deviceType = "#4#";
             } else {
-                // 非闸站: 按站点类型定后缀；站点类型未知时回退用旧"待接入#"设备自身的type推断
-                String suffix = SITE_TYPE_DEVICE_MAP.get(extractPrimarySiteType(epjutj));
-                deviceType = epjutj;
+                // 非闸站: 按站点类型定后缀；站点类型未知时回退用旧"待接入#"设备自身的type推断。
+                // 设备 type 只写单一类型码（2026-10-26 设备拆分）：站点 epjutj 是多值能力声明，
+                // 设备不继承整串——原 deviceType = epjutj 是设备 type 出现多值的唯一来源，已改单值
+                String primary = extractPrimarySiteType(epjutj);
+                String suffix = SITE_TYPE_DEVICE_MAP.get(primary);
+                deviceType = primary != null ? "#" + primary + "#" : null;
                 if (suffix == null) {
                     String orphanId = findExistingDevice(siteName + "待接入#");
                     String orphanType = orphanId != null ? getDeviceType(orphanId) : null;
-                    String orphanSuffix = SITE_TYPE_DEVICE_MAP.get(extractPrimarySiteType(orphanType));
+                    String orphanPrimary = extractPrimarySiteType(orphanType);
+                    String orphanSuffix = SITE_TYPE_DEVICE_MAP.get(orphanPrimary);
                     if (orphanSuffix != null) {
                         suffix = orphanSuffix;
-                        deviceType = orphanType;
+                        deviceType = orphanPrimary != null ? "#" + orphanPrimary + "#" : null;
                     }
                 }
                 if (suffix != null) {
@@ -1301,20 +1451,22 @@ public class MonitorDataService {
         // 收到报文即标记设备在线（epjutj未及时更新时主缓存可能指向"待接入"，此处首闸孔设备补标）
         markDeviceOnline(device);
         // 设备异常/恢复告警 + 水位阈值判定（闸前/闸后水位属 #1# 水位类，行业上同样有保证/警戒/设计值；
-        // 判定值用基准高程修正后的入库值，与通用水位站口径一致）
+        // 判定值用基准高程修正后的入库值，与通用水位站口径一致。
+        // 2026-10-26 改造：显式传 zb=up_z/down_z——阈值表闸站按闸前/闸后分行配置，
+        // 不再用"不限定指标"查询导致闸后水位误用闸前警戒值）
         if (z1 == COMM_ERROR_INSERT_VALUE) {
             alertService.reportDeviceError(siteId, device, siteName, "闸前水位", tm);
         } else if (z1 > 0) {
             alertService.closeDeviceError(siteId, device, siteName, "闸前水位");
             alertService.evaluateThreshold(siteId, device, AlertService.TYPE_WATER_LEVEL,
-                    siteName, "闸前水位", z1, tm);
+                    siteName, "闸前水位", "up_z", z1, tm);
         }
         if (z2 == COMM_ERROR_INSERT_VALUE) {
             alertService.reportDeviceError(siteId, device, siteName, "闸后水位", tm);
         } else if (z2 > 0) {
             alertService.closeDeviceError(siteId, device, siteName, "闸后水位");
             alertService.evaluateThreshold(siteId, device, AlertService.TYPE_WATER_LEVEL,
-                    siteName, "闸后水位", z2, tm);
+                    siteName, "闸后水位", "down_z", z2, tm);
         }
         // 确保 stcdDeviceCache 指向正确的首闸孔设备（覆盖可能存在的"待接入"缓存）
         String oldCached = stcdDeviceCache.put(stcd, device);
@@ -1513,8 +1665,9 @@ public class MonitorDataService {
                 alertService.reportDeviceError(siteId, deviceId, siteName, gateMetric, tm);
             } else if (openDegree >= 0) {
                 alertService.closeDeviceError(siteId, deviceId, siteName, gateMetric);
+                // zb 传空串=通用指标行
                 alertService.evaluateThreshold(siteId, deviceId, AlertService.TYPE_GATE,
-                        siteName, gateMetric, openDegree, tm);
+                        siteName, gateMetric, "", openDegree, tm);
             }
 
             // 去重：相同 stcd+tm+gate_no 已存在则跳过（防止RabbitMQ重投）

@@ -152,16 +152,21 @@ public class AlertService {
         }
     }
 
-    /** 设备数据恢复正常：关闭该站点-设备-指标的设备异常告警（content 精确匹配） */
+    /**
+     * 设备数据恢复正常：关闭该站点-指标的设备异常告警（content 精确匹配）。
+     * 2026-10-26 site 联调评审 #B4：关闭不再限定 device——insertAlert 一日去重键是
+     * 「site+content」（不含 device），同站同内容天然唯一；close 带 device 时设备重建/
+     * 拆分过渡期 device id 变化会关不掉遗留告警（悬挂），改为与插入口径对称。
+     */
     public void closeDeviceError(String siteId, String deviceId, String siteName, String metric) {
         if (siteId == null || deviceId == null) return;
         String content = siteName + "-" + metric + " 设备异常！";
-        int rows = closeByContent(siteId, deviceId, content);
+        int rows = closeByContent(siteId, content);
         if (rows > 0) {
-            log.info("设备恢复正常, 关闭告警 {} 条: site={}, device={}, content={}", rows, siteId, deviceId, content);
+            log.info("设备恢复正常, 关闭告警 {} 条: site={}, content={}", rows, siteId, content);
         }
         // 告警恢复 → 同步自动关闭对应工单
-        workOrderService.closeByContent(siteId, deviceId, content);
+        workOrderService.closeByContent(siteId, content);
     }
 
     // ======================== 站点失联告警 ========================
@@ -205,7 +210,10 @@ public class AlertService {
     // ======================== 阈值告警 ========================
 
     /**
-     * 单指标类型阈值判定入口（水位/雨量/流量/开度/闸站水位等，zb 恒为空）。
+     * 5 参兼容重载（zb 按"指标为空"处理，仅匹配 zb 为空串的阈值行）。
+     * 2026-10-26 闸前/闸后阈值兼容改造后：新调用请用 6 参显式传 zb——
+     * 通用指标(通用水位/流量/雨量/开度)传空串 ""，闸前水位传 up_z，闸后水位传 down_z；
+     * 本重载仅供确实不区分指标的历史场景，误用于闸前/闸后会导致两边都匹配不到配置。
      */
     public void evaluateThreshold(String siteId, String deviceId, String typeCode,
                                   String siteName, String metric, double value, Timestamp tm) {
@@ -214,7 +222,8 @@ public class AlertService {
 
     /**
      * 阈值判定（2026-09-26 细化设计，仅对正常数值调用，-999/-9991 等异常值由调用方排除）：
-     * 1. 匹配键「站点 + 类型(+指标 zb)」实时读阈值表（无缓存），页面编辑保存后下一条数据即生效；
+     * 1. 匹配键「站点 + 类型 + 指标(zb)」实时读阈值表（无缓存），页面编辑保存后下一条数据即生效；
+     *    zb 为 null 按"指标为空"处理（等同传空串），见 findThreshold 语义说明；
      * 2. 单级警戒值 threshold，方向以行上 alarmdir 为准（#1#高于 / #2#低于，均含等号触发），
      *    为空回退默认方向（墒情各层与水质溶解氧 dox 为低于，其余高于）；
      * 3. 无配置（或警戒值缺失/非正，防御）→ 静默跳过，同时关闭遗留阈值告警防配置删除后悬挂；
@@ -273,7 +282,7 @@ public class AlertService {
         Double threshold = th == null ? null : toDbDouble(th.get("threshold"));
         if (!isPositive(threshold)) {
             // 无配置或警戒值缺失/非正（设置页保证必填>0，此处防御）：静默跳过 + 防悬挂
-            closeThresholdAlerts(siteId, deviceId, siteName, metric);
+            closeThresholdAlerts(siteId, siteName, metric);
             return;
         }
         String alarmdir = th.get("alarmdir") != null ? String.valueOf(th.get("alarmdir")).trim() : "";
@@ -285,8 +294,8 @@ public class AlertService {
                     (below ? "低于警戒值" : "高于警戒值") + fmt(threshold),
                     unitFor(typeCode, zb), tm);
         } else {
-            // 正常区间：关闭该设备该指标全部阈值类告警
-            closeThresholdAlerts(siteId, deviceId, siteName, metric);
+            // 正常区间：关闭该站该指标全部阈值类告警
+            closeThresholdAlerts(siteId, siteName, metric);
         }
     }
 
@@ -373,7 +382,7 @@ public class AlertService {
     }
 
     /**
-     * 关闭该设备该指标的阈值类告警。按 content 前缀(站点名+指标)限定范围：
+     * 关闭该站该指标的阈值类告警。按 content 前缀(站点名+指标)限定范围：
      * 同一 RTU 设备常上报多指标（水位+雨量+流量…），仅关闭本指标告警，
      * 否则任一指标正常会把该设备其他指标的阈值告警误关（告警闪断）；
      * 关键词过滤只命阈值类文案（警戒值；保证值/设计值为历史分级文案兼容），不波及设备异常告警。
@@ -381,35 +390,41 @@ public class AlertService {
      * 白名单（展示层评审 #3）：仅关闭系统产生且未人工介入的行（created_by='SYSTEM' 且 status ∈ #1#/#2#），
      * 人为态（已确认处理/已关闭）与人工创建的行一律不动；
      * 关闭即 updated_by=SYSTEM → 抑制计数重置；同文案多行（抑制窗提醒产生的重复行）一并关闭。
+     * 匹配口径（2026-10-26 site 联调评审 #B4）：不按 device 限定——insertAlert 一日去重键是
+     * 「site+content」，同站同内容始终只有一条活跃告警；close 若带 device，设备重建/拆分
+     * 过渡期 device id 变化会关不掉导致告警悬挂，改为与插入口径对称。
      */
-    private void closeThresholdAlerts(String siteId, String deviceId, String siteName, String metric) {
+    private void closeThresholdAlerts(String siteId, String siteName, String metric) {
         try {
             String sql = "UPDATE " + ALERT_TABLE +
                     " SET status = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE site = ? AND device = ? AND content LIKE ? " +
+                    " WHERE site = ? AND content LIKE ? " +
                     " AND created_by = 'SYSTEM' AND status IN (?, ?) " +
                     " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')";
             int rows = jdbcTemplate.update(sql, STATUS_CLOSED,
                     new Timestamp(System.currentTimeMillis()),
-                    siteId, deviceId, siteName + metric + "%", STATUS_UNCONFIRMED, STATUS_CONFIRMED);
+                    siteId, siteName + metric + "%", STATUS_UNCONFIRMED, STATUS_CONFIRMED);
             if (rows > 0) {
-                log.info("阈值告警恢复正常, 关闭 {} 条: site={}, device={}, metric={}", rows, siteId, deviceId, metric);
+                log.info("阈值告警恢复正常, 关闭 {} 条: site={}, metric={}", rows, siteId, metric);
             }
         } catch (Exception e) {
-            log.debug("关闭阈值告警失败, site={}, device={}, metric={}: {}", siteId, deviceId, metric, e.getMessage());
+            log.debug("关闭阈值告警失败, site={}, metric={}: {}", siteId, metric, e.getMessage());
         }
         // 告警恢复 → 同步关闭同条件的阈值类工单
-        workOrderService.closeThreshold(siteId, deviceId, siteName + metric + "%",
+        workOrderService.closeThreshold(siteId, siteName + metric + "%",
                 " AND (content LIKE '%保证值%' OR content LIKE '%警戒值%' OR content LIKE '%设计值%')");
     }
 
     /**
-     * 查站点-类型(-指标)匹配的阈值配置（实时读取无缓存，页面编辑保存后下一条数据即生效）。
-     * 阈值按「站点 × 类型(+zb)」唯一，与设备无关（同站同指标的全部设备/测点共用一条线）；
+     * 查站点-类型-指标匹配的阈值配置（实时读取无缓存，页面编辑保存后下一条数据即生效）。
+     * 阈值按「站点 × 类型 × 指标(zb)」唯一，与设备无关（同站同指标的全部设备/测点共用一条线）；
      * 类型读取统一 COALESCE(NULLIF("zvieyb",''),"type",'') 子串匹配：新配置行 type 恒空、
      * 历史多值行(如 #1#|#2#)同时命中各类型；旧列 type 仅兜底。
      * 模糊匹配必须 LIKE CONCAT('%', ?, '%')——KingbaseES 实测 '%'||?||'%' 绑定参数会静默失效退化为全表。
-     * 单指标类型 zb 传 null（不加指标条件）；多指标类型（#7#/#8#）按 zb=监测数据表列名定位到具体指标行；
+     * zb 语义（2026-10-26 闸前/闸后阈值兼容改造）：null 不再表示"不限定指标"，而是"指标为空"——
+     * 统一按 COALESCE(NULLIF(zb,''),'') = ? 精确匹配：通用指标(通用水位/流量/雨量/开度)传空串
+     * 只命中 zb 为空的行；闸前/闸后水位传 up_z/down_z 只命中对应行；多指标类型（#7#/#8#）
+     * 按 zb=监测数据表列名定位到具体指标行，防止闸站 up_z/down_z 两行被任意取一行串用。
      * LIMIT 1（设置侧保证同「站点+类型+指标」最多一行）。
      * 查询失败返回 QUERY_FAILED（跳过本次评估，下次上报重试），区别于 null=确无配置。
      */
@@ -417,11 +432,10 @@ public class AlertService {
         try {
             String sql = "SELECT threshold, alarmdir FROM " + THRESHOLD_TABLE +
                     " WHERE \"site\" = ? AND COALESCE(NULLIF(\"zvieyb\", ''), \"type\", '') LIKE CONCAT('%', ?, '%')" +
-                    (zb != null ? " AND \"zb\" = ?" : "") +
+                    " AND COALESCE(NULLIF(\"zb\", ''), '') = ?" +
                     " LIMIT 1";
-            List<Map<String, Object>> rows = zb != null
-                    ? jdbcTemplate.queryForList(sql, siteId, typeCode, zb)
-                    : jdbcTemplate.queryForList(sql, siteId, typeCode);
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId, typeCode,
+                    zb == null ? "" : zb.trim());
             return rows.isEmpty() ? null : rows.get(0);
         } catch (Exception e) {
             log.warn("查询阈值配置失败, site={}, type={}, zb={}: {}", siteId, typeCode, zb, e.getMessage());
@@ -578,14 +592,18 @@ public class AlertService {
         }
     }
 
-    /** 精确 content 关闭（设备异常告警恢复用；白名单同 closeThresholdAlerts：仅系统产生且 status ∈ #1#/#2#） */
-    private int closeByContent(String siteId, String deviceId, String content) {
+    /**
+     * 精确 content 关闭（设备异常告警恢复用；白名单同 closeThresholdAlerts：仅系统产生且 status ∈ #1#/#2#）。
+     * 匹配口径（2026-10-26 site 联调评审 #B4）：不按 device 限定，与 insertAlert 一日去重键
+     * 「site+content」对称，防设备重建/拆分过渡期 device id 变化导致告警关不掉悬挂。
+     */
+    private int closeByContent(String siteId, String content) {
         try {
             String sql = "UPDATE " + ALERT_TABLE +
                     " SET status = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE site = ? AND device = ? AND content = ? AND created_by = 'SYSTEM' AND status IN (?, ?)";
+                    " WHERE site = ? AND content = ? AND created_by = 'SYSTEM' AND status IN (?, ?)";
             return jdbcTemplate.update(sql, STATUS_CLOSED,
-                    new Timestamp(System.currentTimeMillis()), siteId, deviceId, content,
+                    new Timestamp(System.currentTimeMillis()), siteId, content,
                     STATUS_UNCONFIRMED, STATUS_CONFIRMED);
         } catch (Exception e) {
             log.debug("关闭告警失败: {}", e.getMessage());
