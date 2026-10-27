@@ -396,7 +396,7 @@ public class MonitorDataService {
                 // Z 有值但无效的 riverInfo）此前也在此创建并 markDeviceOnline——不写业务表却每轮
                 // msg_info 留痕续命，形成"零数据设备永远在线"。拆分模式下此类报文跳过设备解析
                 // （device 留空，留痕/守卫顺序不变）；开关关闭的回滚路径保持改造前行为不变。
-                boolean deviceGuardedOut = deviceSplitEnabled && willBeGuardedOut(tag, site, entity);
+                boolean deviceGuardedOut = deviceSplitEnabled && willBeGuardedOut(stcd, tag, site, entity);
                 String device = deviceGuardedOut ? null
                         : deviceSplitEnabled
                         ? resolveDeviceByTag(stcd, site, tag, entity)
@@ -494,6 +494,32 @@ public class MonitorDataService {
             if (("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) && !isWaterQualitySite(site)) {
                 log.warn("{} 非水质站报文, 仅留痕不入库: stcd={}, site={}, epjutj={}",
                          tag, stcd, site, getSiteType(site));
+                return;
+            }
+
+            // === 水位报文站点档案守卫（2026-10-27 定版，晚调整为仅水库片区生效） ===
+            // 仅水库片区13站（stcd 前缀 32064000）以站点档案监测类型(epjutj)分类编排：
+            // riverInfo Z 水位报文须档案含 #1# 或 #4#，雨量站(#2#)等非水位类站点的水位报文
+            // 视为错误数据（站端 RTU 多发，实测恒 27.3 假水位），业务表不入库、不评估阈值。
+            // 其余站点一律以实际报文为准：水位报文照常入库，不因档案未声明 #1# 拦截
+            // （与 MQTT 链路报文驱动建设备口径一致）。
+            // 守卫放在留痕之后：msg_info 保持完整反映上游投递事实(与水质守卫同一原则)。
+            if ("riverInfo".equals(tag) && hasValue(entity, "Z")
+                    && isReservoirAreaStcd(stcd) && !isWaterLevelSite(site)) {
+                log.warn("riverInfo 水库站点非水位类报文, 仅留痕不入库: stcd={}, site={}, epjutj={}",
+                         stcd, site, getSiteType(site));
+                return;
+            }
+
+            // === 雨量报文站点档案守卫（2026-10-27 晚定版，仅水库片区生效） ===
+            // 仅水库片区13站（stcd 前缀 32064000）以档案编排：rainInfo 须档案含 #2#
+            // （雨量监测项）；纯水位站（如花凉亭坝下 #1#）的雨量报文视为错误数据
+            // （站端 RTU 多发），业务表不入库、不评估阈值、不建"雨量计#"设备。
+            // 其余站点一律以实际报文为准：雨量报文照常入库。
+            // 守卫放在留痕之后：msg_info 保持完整反映上游投递事实(与水位/水质守卫同一原则)。
+            if ("rainInfo".equals(tag) && isReservoirAreaStcd(stcd) && !isRainfallSite(site)) {
+                log.warn("rainInfo 水库站点非雨量类报文, 仅留痕不入库: stcd={}, site={}, epjutj={}",
+                         stcd, site, getSiteType(site));
                 return;
             }
 
@@ -813,22 +839,70 @@ public class MonitorDataService {
     }
 
     /**
+     * 站点是否属于花凉亭水库流域遥测网（stcd 前缀 32064000，即水库 13 站
+     * 3206400001~320640000D：周家河/姜家寨/九田/下前河/牛镇/马嘶铺/花凉亭坝上/
+     * 寺前/河图铺/花凉亭坝下/鲤鱼墩/弥陀/白帽）。
+     * 2026-10-27 晚业务定版：仅水库 13 站完全以档案监测类型(epjutj)编排——雨量站的
+     * riverInfo Z 水位报文视为错误数据拦截；其余所有站点一律以实际报文为准：有报文即
+     * 建对应传感器设备并入库，无入库报文视为设备未接入（不在审查范围）。
+     * MQTT(闸站)链路本就按报文闸孔标签建设备(闸孔N#，#4#)、不做档案校验，与此口径一致。
+     */
+    private boolean isReservoirAreaStcd(String stcd) {
+        return stcd != null && stcd.startsWith("32064000");
+    }
+
+    /**
+     * 站点是否为水位类站点：epjutj 含 #1#（水位站）或 #4#（闸站，闸前/闸后水位属闸站监测项）。
+     * 2026-10-27 定版：水库 13 站（见 isReservoirAreaStcd）以站点档案监测类型(epjutj)
+     * 分类编排——非水位类站点（如水库片区雨量站 #2#）的 riverInfo Z 水位报文视为错误数据
+     * （站端 RTU 多发，实测恒定 27.3 假水位），业务表不入库、不建"水位计#"设备，仅 msg_info
+     * 留痕；非水库站点不以档案否定报文，水位报文照常入库。
+     */
+    private boolean isWaterLevelSite(String siteId) {
+        String epjutj = getSiteType(siteId);
+        return epjutj != null && (epjutj.contains("#1#") || epjutj.contains("#4#"));
+    }
+
+    /**
+     * 站点是否为雨量类站点：epjutj 含 #2#（雨量监测项，含水位+雨量组合站）。
+     * 2026-10-27 晚定版：水库 13 站以档案编排——纯水位站（如花凉亭坝下 #1#）的
+     * rainInfo 雨量报文视为错误数据（站端 RTU 多发），业务表不入库、不建"雨量计#"
+     * 设备，仅 msg_info 留痕；非水库站点以实际报文为准，不受档案限制。
+     */
+    private boolean isRainfallSite(String siteId) {
+        String epjutj = getSiteType(siteId);
+        return epjutj != null && epjutj.contains("#2#");
+    }
+
+    /**
      * 报文是否必定被下方业务守卫拦截（2026-10-26 site 联调修复 #A，2026-10-26 晚扩充流量/水位收口）：
      * - pcpInfo/nmIspInfo 且站点非水质站（epjutj 不含 #8#）——水质类报文站点类型守卫会拦截；
+     * - rainInfo 且水库片区13站(stcd 前缀 32064000)档案不含 #2#——雨量报文站点档案守卫
+     *   会拦截（2026-10-27 晚定版：纯水位站如花凉亭坝下的雨量报文视为错误数据）；
      * - rainInfo 且雨量传感器缺失（DYP 非通讯异常哨兵值 且 缺失/NaN/≤0）——rainInfo 条件入库守卫会拦截；
      * - wtInfo 且流量缺失/异常（Q 非哨兵 且 null/NaN/负值/超上限）——wtInfo 条件入库守卫会拦截
      *   （上线后实测：Q=null 的 wtInfo 曾产出零数据"流量计#"设备，与本类缺陷同源）；
-     * - riverInfo 且 Z 有值但无效（非哨兵 且 ≤0/越界/非数值）——Z 数值守卫会拦截。
+     * - riverInfo 且 Z 有值但无效（非哨兵 且 ≤0/越界/非数值）——Z 数值守卫会拦截；
+     * - riverInfo 且水库片区13站(stcd 前缀 32064000)档案非水位类（epjutj 不含 #1# 且不含 #4#）
+     *   ——水位报文站点档案守卫会拦截（2026-10-27 定版：水库13站以档案分类编排，雨量站等
+     *   的水位报文视为错误数据；非水库站点以实际报文为准，不受档案限制）。
      * 此类报文不写业务表，设备解析阶段不得创建/标在线设备（device 留空，msg_info 照常留痕）。
-     * 哨兵值(FFFFFFFF)一律不命中——那是真实设备异常，需建设备参与异常告警（-9991 入库有数据）。
-     * 判定口径须与下方四处守卫（水质站点类型守卫、rainInfo/wtInfo 条件入库守卫、
-     * riverInfo Z 数值守卫）保持同步，修改任一守卫的拦截条件时联动自查本方法。
+     * 数值类条件守卫对哨兵值(FFFFFFFF)一律不命中——那是真实设备异常，需建设备参与异常告警；
+     * 站点档案守卫（水位/雨量方向）对哨兵值同样拦截（档案未声明该监测项的站点不建设备）。
+     * 判定口径须与下方六处守卫（水质站点类型守卫、水位/雨量报文站点档案守卫、
+     * rainInfo/wtInfo 条件入库守卫、riverInfo Z 数值守卫）保持同步，
+     * 修改任一守卫的拦截条件时联动自查本方法。
      */
-    private boolean willBeGuardedOut(String tag, String site, JsonNode entity) {
+    private boolean willBeGuardedOut(String stcd, String tag, String site, JsonNode entity) {
         if ("pcpInfo".equals(tag) || "nmIspInfo".equals(tag)) {
             return !isWaterQualitySite(site);
         }
         if ("rainInfo".equals(tag)) {
+            // 水库13站档案守卫（2026-10-27 晚定版）：档案不含 #2# 的纯水位站（如花凉亭坝下）
+            // 雨量报文视为错误数据直接拦截（哨兵值同样拦：不发雨量的站无需建设备参与雨量告警）
+            if (isReservoirAreaStcd(stcd) && !isRainfallSite(site)) {
+                return true;
+            }
             if (isCommErrorValue(entity, "DYP")) {
                 return false; // 哨兵=真实设备异常，需建设备参与"雨量"异常告警
             }
@@ -848,6 +922,11 @@ public class MonitorDataService {
         if ("riverInfo".equals(tag)) {
             if (!hasValue(entity, "Z")) {
                 return false; // 无 Z 走闸站水位分支，主链路 resolveDeviceByTag 本就不建水位计设备
+            }
+            // 档案守卫仅对水库片区13站生效；其余站点以实际报文为准（2026-10-27 晚定版），
+            // 水位报文一律入库，不因档案未声明 #1# 拦截
+            if (isReservoirAreaStcd(stcd) && !isWaterLevelSite(site)) {
+                return true; // 水库站档案非水位类（雨量站等）的 Z 水位报文 → 仅留痕不入库，不建水位计设备
             }
             if (isCommErrorValue(entity, "Z")) {
                 return false; // 哨兵=-9991 入库并报告警
