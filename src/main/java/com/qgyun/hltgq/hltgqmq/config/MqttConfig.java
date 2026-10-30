@@ -1,5 +1,6 @@
 package com.qgyun.hltgq.hltgqmq.config;
 
+import com.qgyun.hltgq.hltgqmq.service.MqttGateActionService;
 import com.qgyun.hltgq.hltgqmq.service.MqttGateDataService;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.slf4j.Logger;
@@ -52,6 +53,10 @@ public class MqttConfig {
 
     @Autowired
     private MqttGateDataService mqttGateDataService;
+
+    /** 闸门动作记录（DZJL topic）解析入库服务 */
+    @Autowired
+    private MqttGateActionService mqttGateActionService;
 
     /**
      * MQTT 客户端工厂
@@ -109,11 +114,22 @@ public class MqttConfig {
                 String topic = (String) message.getHeaders().get(MqttHeaders.RECEIVED_TOPIC);
                 Object payload = message.getPayload();
                 String payloadStr = payload != null ? payload.toString() : "";
-                log.info("收到 MQTT 消息: topic={}, payload长度={}", topic, payloadStr.length());
-                // MQTT 报文(约10分钟/条)，完整报文用 debug 级别避免日志刷屏
-                log.debug("MQTT 报文: topic={}, payload={}", topic, payloadStr);
+                // 按 topic 路由：DZJL=闸门动作记录（含兼容层级主题 xxx/DZJL），其余走闸门快照链路
+                boolean gateAction = topic != null && (topic.equals("DZJL") || topic.endsWith("/DZJL"));
+                if (gateAction) {
+                    // DZJL 闸门开启期间每秒一帧，这里不打印收发日志（避免刷屏堵塞回调）；
+                    // 动作帧日志由 MqttGateActionService 按“是否新动作”级别输出
+                } else {
+                    log.info("收到 MQTT 消息: topic={}, payload长度={}", topic, payloadStr.length());
+                    // HLTData 报文(约10分钟/条)，完整报文用 debug 级别避免日志刷屏
+                    log.debug("MQTT 报文: topic={}, payload={}", topic, payloadStr);
+                }
                 if (!payloadStr.isEmpty()) {
-                    mqttGateDataService.process(payloadStr);
+                    if (gateAction) {
+                        mqttGateActionService.process(topic, payloadStr);
+                    } else {
+                        mqttGateDataService.process(payloadStr);
+                    }
                 }
             }
         };

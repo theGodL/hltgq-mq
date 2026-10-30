@@ -72,8 +72,9 @@ public class MqttGateDataService {
     /**
      * MQTT 前缀 → 站点/设备名称 (查 zzkaec 和 water_device.name 共用)
      * 设备表 name = 站点名 + 闸孔号 + "#"  例: "南山寺节制闸1#"
+     * public 供 MqttGateActionService（DZJL 动作记录）复用，新增站点前缀时只改这一处
      */
-    private static final Map<String, String> PREFIX_MAP = new LinkedHashMap<>();
+    public static final Map<String, String> PREFIX_MAP = new LinkedHashMap<>();
     static {
         PREFIX_MAP.put("NSS",   "南山寺节制闸");
         PREFIX_MAP.put("QSDZ",  "渠首电站防洪闸");
