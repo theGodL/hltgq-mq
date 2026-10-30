@@ -29,10 +29,14 @@ EXPOSE 8080
 # JVM 参数说明：
 #   -XX:+UseContainerSupport  容器内存感知
 #   -XX:MaxRAMPercentage=75   堆内存上限=容器内存的75%
+#   -XX:+HeapDumpOnOutOfMemoryError  OOM 时自动留 heap dump（排查现场用）
+#   -XX:HeapDumpPath=/tmp/heapdump.hprof  dump 路径（容器内可写目录）
 #   -Dfile.encoding=UTF-8     文件编码
 ENTRYPOINT ["java", \
     "-XX:+UseContainerSupport", \
     "-XX:MaxRAMPercentage=75.0", \
+    "-XX:+HeapDumpOnOutOfMemoryError", \
+    "-XX:HeapDumpPath=/tmp/heapdump.hprof", \
     "-Dfile.encoding=UTF-8", \
     "-Djava.security.egd=file:/dev/./urandom", \
     "-jar", "/app/app.jar"]

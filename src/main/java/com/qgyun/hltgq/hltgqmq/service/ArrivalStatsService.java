@@ -287,10 +287,27 @@ public class ArrivalStatsService {
         if (!warmupEnabled) {
             return;
         }
+        long nowMs = System.currentTimeMillis();
+        pruneCaches(nowMs);
         LocalDate today = LocalDate.now();
         forceRebuildDaySnap(today);
         forceRebuildRange(today, today);
         forceRebuildCtx();
+    }
+
+    /**
+     * 缓存容量守卫（随每分钟预热执行）：daySnapCache/rangeCache 无自动淘汰，
+     * 长期运行 + 多区间查询组合会缓慢累积快照对象；此处惰性清理过期条目，
+     * 防核心服务内存慢性增长（今日快照每分钟预热重建，timeMs 恒新鲜不会被清）。
+     */
+    private void pruneCaches(long nowMs) {
+        // 日快照：超过 TTL 的 6 倍（1 小时）未访问则移除，下次查询自动重建（历史日数据不变，重建仅 6 次小查询）
+        daySnapCache.entrySet().removeIf(e -> nowMs - e.getValue().timeMs > DAY_SNAP_TTL_MS * 6);
+        // 区间缓存：超过 64 个条目时才清理已过 TTL 的（正常只有少量固定区间，防御自定义区间组合无界增长）
+        if (rangeCache.size() > 64) {
+            long cutoff = nowMs - CACHE_TTL_MS;
+            rangeCache.entrySet().removeIf(e -> e.getValue().timeMs < cutoff);
+        }
     }
 
     /** 容器关闭时回收重建线程池 */
@@ -351,7 +368,6 @@ public class ArrivalStatsService {
         // 有效起始 = max(流水上线日, 本月1日)：跨月后统计窗口跟随本月，不回退到上线日之前
         LocalDate effStartDate = ctx.statStartDate.isBefore(monthStartDate) ? monthStartDate : ctx.statStartDate;
         ctx.effStartDate = effStartDate;
-        long effStartMs = Timestamp.valueOf(effStartDate.atStartOfDay()).getTime();
 
         // === 参与站点（有设备档案的站 ∪ 原采集口径站（有stcd且有设备/本月流水，或MQTT闸站）；剔除测试站） ===
         ctx.sites = querySites(ctx.monthStartMs);
@@ -361,11 +377,6 @@ public class ArrivalStatsService {
         }
         // === 无采集站本月历史日判定（月均到报率叠加用） ===
         ctx.noCollectDaily = loadNoCollectDaily(ctx);
-
-        // === 报文流水（有效起始日至今一次查出：今日到报 + 本月逐日到报共用） ===
-        ctx.msgRows = jdbcTemplate.queryForList(
-                "SELECT site, tm, msg FROM " + SCHEMA + "t_auto_hltgq_water_msg_info WHERE tm >= ?",
-                new Timestamp(effStartMs));
 
         // === 有效数据（缺测判定）：按主监测要素聚合 table -> siteId -> 有效时间点集合 ===
         ctx.validByTable = new HashMap<>();
@@ -382,35 +393,43 @@ public class ArrivalStatsService {
         // 否则晴天雨量站会被误判缺测（msg 列非 msgInfo tag 时存 tag 名）
         ctx.rainArrivalPoints = new HashMap<>();
         ctx.dailyWindows = new HashMap<>();
-        for (Map<String, Object> row : ctx.msgRows) {
-            Timestamp tm = toTimestamp(row.get("tm"));
-            String siteId = String.valueOf(row.get("site"));
-            // 今日报文行数（口径与 getServiceStatus 一致：只按 tm 判定，不限站点）
-            if (tm != null && tm.getTime() >= ctx.todayStartMs) {
-                ctx.todayMsgCount++;
-            }
-            if (tm == null || siteId == null || "null".equals(siteId)) continue;
-            LocalDate day = tm.toLocalDateTime().toLocalDate();
-            if (day.isBefore(effStartDate)) continue;
-            SiteInfo s = ctx.siteById.get(siteId);
-            if (s == null) continue;
-            long win = arrivalWinMs(s);
-            long bucket = tm.getTime() / win * win;
-            // 当前进行中窗不计入：应报/应测分母只统计已结束完整窗，分子口径必须一致(防到报率超100%)
-            long currentWinStart = ctx.todayStartMs + ((ctx.nowMs - ctx.todayStartMs) / win) * win;
-            if (tm.getTime() >= ctx.todayStartMs && bucket >= currentWinStart) {
-                continue;
-            }
-            if (tm.getTime() >= ctx.todayStartMs) {
-                ctx.arrivalWindows.computeIfAbsent(siteId, k -> new HashSet<>()).add(bucket);
-                if ("rainInfo".equals(String.valueOf(row.get("msg")))) {
-                    ctx.rainArrivalPoints.computeIfAbsent(siteId, k -> new HashSet<>()).add(tm.getTime());
+        // 按自然日分批查询聚合：本月报文行已近百万级，一次 queryForList 全量拉入内存
+        // 会造成数百 MB 峰值（分钟级预热重建下触发 OOM）；msg_info.tm 有索引，
+        // 逐日范围扫描 口径不变、单批仅数万行，聚合完成即释放
+        for (LocalDate day = effStartDate; !day.isAfter(ctx.today); day = day.plusDays(1)) {
+            long dayStartMs = Timestamp.valueOf(day.atStartOfDay()).getTime();
+            List<Map<String, Object>> dayRows = jdbcTemplate.queryForList(
+                    "SELECT site, tm, msg FROM " + SCHEMA + "t_auto_hltgq_water_msg_info" +
+                    " WHERE tm >= ? AND tm < ?",
+                    new Timestamp(dayStartMs), new Timestamp(dayStartMs + DAY_MS));
+            for (Map<String, Object> row : dayRows) {
+                Timestamp tm = toTimestamp(row.get("tm"));
+                String siteId = String.valueOf(row.get("site"));
+                // 今日报文行数（口径与 getServiceStatus 一致：只按 tm 判定，不限站点）
+                if (tm != null && tm.getTime() >= ctx.todayStartMs) {
+                    ctx.todayMsgCount++;
                 }
+                if (tm == null || siteId == null || "null".equals(siteId)) continue;
+                SiteInfo s = ctx.siteById.get(siteId);
+                if (s == null) continue;
+                long win = arrivalWinMs(s);
+                long bucket = tm.getTime() / win * win;
+                // 当前进行中窗不计入：应报/应测分母只统计已结束完整窗，分子口径必须一致(防到报率超100%)
+                long currentWinStart = ctx.todayStartMs + ((ctx.nowMs - ctx.todayStartMs) / win) * win;
+                if (tm.getTime() >= ctx.todayStartMs && bucket >= currentWinStart) {
+                    continue;
+                }
+                if (tm.getTime() >= ctx.todayStartMs) {
+                    ctx.arrivalWindows.computeIfAbsent(siteId, k -> new HashSet<>()).add(bucket);
+                    if ("rainInfo".equals(String.valueOf(row.get("msg")))) {
+                        ctx.rainArrivalPoints.computeIfAbsent(siteId, k -> new HashSet<>()).add(tm.getTime());
+                    }
+                }
+                ctx.dailyWindows.computeIfAbsent(day, k -> new HashMap<>())
+                        .computeIfAbsent(siteId, k -> new HashSet<>()).add(bucket);
             }
-            ctx.dailyWindows.computeIfAbsent(day, k -> new HashMap<>())
-                    .computeIfAbsent(siteId, k -> new HashSet<>()).add(bucket);
         }
-        // 全月原始报文行已聚合进 arrivalWindows/dailyWindows，释放引用降低缓存上下文内存占用
+        // 原始报文行已按天分批聚合进 arrivalWindows/dailyWindows，上下文不再持有全量行引用
         ctx.msgRows = null;
         return ctx;
     }
