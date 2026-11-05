@@ -2658,6 +2658,10 @@ public class MonitorDataService {
      * 本项目完全跳过不写；失联告警不适用（不发、历史悬挂每小时关闭）；
      * 跳过的站若 24h 有遥测数据在流则打 WARN 提示补设备档案。
      * 2026-10-20 与 hltgq-device 联调定稿（device 写纯视频站，mq 写其余，写入范围互斥）。
+     * <p>
+     * 混挂站视频在线豁免（2026-11-05 业务裁定）：站点下只要有视频设备(#5#)在线，
+     * 即使遥测 24h 无数据也不标离线；已离线的此类站在巡检时标回 #1# 并关闭失联告警。
+     * 视频设备状态由 hltgq-device 维护，mq 只读判定、不写设备状态；纯视频站仍归 device 维护。
      */
     // 每小时第5分执行：客户要求每小时执行离线检查（非仅每日0点），验收口径
     // "不出现 24h 无数据却显示在线"。与整点错峰：MQTT flushToDb 每分钟落库一次，
@@ -2674,7 +2678,7 @@ public class MonitorDataService {
             // 仅遥测设备参与判定：有RTU站号(水位/雨量/墒情/闸站/流量/水质经RabbitMQ stcd=iofhpi入库)
             // 或存在MQTT闸站gate数据(site=id)；点位等其他无遥测数据源的设备不参与；
             // 视频设备(#5#)状态由大华对接项目(hltgq-device)维护，纯视频站点 zebpsu 归 device 维护，
-            // 本项目完全跳过不写（见 1.5）
+            // 本项目完全跳过不写（见 1.5）；混挂站视频设备在线时豁免遥测离线判定（见 1.6）
             // pcp_info 表无 tm 列(历史结构)，以 spt 采样时间列作为时间判定列
             Set<String> pcpCols = tableColumnsCache.getOrDefault(
                     "t_auto_hltgq_water_pcp_info", Collections.emptySet());
@@ -2720,13 +2724,20 @@ public class MonitorDataService {
                     "EXISTS (SELECT 1 FROM " + DEVICE_TABLE + " v WHERE v.site = s.id AND v.type LIKE '%#5#%') " +
                     "AND NOT EXISTS (SELECT 1 FROM " + DEVICE_TABLE + " d WHERE d.site = s.id " +
                     "  AND (d.type IS NULL OR d.type NOT LIKE '%#5#%'))";
+            // 视频在线豁免条件（2026-11-05）：站点下存在在线视频设备(#5#)。
+            // 在线值兼容 #1#/#1/1（与 ArrivalStatsService 设备在线口径一致），状态由 hltgq-device 整点写入
+            String videoOnlineCond =
+                    "EXISTS (SELECT 1 FROM " + DEVICE_TABLE + " vo WHERE vo.site = s.id " +
+                    "  AND vo.type LIKE '%#5#%' AND vo.status IN ('#1#', '#1', '1'))";
 
-            // 1) 遥测站先标离线（纯视频站跳过不写，归 device；UPDATE 后到达的报文会通过 markSiteOnline 标回 #1#）
+            // 1) 遥测站先标离线（纯视频站跳过不写，归 device；视频设备在线的站豁免；
+            //    UPDATE 后到达的报文会通过 markSiteOnline 标回 #1#）
             // 同步将核心指标文本列置0：客户要求无报文时展示0而非陈旧值，
             // 恢复在线后由下一份业务报文(riverInfo/rainInfo)重新刷新真实值
             String sql = "UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
                          "SET zebpsu = '#2#', ccnhtm1 = '0.00', ijzsby1 = '0.00', updated_at = ?, updated_by = 'SYSTEM' " +
-                         "WHERE zebpsu IS DISTINCT FROM '#2#' AND NOT (" + pureVideoCond + ") AND " + offlineBody;
+                         "WHERE zebpsu IS DISTINCT FROM '#2#' AND NOT (" + pureVideoCond + ") " +
+                         "AND NOT (" + videoOnlineCond + ") AND " + offlineBody;
             int rows = jdbcTemplate.update(sql, now,
                     cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff);
             if (rows > 0) {
@@ -2755,11 +2766,40 @@ public class MonitorDataService {
             }
             log.info("跳过纯视频站点(归 hltgq-device 维护): {} 个", pureVideoIds.size());
 
+            // 1.6) 混挂站视频在线豁免回标：有在线视频设备且当前非在线的业务站 → 标回 #1# 并关闭失联告警。
+            // 遥测断但视频在线不标离线；视频设备后续也离线时，下一轮巡检按遥测口径重新判定。
+            // 驱动条件含“存在未关闭失联告警”：关闭告警与状态变更解耦，本轮关闭失败（DB 抖动/重启）
+            // 下一轮巡检仍会重试，避免站点已回标在线而失联告警永久悬挂（2026-11-05 健壮性完善）。
+            // 告警白名单与 AlertService.closeOfflineAlerts 的关闭条件保持一致（SYSTEM 产生、未关闭）
+            String unclosedOfflineAlertCond =
+                    "EXISTS (SELECT 1 FROM " + SCHEMA + "t_auto_hltgq_water_alert a " +
+                    "  WHERE a.site = s.id AND a.content LIKE '%失联%' " +
+                    "  AND a.created_by = 'SYSTEM' AND a.status IN ('#1#', '#2#'))";
+            List<String> videoOnlineSiteIds = jdbcTemplate.queryForList(
+                    "SELECT s.id FROM " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
+                    "WHERE (s.zebpsu IS DISTINCT FROM '#1#' OR " + unclosedOfflineAlertCond + ") " +
+                    " AND " + videoOnlineCond +
+                    " AND NOT (" + pureVideoCond + ") AND " + notTestBody, String.class);
+            int videoMarkedOnline = 0;
+            for (String siteId : videoOnlineSiteIds) {
+                // UPDATE 复核 pureVideoCond/notTestBody：防 SELECT 与写入间隙档案变更导致误写纯视频站
+                videoMarkedOnline += jdbcTemplate.update("UPDATE " + SCHEMA + "t_auto_hltgq_5nw74_vnqqef s " +
+                                "SET zebpsu = '#1#', updated_at = ?, updated_by = 'SYSTEM' " +
+                                "WHERE s.id = ? AND s.zebpsu IS DISTINCT FROM '#1#' " +
+                                "AND NOT (" + pureVideoCond + ") AND " + notTestBody, now, siteId);
+                alertService.closeOfflineAlerts(siteId);
+            }
+            if (!videoOnlineSiteIds.isEmpty()) {
+                log.info("视频在线豁免: 回标在线 {} 个, 处理站点 {} 个(含仅关闭悬挂失联告警), sites={}",
+                        videoMarkedOnline, videoOnlineSiteIds.size(), videoOnlineSiteIds);
+            }
+
             // 2) 确认仍离线的站点（UPDATE 后恢复通信的站点 zebpsu 已标回 #1#，不在此列；
-            // 纯视频站不参与失联告警，排除）
+            // 纯视频站与视频在线豁免站不参与失联告警，排除）
             // 含站点名与该站任一遥测设备（排除视频设备 #5#：站点-设备 1:N 改造后业务站可挂视频设备，
             // 失联语义应挂遥测设备），供失联告警生成；无设备的站跳过告警（无设备即无数据源，仅标离线）
-            String confirmCond = "s.zebpsu = '#2#' AND NOT (" + pureVideoCond + ") AND " + offlineBody;
+            String confirmCond = "s.zebpsu = '#2#' AND NOT (" + pureVideoCond + ") " +
+                    "AND NOT (" + videoOnlineCond + ") AND " + offlineBody;
             String selectSql = "SELECT s.id, s.zzkaec, " +
                     "(SELECT d.id FROM " + DEVICE_TABLE + " d WHERE d.site = s.id " +
                     "  AND (d.type IS NULL OR d.type NOT LIKE '%#5#%') LIMIT 1) AS device_id " +
