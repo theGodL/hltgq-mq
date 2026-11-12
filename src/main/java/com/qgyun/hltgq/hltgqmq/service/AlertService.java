@@ -54,6 +54,9 @@ public class AlertService {
     @Autowired
     private WorkOrderService workOrderService;
 
+    @Autowired
+    private SmsAlarmNotifier smsAlarmNotifier;
+
     /** 人大金仓 schema（带双引号，因为含连字符） */
     private static final String SCHEMA = "\"qixiao-apaas\".";
 
@@ -147,7 +150,7 @@ public class AlertService {
             return;
         }
         if (insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm,
-                WorkOrderService.WORK_TYPE_REPAIR)) {
+                WorkOrderService.WORK_TYPE_REPAIR) != null) {
             log.warn("新增设备异常告警: site={}, device={}, content={}", siteId, deviceId, content);
         }
     }
@@ -182,7 +185,7 @@ public class AlertService {
         }
         String content = siteName + " 连续24小时未收到任何报文，疑似站点失联！";
         if (insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_ABNORMAL, tm,
-                WorkOrderService.WORK_TYPE_REPAIR)) {
+                WorkOrderService.WORK_TYPE_REPAIR) != null) {
             log.warn("新增站点失联告警: site={}, content={}", siteId, content);
         }
     }
@@ -292,7 +295,7 @@ public class AlertService {
         if (triggered) {
             reportThresholdAlert(siteId, deviceId, siteName, metric,
                     (below ? "低于警戒值" : "高于警戒值") + fmt(threshold),
-                    unitFor(typeCode, zb), tm);
+                    unitFor(typeCode, zb), tm, typeCode, threshold, value);
         } else {
             // 正常区间：关闭该站该指标全部阈值类告警
             closeThresholdAlerts(siteId, siteName, metric);
@@ -300,7 +303,8 @@ public class AlertService {
     }
 
     private void reportThresholdAlert(String siteId, String deviceId, String siteName,
-                                      String metric, String desc, String unit, Timestamp tm) {
+                                      String metric, String desc, String unit, Timestamp tm,
+                                      String typeCode, double threshold, double value) {
         String prefix = siteName + metric;
         String content = prefix + desc + unit + "！";
         if (isSuppressed(siteId, deviceId, prefix)) {
@@ -309,9 +313,13 @@ public class AlertService {
         }
         // 无论落库成败均记录进程内时间：存储抖动导致库内不可检时由内存兜底限流（fail-closed 防风暴）
         recentThresholdAlertMemMs.put(siteId + "|" + deviceId + "|" + prefix, System.currentTimeMillis());
-        if (insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_THRESHOLD, tm,
-                WorkOrderService.WORK_TYPE_EMERGENCY)) {
+        String alertId = insertAlert(siteId, deviceId, content, LEVEL_SEVERE, ALERT_TYPE_THRESHOLD, tm,
+                WorkOrderService.WORK_TYPE_EMERGENCY);
+        if (alertId != null) {
             log.warn("新增阈值告警: site={}, device={}, content={}", siteId, deviceId, content);
+            // 短信告警回调（hltgq-site）：仅水位/雨量阈值告警，落库成功后异步触发一次，
+            // 失败只记日志不重试（hltgq-site 每 5 分钟补偿扫描兜底）
+            smsAlarmNotifier.notifyThresholdAlert(alertId, typeCode, siteId, threshold, value, tm);
         }
     }
 
@@ -493,10 +501,10 @@ public class AlertService {
      * 查重-插入经分段锁互斥防双通道并发竞态；去重查询失败放行并打 warn（fail-open，
      * 阈值链路另有进程内限流兜底防风暴）。
      *
-     * @return true=已新增并生成工单；false=被一日去重拦截或入库失败
+     * @return 已新增则返回告警行主键 id（供短信回调等下游使用）；被一日去重拦截或入库失败返回 null
      */
-    private boolean insertAlert(String siteId, String deviceId, String content, String level,
-                                String alertType, Timestamp tm, String workOrderType) {
+    private String insertAlert(String siteId, String deviceId, String content, String level,
+                               String alertType, Timestamp tm, String workOrderType) {
         Object lock = INSERT_LOCKS[Math.floorMod((siteId + "|" + content).hashCode(), INSERT_LOCKS.length)];
         synchronized (lock) {
             // 一日内容去重：同站点 + 同内容 24h 内只播报一次（status 不限：恢复后同日再触发同样抑制）；
@@ -508,7 +516,7 @@ public class AlertService {
                         siteId, content, new Timestamp(System.currentTimeMillis() - 86400000L));
                 if (!dup.isEmpty()) {
                     log.debug("告警内容一日内重复, 不再重复播报: site={}, content={}", siteId, content);
-                    return false;
+                    return null;
                 }
             } catch (Exception e) {
                 log.warn("告警一日去重检查失败, 放行: {}", e.getMessage());
@@ -552,10 +560,10 @@ public class AlertService {
                 // 告警新增成功 → 自动生成工单（alert 字段存告警ID形成精确关联，qjulvf 落工单类型字典）
                 workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveWorkOrderTitle(content),
                         content, workOrderType);
-                return true;
+                return alertId;
             } catch (Exception e) {
                 log.error("告警入库失败, site={}, device={}, content={}: {}", siteId, deviceId, content, e.getMessage());
-                return false;
+                return null;
             }
         }
     }

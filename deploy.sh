@@ -8,6 +8,11 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE_NAME="hltgq-mq"
 CONTAINER_NAME="hltgq-mq"
 
+# 短信告警回调 token（hltgq-site 提供）：部署前在服务器当前 shell 先 export，例如
+#   export APP_SMS_ALARM_EVENT_TOKEN='<site提供的token>'   # 含 # 时必须加引号
+# 未 export 时容器照常启动，仅短信回调跳过（启动日志 WARN）
+SMS_TOKEN="${APP_SMS_ALARM_EVENT_TOKEN:-}"
+
 docker stop ${CONTAINER_NAME} 2>/dev/null || true
 docker rm ${CONTAINER_NAME} 2>/dev/null || true
 docker build -t ${IMAGE_NAME}:latest "$PROJECT_DIR"
@@ -22,6 +27,7 @@ docker run -d \
     -e SPRING_RABBITMQ_USERNAME=sunny \
     -e "SPRING_RABBITMQ_PASSWORD=sunny@2025" \
     -e SPRING_RABBITMQ_VIRTUAL_HOST=/ \
+    -e "APP_SMS_ALARM_EVENT_TOKEN=${SMS_TOKEN}" \
     --memory="1g" \
     ${IMAGE_NAME}:latest
 
