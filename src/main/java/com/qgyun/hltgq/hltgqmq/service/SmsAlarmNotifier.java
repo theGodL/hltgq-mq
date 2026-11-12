@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit;
  * - 仅水位/雨量阈值告警回调：metric=rain（typeCode #2#）/ water_level（typeCode #1#）；
  *   设备异常、站点失联、流量/开度/墒情/水质阈值告警不回调；
  * - 告警写入成功后立即回调一次（调用方在 insertAlert 返回 alertId 后触发），
- *   异步单线程执行，不阻塞 MQ 消费线程；连接/读取超时均 3 秒（可配）；
+ *   异步单线程执行，不阻塞 MQ 消费线程；连接/读取超时均 10 秒（可配，site 同步发短信实测 >3s）；
  * - 失败（超时/非 200/code!=0）只记一条 error 日志（带 alertId），不回滚告警、不重试，
  *   由 hltgq-site 侧每 5 分钟补偿扫描兜底补发；
  * - 同一 alertId 由 hltgq-site 保证只发一次短信，mq 侧不需要维护发送记录或去重。
