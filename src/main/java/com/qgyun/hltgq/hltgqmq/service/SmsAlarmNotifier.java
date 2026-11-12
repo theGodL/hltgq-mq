@@ -76,7 +76,9 @@ public class SmsAlarmNotifier {
     @Value("${app.sms.alarm-event.token:}")
     private String token;
 
-    @Value("${app.sms.alarm-event.timeout-ms:3000}")
+    /** 连接/读取超时（毫秒）：site 同步发短信耗时约 3s+（2026-11-12 实测首条回调 Read timed out），
+     *  故读超时需大于 site 发送耗时；连接与读取共用此值（内网连接瞬时，10s 只影响 site 卡死场景） */
+    @Value("${app.sms.alarm-event.timeout-ms:10000}")
     private int timeoutMs;
 
     /**
