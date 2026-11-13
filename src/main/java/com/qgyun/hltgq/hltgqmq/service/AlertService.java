@@ -62,6 +62,7 @@ public class AlertService {
 
     private static final String ALERT_TABLE     = SCHEMA + "t_auto_hltgq_water_alert";
     private static final String THRESHOLD_TABLE = SCHEMA + "t_auto_hltgq_water_threshold";
+    private static final String SITE_TABLE      = SCHEMA + "t_auto_hltgq_5nw74_vnqqef";
 
     @Value("${app.corp-code:hltgq}")
     private String corpCode;
@@ -69,6 +70,18 @@ public class AlertService {
     /** 重复告警抑制时长(分钟)：同站点同条件持续超限时两次告警的最小间隔；环境值≤0 时按 1 分钟兜底防刷屏 */
     @Value("${alarm.suppress-minutes:30}")
     private int suppressMinutes;
+
+    /**
+     * 水位/雨量阈值告警站点白名单(stcd 前缀，逗号分隔；空=不限制)。
+     * 2026-11-13 业务裁定：只有库上站点(3206400001~320640000D，其中 3206400008 为非水位类)参与
+     * 水位/雨量阈值告警；闸站(9 开头召测通道、QSJSZ、SMH 等)的闸前/闸后水位即使超过阈值表配置也不告警。
+     * 阈值表里的闸站行保留原值(页面可见)，仅告警判定侧过滤，不动业务数据。
+     */
+    @Value("${alert.threshold-stcd-allow-prefixes:32064}")
+    private String thresholdStcdAllowPrefixes;
+
+    /** siteId → stcd(iofhpi) 缓存：站点编码不随业务变动；只缓存查询成功结果，失败下次重试 */
+    private final ConcurrentMap<String, String> siteStcdCache = new ConcurrentHashMap<>();
 
     /** 告警级别字典：#3#严重（阈值告警统一 #3#） */
     private static final String LEVEL_SEVERE   = "#3#";
@@ -225,6 +238,8 @@ public class AlertService {
 
     /**
      * 阈值判定（2026-09-26 细化设计，仅对正常数值调用，-999/-9991 等异常值由调用方排除）：
+     * 0. 站点白名单：仅 #1#水位/#2#雨量受 alert.threshold-stcd-allow-prefixes 约束（默认只允许库上站点
+     *    32064*，闸站闸前/闸后水位不告警，见 isThresholdSiteAllowed）；其它类型不限制；
      * 1. 匹配键「站点 + 类型 + 指标(zb)」实时读阈值表（无缓存），页面编辑保存后下一条数据即生效；
      *    zb 为 null 按"指标为空"处理（等同传空串），见 findThreshold 语义说明；
      * 2. 单级警戒值 threshold，方向以行上 alarmdir 为准（#1#高于 / #2#低于，均含等号触发），
@@ -241,11 +256,54 @@ public class AlertService {
                                   String siteName, String metric, String zb,
                                   double value, Timestamp tm) {
         if (siteId == null || deviceId == null) return;
+        if (!isThresholdSiteAllowed(siteId, typeCode)) {
+            return;
+        }
         Map<String, Object> th = findThreshold(siteId, typeCode, zb);
         if (th == QUERY_FAILED) {
             return; // 查询失败不等同于无配置：跳过本次评估，防止误关遗留告警
         }
         evaluateThresholdRow(siteId, deviceId, typeCode, siteName, zb, metric, value, tm, th);
+    }
+
+    /**
+     * 水位/雨量阈值告警站点白名单判定（2026-11-13 业务裁定，fail-closed 宁可不发不可错发）：
+     * 只有库上站点(stcd 前缀命中 alert.threshold-stcd-allow-prefixes，默认 32064)参与 #1#水位/#2#雨量
+     * 阈值告警；闸站(9 开头召测通道、QSJSZ、SMH 等)不参与——闸门水位不具备警戒意义，不产生告警短信。
+     * 其它类型(#3#流量/#4#开度/#7#墒情/#8#水质)不受白名单约束，维持原有判定。
+     * fail-closed：站点编码缺失/查询失败/配置为空一律按拦截处理（宁可漏发，绝不误发）；
+     * 查询失败不缓存，下一条报文自动重试，恢复后告警能力自动回来。
+     */
+    private boolean isThresholdSiteAllowed(String siteId, String typeCode) {
+        if (!TYPE_WATER_LEVEL.equals(typeCode) && !TYPE_RAINFALL.equals(typeCode)) return true;
+        String prefixes = thresholdStcdAllowPrefixes == null ? "" : thresholdStcdAllowPrefixes.trim();
+        if (prefixes.isEmpty()) {
+            prefixes = "32064"; // 配置缺失/置空回退默认白名单，绝不放行全网
+        }
+        String stcd = siteStcdCache.get(siteId);
+        if (stcd == null) {
+            try {
+                List<String> rows = jdbcTemplate.queryForList(
+                        "SELECT iofhpi FROM " + SITE_TABLE + " WHERE id = ?", String.class, siteId);
+                if (rows.isEmpty() || rows.get(0) == null || rows.get(0).trim().isEmpty()) {
+                    log.warn("阈值告警白名单: 站点编码缺失, 按拦截处理(宁可不发): site={}, type={}", siteId, typeCode);
+                    return false;
+                }
+                stcd = rows.get(0).trim();
+                siteStcdCache.put(siteId, stcd);
+            } catch (Exception e) {
+                log.warn("阈值告警白名单查询失败, 按拦截处理(宁可不发): site={}, type={}, err={}",
+                        siteId, typeCode, e.getMessage());
+                return false;
+            }
+        }
+        for (String p : prefixes.split(",")) {
+            String prefix = p.trim();
+            if (!prefix.isEmpty() && stcd.startsWith(prefix)) return true;
+        }
+        log.debug("站点不在水位/雨量阈值告警范围(白名单前缀{}), 跳过判定: site={}, stcd={}, type={}",
+                prefixes, siteId, stcd, typeCode);
+        return false;
     }
 
     /**
@@ -256,6 +314,9 @@ public class AlertService {
     public void evaluateThresholdBatch(String siteId, String deviceId, String typeCode,
                                        String siteName, Timestamp tm, List<ThresholdMetric> metrics) {
         if (siteId == null || deviceId == null || metrics == null || metrics.isEmpty()) return;
+        if (!isThresholdSiteAllowed(siteId, typeCode)) {
+            return;
+        }
         Map<String, Map<String, Object>> rowsByZb = findThresholdRows(siteId, typeCode);
         if (rowsByZb == ROWS_QUERY_FAILED) {
             return; // 查询失败：跳过全部指标，防止误关遗留告警
@@ -305,6 +366,12 @@ public class AlertService {
     private void reportThresholdAlert(String siteId, String deviceId, String siteName,
                                       String metric, String desc, String unit, Timestamp tm,
                                       String typeCode, double threshold, double value) {
+        // 最后防线（2026-11-13）：即使未来新增判定入口绕过 evaluateThreshold，非白名单站点的
+        // 水位/雨量告警也绝不落库、绝不发短信（宁可不发，不可错发）
+        if (!isThresholdSiteAllowed(siteId, typeCode)) {
+            log.debug("阈值告警最后防线拦截: site={}, type={}, metric={}", siteId, typeCode, metric);
+            return;
+        }
         String prefix = siteName + metric;
         String content = prefix + desc + unit + "！";
         if (isSuppressed(siteId, deviceId, prefix)) {
